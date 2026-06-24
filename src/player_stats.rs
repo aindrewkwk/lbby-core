@@ -1,0 +1,142 @@
+use rusqlite::{Connection, Result as SqlResult, params};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PlayerSummary {
+    pub player_id: String,
+    pub total_playtime_seconds: i64,
+    pub last_seen: i64,
+    pub deaths: u32,
+    pub kills: u32,
+}
+
+fn get_db_path(_app: &std::sync::Arc<crate::app_state::AppEventSender>) -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("players.db")
+}
+
+fn init_db(conn: &Connection) -> SqlResult<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS player_stats (
+            player_id TEXT PRIMARY KEY,
+            total_playtime_seconds INTEGER DEFAULT 0,
+            last_seen INTEGER DEFAULT 0,
+            deaths INTEGER DEFAULT 0,
+            kills INTEGER DEFAULT 0
+        )",
+        [],
+    )?;
+    
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id TEXT,
+            start_time INTEGER,
+            end_time INTEGER
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn get_conn(app: &std::sync::Arc<crate::app_state::AppEventSender>) -> Result<Connection, String> {
+    let db_path = get_db_path(app);
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    init_db(&conn).map_err(|e| e.to_string())?;
+    Ok(conn)
+}
+
+pub fn record_session_start(app: &std::sync::Arc<crate::app_state::AppEventSender>, player_id: &str, timestamp: i64) -> Result<(), String> {
+    let conn = get_conn(app)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO player_stats (player_id, last_seen) VALUES (?1, ?2)",
+        params![player_id, timestamp],
+    ).map_err(|e| e.to_string())?;
+    
+    conn.execute(
+        "UPDATE player_stats SET last_seen = ?2 WHERE player_id = ?1",
+        params![player_id, timestamp],
+    ).map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "INSERT INTO sessions (player_id, start_time, end_time) VALUES (?1, ?2, NULL)",
+        params![player_id, timestamp],
+    ).map_err(|e| e.to_string())?;
+    
+    app.emit("player-stats-updated", ()).ok();
+    Ok(())
+}
+
+pub fn record_session_end(app: &std::sync::Arc<crate::app_state::AppEventSender>, player_id: &str, timestamp: i64, deaths: u32, kills: u32) -> Result<(), String> {
+    let conn = get_conn(app)?;
+    
+    // Find the latest open session
+    let mut stmt = conn.prepare("SELECT id, start_time FROM sessions WHERE player_id = ?1 AND end_time IS NULL ORDER BY start_time DESC LIMIT 1").map_err(|e| e.to_string())?;
+    let mut rows = stmt.query(params![player_id]).map_err(|e| e.to_string())?;
+    
+    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let session_id: i64 = row.get(0).map_err(|e| e.to_string())?;
+        let start_time: i64 = row.get(1).map_err(|e| e.to_string())?;
+        let duration = timestamp - start_time;
+        let duration = if duration < 0 { 0 } else { duration };
+        
+        conn.execute(
+            "UPDATE sessions SET end_time = ?2 WHERE id = ?1",
+            params![session_id, timestamp],
+        ).map_err(|e| e.to_string())?;
+        
+        conn.execute(
+            "UPDATE player_stats SET total_playtime_seconds = total_playtime_seconds + ?2, last_seen = ?3, deaths = deaths + ?4, kills = kills + ?5 WHERE player_id = ?1",
+            params![player_id, duration, timestamp, deaths, kills],
+        ).map_err(|e| e.to_string())?;
+    } else {
+        // No open session, just update last_seen, deaths, kills
+        conn.execute(
+            "INSERT OR IGNORE INTO player_stats (player_id, last_seen, deaths, kills) VALUES (?1, ?2, ?3, ?4)",
+            params![player_id, timestamp, deaths, kills],
+        ).map_err(|e| e.to_string())?;
+        
+        conn.execute(
+            "UPDATE player_stats SET last_seen = ?2, deaths = deaths + ?3, kills = kills + ?4 WHERE player_id = ?1",
+            params![player_id, timestamp, deaths, kills],
+        ).map_err(|e| e.to_string())?;
+    }
+    
+    app.emit("player-stats-updated", ()).ok();
+    Ok(())
+}
+
+pub fn list_all_summaries(app: std::sync::Arc<crate::app_state::AppEventSender>) -> Result<Vec<PlayerSummary>, String> {
+    let conn = get_conn(&app)?;
+    let mut stmt = conn.prepare("SELECT player_id, total_playtime_seconds, last_seen, deaths, kills FROM player_stats ORDER BY total_playtime_seconds DESC").map_err(|e| e.to_string())?;
+    let iter = stmt.query_map([], |row| {
+        Ok(PlayerSummary {
+            player_id: row.get(0)?,
+            total_playtime_seconds: row.get(1)?,
+            last_seen: row.get(2)?,
+            deaths: row.get(3)?,
+            kills: row.get(4)?,
+        })
+    }).map_err(|e| e.to_string())?;
+    
+    let mut summaries = Vec::new();
+    for s in iter {
+        summaries.push(s.map_err(|e| e.to_string())?);
+    }
+    
+    Ok(summaries)
+}
+
+pub fn player_record_start(app: std::sync::Arc<crate::app_state::AppEventSender>, player_id: String, timestamp: i64) -> Result<(), String> {
+    record_session_start(&app, &player_id, timestamp)
+}
+
+pub fn player_record_end(app: std::sync::Arc<crate::app_state::AppEventSender>, player_id: String, timestamp: i64, deaths: u32, kills: u32) -> Result<(), String> {
+    record_session_end(&app, &player_id, timestamp, deaths, kills)
+}

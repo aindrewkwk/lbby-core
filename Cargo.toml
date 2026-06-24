@@ -1,0 +1,41 @@
+[package]
+name = "lbby-core"
+version = "0.2.7"
+edition = "2021"
+description = "Shared core library for Lbby agent and app — server management, mods, tunnels, backups"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+dirs = "5"
+zip = "2"
+tar = "0.4"
+flate2 = "1"
+fastnbt = "2"
+sysinfo = "0.32"
+walkdir = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+toml = "0.8"
+sha2 = "0.10"
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+machine-uid = "0.5"
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
+if-addrs = "0.13"
+rusqlite = { version = "0.40.0", features = ["bundled"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+incremental = false
+overflow-checks = false
