@@ -1,7 +1,10 @@
 // Helper functions and types referenced by modules.
 // These were originally in the monolithic lib.rs — extracted here for reuse.
 
+use base64::Engine;
 use serde::Serialize;
+use std::io::Read;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::app_state::AppEventSender;
@@ -129,4 +132,156 @@ pub async fn remote_kill_server_and_playit(app: &Arc<AppEventSender>) {
 pub async fn do_install_server(app: Arc<AppEventSender>, cfg: ServerConfig) -> Result<ServerConfig, String> {
     let _ = (app, cfg);
     Err("Server installation not yet implemented in lbby-core".to_string())
+}
+
+// ── Generic helpers (migrated from lbby-agent/src/lib.rs) ────────────────────
+
+pub fn is_private_or_local_host(host: &str) -> bool {
+    let h = host
+        .trim_matches(|c| c == '[' || c == ']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+
+    if matches!(h.as_str(), "localhost" | "::1") {
+        return true;
+    }
+
+    let octets = h
+        .split('.')
+        .map(str::parse::<u8>)
+        .collect::<Result<Vec<_>, _>>();
+
+    match octets.as_deref() {
+        Ok([10, ..]) => true,
+        Ok([127, ..]) => true,
+        Ok([169, 254, ..]) => true,
+        Ok([172, second, ..]) if (16..=31).contains(second) => true,
+        Ok([192, 168, ..]) => true,
+        _ => false,
+    }
+}
+
+pub fn is_public_tunnel_address(addr: &str) -> bool {
+    let Some(idx) = addr.rfind(':') else {
+        return addr.contains("playit.gg") || addr.contains("playit.cloud");
+    };
+    let host = &addr[..idx];
+    !is_private_or_local_host(host)
+}
+
+/// Check whether a TCP port is available for binding.
+/// Returns Ok(()) if the port is free, Err with a clear message if in use.
+pub fn check_port_available(port: u16) -> Result<(), String> {
+    match std::net::TcpListener::bind(("0.0.0.0", port)) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!(
+            "Port {} is already in use ({}). Close the other application or change the port in Settings.",
+            port, e
+        )),
+    }
+}
+
+/// Strip ANSI escape codes (VT100/CSI sequences) from a string.
+/// On Windows, playit may emit ANSI sequences that corrupt URLs.
+pub fn strip_ansi_codes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip ESC [ ... m  (CSI sequence) or ESC ] ... BEL (OSC sequence)
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next.is_ascii_alphabetic() || next == 'm' { break; }
+                }
+            } else if chars.peek() == Some(&']') {
+                chars.next(); // consume ']'
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next == '\x07' || next == '\x1b' { break; }
+                }
+            }
+            // Other ESC sequences — just skip the ESC char
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+pub fn is_valid_player_name(s: &str) -> bool {
+    let len = s.chars().count();
+    (2..=16).contains(&len) && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Check if a process with the given PID is still alive.
+pub fn is_process_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+            .output();
+        match out {
+            Ok(o) => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                // tasklist returns "INFO: No tasks are running..." if not found
+                text.contains(&pid.to_string())
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(unix)]
+    {
+        // kill(pid, 0) checks if the process exists without sending a signal
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+}
+
+pub fn default_downloads_dir() -> String {
+    dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .to_string_lossy()
+        .to_string()
+}
+
+pub fn json_string(value: &serde_json::Value, key: &str) -> String {
+    value.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string()
+}
+
+pub fn toml_string(value: &toml::Value, key: &str) -> String {
+    value.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string()
+}
+
+pub fn read_zip_text<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name: &str) -> Option<String> {
+    let mut file = zip.by_name(name).ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+pub fn read_zip_icon_data_url<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    path: &str,
+) -> Option<String> {
+    let clean = path.trim().trim_start_matches('/');
+    if clean.is_empty() { return None; }
+    let mut file = zip.by_name(clean).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    if bytes.is_empty() || bytes.len() > 256 * 1024 { return None; }
+    let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        "image/jpeg"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "data:{};base64,{}",
+        mime,
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
 }

@@ -20,6 +20,7 @@ pub mod stats;
 pub mod steamcmd;
 pub mod terraria_config;
 pub mod tmod_services;
+pub mod version_fetch;
 
 // Re-export commonly used types for convenience
 pub use app_state::{ActionResult, AppState, AppEventSender, BannedPlayer, ModInfo, PregenState, ShutdownStatus};
