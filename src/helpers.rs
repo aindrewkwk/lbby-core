@@ -4,7 +4,7 @@
 use serde::Serialize;
 use std::sync::Arc;
 
-use crate::app_state::{AppEventSender, AppState};
+use crate::app_state::AppEventSender;
 use crate::config::ServerConfig;
 
 /// Progress event for server installation / mod installation.

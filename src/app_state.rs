@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
 
 use crate::cloudflare::CloudflareTunnelState;
-use crate::config::ServerConfig;
 use crate::playit::PlayitState;
 use crate::server::ServerManager;
 use crate::stats::ServerStats;

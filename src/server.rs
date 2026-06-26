@@ -30,3 +30,15 @@ impl ServerManager {
         }
     }
 }
+
+/// Stub: start the Minecraft server — full implementation to be migrated from monolithic lib.rs.
+pub async fn start_server(app: std::sync::Arc<crate::app_state::AppEventSender>) -> Result<(), String> {
+    let _ = app;
+    Err("start_server not yet implemented in lbby-core".to_string())
+}
+
+/// Stub: stop the Minecraft server — full implementation to be migrated from monolithic lib.rs.
+pub async fn stop_server(app: std::sync::Arc<crate::app_state::AppEventSender>) -> Result<(), String> {
+    let _ = app;
+    Err("stop_server not yet implemented in lbby-core".to_string())
+}

@@ -344,16 +344,20 @@ async fn download_jre(major: u8, app: &std::sync::Arc<crate::app_state::AppEvent
             downloaded += chunk.len() as u64;
             let progress = if total > 0 { downloaded as f32 / total as f32 } else { 0.0 };
             app.emit("install-progress", crate::helpers::InstallProgress {
-                message: format!("Downloading Java {}… {:.1}%", major, progress * 100.0),
-                progress,
+                stage: "download".into(),
+                label: format!("Downloading Java {}… {:.1}%", major, progress * 100.0),
+                current: downloaded as u32,
+                total: total as u32,
             }).ok();
         }
     }
 
     // Extract
     app.emit("install-progress", crate::helpers::InstallProgress {
-        message: format!("Extracting Java {}…", major),
-        progress: 0.9,
+        stage: "extract".into(),
+        label: format!("Extracting Java {}…", major),
+        current: 90,
+        total: 100,
     }).ok();
 
     let dest = bundled_java_dir(major);

@@ -306,6 +306,18 @@ impl PlayitState {
     }
 }
 
+impl Default for PlayitState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Stub: stop the playit.gg tunnel — full implementation to be migrated from monolithic lib.rs.
+pub async fn stop(app: std::sync::Arc<crate::app_state::AppEventSender>) -> Result<(), String> {
+    let _ = app;
+    Err("playit::stop not yet implemented in lbby-core".to_string())
+}
+
 pub fn playit_dir() -> PathBuf {
     let base = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))

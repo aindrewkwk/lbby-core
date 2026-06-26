@@ -1,4 +1,4 @@
-use crate::{config, remote, app_state::AppState};
+use crate::{config, remote};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -31,6 +31,12 @@ pub struct CloudflareTunnelState {
     pub url: Option<String>,
     pub pid: Option<u32>,
     pub message: String,
+}
+
+impl Default for CloudflareTunnelState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CloudflareTunnelState {
@@ -244,7 +250,7 @@ pub async fn start_quick_tunnel(app: std::sync::Arc<crate::app_state::AppEventSe
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
     {
-        let state = app.state::<AppState>();
+        let state = app.state();
         let mut tunnel = state.cloudflare_remote.lock().await;
         tunnel.running = true;
         tunnel.pid = pid;
@@ -263,7 +269,7 @@ pub async fn start_quick_tunnel(app: std::sync::Arc<crate::app_state::AppEventSe
     let app_wait = app.clone();
     tokio::spawn(async move {
         let status = child.wait().await;
-        let state = app_wait.state::<AppState>();
+        let state = app_wait.state();
         let mut tunnel = state.cloudflare_remote.lock().await;
         tunnel.running = false;
         tunnel.pid = None;
@@ -289,7 +295,7 @@ pub async fn start_quick_tunnel(app: std::sync::Arc<crate::app_state::AppEventSe
     loop {
         tokio::select! {
             _ = &mut timeout => {
-                let state = app.state::<AppState>();
+                let state = app.state();
                 let tunnel = state.cloudflare_remote.lock().await.clone();
                 if tunnel.running {
                     return Ok(tunnel);
@@ -305,7 +311,7 @@ pub async fn start_quick_tunnel(app: std::sync::Arc<crate::app_state::AppEventSe
                     if let Err(e) = save_public_url(&url) {
                         eprintln!("[lbby] could not save Cloudflare URL to config: {}", e);
                     }
-                    let state = app.state::<AppState>();
+                    let state = app.state();
                     let mut tunnel = state.cloudflare_remote.lock().await;
                     tunnel.running = true;
                     tunnel.url = Some(url.clone());
@@ -319,7 +325,7 @@ pub async fn start_quick_tunnel(app: std::sync::Arc<crate::app_state::AppEventSe
 }
 
 pub async fn stop_quick_tunnel(app: std::sync::Arc<crate::app_state::AppEventSender>) -> Result<CloudflareTunnelState, String> {
-    let state = app.state::<AppState>();
+    let state = app.state();
     let mut tunnel = state.cloudflare_remote.lock().await;
     if let Some(pid) = tunnel.pid {
         #[cfg(unix)]
@@ -343,7 +349,7 @@ pub async fn stop_quick_tunnel(app: std::sync::Arc<crate::app_state::AppEventSen
 }
 
 pub async fn status(app: std::sync::Arc<crate::app_state::AppEventSender>) -> CloudflareTunnelState {
-    app.state::<AppState>().cloudflare_remote.lock().await.clone()
+    app.state().cloudflare_remote.lock().await.clone()
 }
 
 fn spawn_cloudflared_reader<R>(app: std::sync::Arc<crate::app_state::AppEventSender>, stream: R, tx: mpsc::UnboundedSender<String>)
@@ -356,13 +362,13 @@ where
         while let Ok(Some(line)) = lines.next_line().await {
             if let Some(url) = parse_trycloudflare_url(&line) {
                 save_public_url(&url).ok();
-                let state = app.state::<AppState>();
+                let state = app.state();
                 let mut tunnel = state.cloudflare_remote.lock().await;
                 tunnel.url = Some(url);
                 tunnel.message = "Cloudflare tunnel ready.".to_string();
                 app.emit("cloudflare-remote-update", tunnel.clone()).ok();
             } else {
-                let state = app.state::<AppState>();
+                let state = app.state();
                 let mut tunnel = state.cloudflare_remote.lock().await;
                 tunnel.message = line.clone();
                 app.emit("cloudflare-remote-update", tunnel.clone()).ok();

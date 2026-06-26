@@ -428,7 +428,7 @@ pub fn list_installed_mods() -> Result<Vec<ModInfo>, String> {
     let mut mods: Vec<ModInfo> = std::fs::read_dir(&dir).map_err(|e| e.to_string())?
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == ext))
-        .map(|e| read_mod_info(&e.path()))
+        .filter_map(|e| read_mod_info(&e.path()))
         .collect();
     mods.sort_by_key(|a| a.display_name.to_lowercase());
     Ok(mods)
@@ -444,7 +444,7 @@ pub async fn check_mod_updates() -> Result<Vec<ModUpdateInfo>, String> {
         if path.extension().is_none_or(|x| x != "jar") {
             continue;
         }
-        let info = read_mod_info(&path);
+        let Some(info) = read_mod_info(&path) else { continue; };
         let hash = {
             let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
             format!("{:x}", Sha512::digest(&bytes))

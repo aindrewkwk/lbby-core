@@ -24,5 +24,6 @@ pub mod tmod_services;
 // Re-export commonly used types for convenience
 pub use app_state::{ActionResult, AppState, AppEventSender, BannedPlayer, ModInfo, PregenState, ShutdownStatus};
 pub use config::{ServerConfig, ServerType};
+pub use helpers::remote_kill_server_and_playit;
 pub use server::{ServerManager, ServerStatus};
 pub use stats::ServerStats;

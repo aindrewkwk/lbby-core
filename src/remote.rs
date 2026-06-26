@@ -1,4 +1,4 @@
-use crate::{backup, config, app_state::AppState};
+use crate::{backup, config};
 use crate::server::ServerStatus;
 use std::path::PathBuf;
 use serde::Serialize;
@@ -175,7 +175,7 @@ fn build_public_url(raw: &str, token: &str) -> String {
 
 pub async fn sync(app: &std::sync::Arc<crate::app_state::AppEventSender>) -> Result<RemoteControlState, String> {
     let cfg = config::load_config();
-    let state = app.state::<AppState>();
+    let state = app.state();
     let mut task = state.remote_control.lock().await;
     let mut active_token = state.remote_control_active_token.lock().await;
 
@@ -261,7 +261,7 @@ pub async fn sync(app: &std::sync::Arc<crate::app_state::AppEventSender>) -> Res
 /// retries the port-check in a tight loop so the caller is guaranteed the
 /// port is free by the time it returns.
 pub async fn stop(app: &std::sync::Arc<crate::app_state::AppEventSender>) -> Result<RemoteControlState, String> {
-    let state = app.state::<AppState>();
+    let state = app.state();
     let mut task = state.remote_control.lock().await;
     let mut active_token = state.remote_control_active_token.lock().await;
     let port = config::load_config().remote_control_port;
@@ -284,7 +284,7 @@ pub async fn stop(app: &std::sync::Arc<crate::app_state::AppEventSender>) -> Res
 }
 
 pub async fn status(app: &std::sync::Arc<crate::app_state::AppEventSender>) -> RemoteControlState {
-    let state = app.state::<AppState>();
+    let state = app.state();
     let running = if state.remote_control.lock().await.is_some() {
         let cfg = config::load_config();
         tokio::net::TcpStream::connect(("127.0.0.1", cfg.remote_control_port))
@@ -450,7 +450,7 @@ fn authorized(request: &HttpRequest, token: &str) -> bool {
 }
 
 async fn remote_status_response(app: std::sync::Arc<crate::app_state::AppEventSender>) -> String {
-    let state = app.state::<AppState>();
+    let state = app.state();
     let cfg = config::load_config();
     let status = state.server.lock().await.status.clone();
     let stats = state.stats.lock().await.clone();
@@ -479,7 +479,7 @@ async fn remote_status_response(app: std::sync::Arc<crate::app_state::AppEventSe
 }
 
 async fn remote_console_response(app: std::sync::Arc<crate::app_state::AppEventSender>) -> String {
-    let state = app.state::<AppState>();
+    let state = app.state();
     let lines = state
         .console_buffer
         .lock()
@@ -502,7 +502,7 @@ async fn remote_command_response(app: std::sync::Arc<crate::app_state::AppEventS
         return json_response(400, &serde_json::json!({ "error": "Missing command" }));
     }
 
-    let state = app.state::<AppState>();
+    let state = app.state();
     let mut srv = state.server.lock().await;
     let Some(stdin) = srv.stdin.as_mut() else {
         return json_response(
@@ -527,7 +527,7 @@ async fn remote_start_server(app: std::sync::Arc<crate::app_state::AppEventSende
 async fn remote_stop_server(app: std::sync::Arc<crate::app_state::AppEventSender>) -> String {
     // Snapshot status first, so we can return 409 if the server isn't running.
     let was_running = {
-        let state = app.state::<AppState>();
+        let state = app.state();
         let srv = state.server.lock().await;
         matches!(srv.status, ServerStatus::Running | ServerStatus::Starting | ServerStatus::Stopping)
     };
@@ -560,7 +560,7 @@ async fn remote_restart_server(app: std::sync::Arc<crate::app_state::AppEventSen
 // ── Pre-generation ──────────────────────────────────────────────────────────
 
 async fn remote_pregen_status(app: std::sync::Arc<crate::app_state::AppEventSender>) -> String {
-    let state = app.state::<AppState>();
+    let state = app.state();
     let pg = state.pregen.lock().await.clone();
     json_response(
         200,
@@ -589,7 +589,7 @@ async fn remote_pregen_start(app: std::sync::Arc<crate::app_state::AppEventSende
 }
 
 async fn remote_pregen_cancel(app: std::sync::Arc<crate::app_state::AppEventSender>) -> String {
-    let state = app.state::<AppState>();
+    let state = app.state();
     let mut pg = state.pregen.lock().await;
     if pg.running {
         pg.cancel_requested = true;
