@@ -175,11 +175,9 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
     crate::server::start_server(app).await
 }
 
-/// Stub: pregenerate chunks.
+/// Pre-generate chunks — delegates to server module.
 pub async fn do_pregenerate_chunks(app: Arc<AppEventSender>, total_chunks: u32) -> Result<(), String> {
-    // TODO: implement chunk pre-generation
-    let _ = (app, total_chunks);
-    Err("Chunk pre-generation not yet implemented in lbby-core".to_string())
+    crate::server::do_pregenerate_chunks(app, total_chunks).await
 }
 
 /// Stub: kill server and playit for remote control.

@@ -75,6 +75,25 @@ pub enum ServerType {
 }
 
 impl ServerType {
+    /// Short label for display (e.g. "Paper", "Forge", "Vanilla").
+    pub fn label(&self) -> &'static str {
+        match self {
+            ServerType::Vanilla => "Vanilla",
+            ServerType::Paper => "Paper",
+            ServerType::Forge => "Forge",
+            ServerType::Fabric => "Fabric",
+            ServerType::NeoForge => "NeoForge",
+            ServerType::Bukkit => "Bukkit",
+            ServerType::Spigot => "Spigot",
+            ServerType::Folia => "Folia",
+            ServerType::Purpur => "Purpur",
+            ServerType::SpongeVanilla => "SpongeVanilla",
+            ServerType::SpongeForge => "SpongeForge",
+            ServerType::Terraria => "Terraria",
+            ServerType::TModLoader => "tModLoader",
+        }
+    }
+
     /// Which game this server type belongs to.
     pub fn game(&self) -> Game {
         match self {

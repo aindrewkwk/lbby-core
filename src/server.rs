@@ -1,15 +1,20 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
 
 use crate::app_state::AppEventSender;
 use crate::config::{ServerConfig, ServerType};
-use crate::helpers::{InstallProgress, hide_child_window};
+use crate::helpers::{InstallProgress, check_port_available, hide_child_window};
+use crate::stats::ServerStats;
+
+const RESTART_WINDOW_SECS: u64 = 300;
+const MAX_RESTARTS_IN_WINDOW: usize = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -41,16 +46,627 @@ impl ServerManager {
     }
 }
 
-/// Stub: start the Minecraft server — full implementation to be migrated from monolithic lib.rs.
-pub async fn start_server(app: std::sync::Arc<crate::app_state::AppEventSender>) -> Result<(), String> {
-    let _ = app;
-    Err("start_server not yet implemented in lbby-core".to_string())
+/// Start the Minecraft/Terraria server.
+///
+/// Thin wrapper that calls `do_start_server` and resets status to Stopped
+/// if the start fails while still in the Starting state.
+/// Returns a boxed future to allow recursive calls (auto-restart).
+pub fn start_server(app: Arc<AppEventSender>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+    Box::pin(async move {
+    let result = do_start_server(app.clone()).await;
+    if result.is_err() {
+        // If we set the status to Starting but the start failed, reset to
+        // Stopped so the UI doesn't get stuck on "Starting" forever.
+        let state = app.state();
+        let mut srv = state.server.lock().await;
+        if srv.status == ServerStatus::Starting {
+            srv.status = ServerStatus::Stopped;
+            srv.stdin = None;
+            srv.pid = None;
+            app.emit("server-status", ServerStatus::Stopped).ok();
+        }
+    }
+    result
+    })
 }
 
-/// Stub: stop the Minecraft server — full implementation to be migrated from monolithic lib.rs.
-pub async fn stop_server(app: std::sync::Arc<crate::app_state::AppEventSender>) -> Result<(), String> {
-    let _ = app;
-    Err("stop_server not yet implemented in lbby-core".to_string())
+/// The actual start logic, callable both from the public command and from the
+/// auto-restart task on the wait-for-child handler.
+pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
+    let cfg = crate::config::load_config();
+    if !cfg.setup_complete {
+        return Err("Server not set up yet".to_string());
+    }
+    {
+        let state = app.state();
+        let srv = state.server.lock().await;
+        if srv.status != ServerStatus::Stopped {
+            return Err("Server is already running".to_string());
+        }
+    }
+
+    // Mark the server as Starting immediately — before any Java download or
+    // version detection — so the frontend shows the "Starting" status pill
+    // right away instead of staying on "Stopped" during network activity.
+    {
+        let state = app.state();
+        let mut srv = state.server.lock().await;
+        srv.status = ServerStatus::Starting;
+        srv.stop_requested = false;
+    }
+    app.emit("server-status", ServerStatus::Starting).ok();
+
+    let server_dir = PathBuf::from(&cfg.server_path);
+
+    // ── Terraria / tModLoader start path ──────────────────────────────────
+    if cfg.is_terraria() {
+        return Err("Terraria start not yet migrated to lbby-core".to_string());
+    }
+
+    // Pre-flight: check port availability for Minecraft servers
+    let port: u16 = cfg.default_port();
+    check_port_available(port)?;
+
+    std::fs::create_dir_all(&server_dir)
+        .map_err(|e| format!("Failed to create server directory {}: {}", server_dir.display(), e))?;
+    let ram = cfg.ram_mb;
+    if matches!(cfg.server_type, ServerType::Forge | ServerType::NeoForge) {
+        upsert_managed_jvm_args(&server_dir, &cfg)?;
+    }
+
+    // Pre-start cleanup: if a previous run left a `world/session.lock` and
+    // an orphan `java`/`bash run.sh` is still holding it, kill it and
+    // delete the lock so this start can succeed instead of hitting a
+    // confusing `DirectoryLock$LockException` from Forge.
+    if cfg.is_minecraft() {
+        let lock_path = server_dir.join("world").join("session.lock");
+        if lock_path.exists() {
+            let pid_file = server_dir.join(".lbby-server.pid");
+            #[cfg(unix)]
+            {
+                if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        kill_unix_process_tree(pid).await;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+            std::fs::remove_file(&pid_file).ok();
+            if let Err(e) = std::fs::remove_file(&lock_path) {
+                eprintln!("[lbby] could not remove stale session.lock: {}", e);
+            } else {
+                let s = app.state();
+                s.push_console_line(
+                    "[lbby] Removed stale world/session.lock from a previous run".to_string(),
+                );
+            }
+        }
+    }
+
+    // Pick the Java version that matches the Minecraft version
+    let required_major = crate::java::required_java_for_mc(&cfg.minecraft_version);
+    let resolved_java = crate::java::find_java_with_version(required_major);
+    let (java_bin, actual_major) = match resolved_java {
+        Some(p) => (p, Some(required_major)),
+        None => {
+            let s = app.state();
+            s.push_console_line(
+                format!("[lbby] Java {} not found — downloading from Adoptium\u{2026}", required_major),
+            );
+            match crate::java::ensure_java(required_major, &app).await {
+                Ok(path) => (path, Some(required_major)),
+                Err(e) => {
+                    eprintln!("[lbby] Java download failed: {}", e);
+                    let fallback = if !cfg.java_path.is_empty() && std::path::Path::new(&cfg.java_path).exists() {
+                        PathBuf::from(&cfg.java_path)
+                    } else if cfg!(target_os = "windows") {
+                        PathBuf::from("java.exe")
+                    } else {
+                        PathBuf::from("/usr/bin/java")
+                    };
+                    let actual = crate::java::detect_java_major(&fallback);
+                    (fallback, actual)
+                }
+            }
+        }
+    };
+
+    // Java version check
+    let install_hint: &str = if cfg!(target_os = "macos") {
+        "  \u{2022} Install via: brew install openjdk@17 (or download from https://adoptium.net)"
+    } else if cfg!(target_os = "windows") {
+        "  \u{2022} Download Eclipse Temurin from https://adoptium.net (pick the matching version)"
+    } else {
+        "  \u{2022} Install OpenJDK 17 from your distro's package manager or https://adoptium.net"
+    };
+    match actual_major {
+        Some(m) if m < required_major => {
+            return Err(format!(
+                "Java too old. Minecraft {} (Forge/{}) needs Java {}, but {} has Java {}.\n{}",
+                cfg.minecraft_version,
+                cfg.loader_version.as_deref().unwrap_or("loader"),
+                required_major,
+                java_bin.display(),
+                m,
+                install_hint
+            ));
+        }
+        Some(m) if m > required_major => {
+            if matches!(cfg.server_type, ServerType::Forge | ServerType::NeoForge) {
+                return Err(format!(
+                    "Java {} is too new for Minecraft {} ({}). This server type needs Java {} — \
+                     newer JVMs cause the server to hang silently.\n{}",
+                    m, cfg.minecraft_version,
+                    cfg.loader_version.as_deref().unwrap_or("loader"),
+                    required_major, install_hint
+                ));
+            }
+            let s = app.state();
+            let warn = format!(
+                "[lbby] \u{26a0} Using Java {} (newer than the recommended Java {} for MC {}). \
+                 Most newer JVMs work, but if the server hangs at startup, install Java {}.",
+                m, required_major, cfg.minecraft_version, required_major
+            );
+            s.push_console_line(warn.clone());
+            app.emit("mc-line", &warn).ok();
+        }
+        _ => {}
+    }
+
+    let java_home = crate::java::java_home_from_bin(&java_bin);
+    let banner = format!(
+        "[lbby] Using Java {} at {}",
+        actual_major.unwrap_or(required_major),
+        java_bin.display()
+    );
+    {
+        let s = app.state();
+        s.push_console_line(banner.clone());
+    }
+    app.emit("mc-line", &banner).ok();
+
+    let mut cmd = match cfg.server_type {
+        ServerType::Forge | ServerType::NeoForge => {
+            #[cfg(target_os = "windows")]
+            let mut c = {
+                let mut c = tokio::process::Command::new("cmd");
+                c.args(["/c", "run.bat", "nogui"]);
+                c
+            };
+            #[cfg(not(target_os = "windows"))]
+            let mut c = {
+                let mut c = tokio::process::Command::new("/bin/bash");
+                c.args(["-c", "./run.sh nogui"]);
+                c
+            };
+            if let Some(jh) = &java_home {
+                c.env("JAVA_HOME", jh);
+                let bin_dir = jh.join("bin");
+                let sep = if cfg!(windows) { ";" } else { ":" };
+                let new_path = match std::env::var("PATH") {
+                    Ok(p) => format!("{}{}{}", bin_dir.display(), sep, p),
+                    Err(_) => bin_dir.display().to_string(),
+                };
+                c.env("PATH", new_path);
+            }
+            c
+        }
+        _ => {
+            let mut c = tokio::process::Command::new(&java_bin);
+            c.arg(format!("-Xmx{}M", ram));
+            c.arg(format!("-Xms{}M", (ram / 2).max(512)));
+            if cfg.optimized_jvm_flags {
+                c.args(optimized_jvm_flags());
+            }
+            c.args(["-jar", "server.jar", "nogui"]);
+            c
+        }
+    };
+
+    cmd.env_remove("DYLD_LIBRARY_PATH");
+    cmd.env_remove("DYLD_FALLBACK_LIBRARY_PATH");
+    cmd.env_remove("DYLD_FRAMEWORK_PATH");
+    cmd.env_remove("DYLD_ROOT_PATH");
+    cmd.env_remove("DYLD_IMAGE_SUFFIX");
+    cmd.env_remove("DYLD_SHARED_FILE");
+    cmd.env_remove("DYLD_INSERT_LIBRARIES");
+    cmd.env_remove("DYLD_FORCE_FLAT_NAMESPACE");
+
+    cmd.current_dir(&server_dir)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    hide_child_window(&mut cmd);
+
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to start server: {}", e))?;
+    let stdin = child.stdin.take().ok_or("No stdin")?;
+    let stdout = child.stdout.take().ok_or("No stdout")?;
+    let stderr = child.stderr.take().ok_or("No stderr")?;
+    let pid = child.id();
+    drop(child); // Release the child handle — streams are taken, process runs independently
+
+    {
+        let state = app.state();
+        let mut srv = state.server.lock().await;
+        srv.stdin = Some(stdin);
+        srv.pid = pid;
+    }
+
+    if let Some(p) = pid {
+        let _ = std::fs::write(server_dir.join(".lbby-server.pid"), p.to_string());
+    }
+
+    let players_max = cfg.max_players;
+    {
+        let s = app.state();
+        let mut st = s.stats.lock().await;
+        *st = ServerStats::default();
+        st.players_max = players_max;
+        st.ram_max_mb = ram;
+    }
+
+    // Spawn stdout reader task — detects "Done" line, parses TPS / player events,
+    // and feeds the console buffer.
+    let app3 = app.clone();
+    tokio::spawn(async move {
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.contains("Done") && line.contains("For help") {
+                let s = app3.state();
+                let mut srv = s.server.lock().await;
+                if srv.status == ServerStatus::Starting {
+                    srv.status = ServerStatus::Running;
+                    app3.emit("server-status", ServerStatus::Running).ok();
+                }
+            }
+            if let Some(tps) = parse_tps_line(&line) {
+                let s = app3.state();
+                let mut st = s.stats.lock().await;
+                st.tps = tps;
+                app3.emit("server-stats", st.clone()).ok();
+            }
+            if let Some(tick) = parse_gametime_line(&line) {
+                let s = app3.state();
+                let now = std::time::Instant::now();
+                let mut last = s.last_gametime_sample.lock().await;
+                if let Some((prev_tick, prev_inst)) = *last {
+                    let elapsed_secs = now.duration_since(prev_inst).as_secs_f32();
+                    let tick_delta = tick.saturating_sub(prev_tick) as f32;
+                    if elapsed_secs > 0.5 && tick_delta >= 0.0 {
+                        let tps = (tick_delta / elapsed_secs).clamp(0.0, 20.0);
+                        let mut st = s.stats.lock().await;
+                        st.tps = tps;
+                        app3.emit("server-stats", st.clone()).ok();
+                    }
+                }
+                *last = Some((tick, now));
+            }
+            if let Some((name, is_join)) = parse_player_event(&line) {
+                let s = app3.state();
+                let mut players = s.online_players.lock().await;
+                if is_join { players.insert(name.clone()); }
+                else       { players.remove(&name); }
+                let list: Vec<String> = players.iter().cloned().collect();
+                let count = players.len() as u32;
+                drop(players);
+
+                if is_join {
+                    s.record_player_join(name.clone());
+                    app3.emit("recent-players-update", s.recent_players.lock().await.iter().cloned().collect::<Vec<_>>()).ok();
+                }
+
+                let mut st = s.stats.lock().await;
+                st.players_online = count;
+                app3.emit("server-stats", st.clone()).ok();
+                app3.emit("players-update", &list).ok();
+            }
+            {
+                let s = app3.state();
+                s.push_console_line(line.clone());
+            }
+            app3.emit("mc-line", &line).ok();
+        }
+        // Stream ended — server process exited
+        let s = app3.state();
+        let was_unexpected = {
+            let srv = s.server.lock().await;
+            !srv.stop_requested
+        };
+        {
+            let mut srv = s.server.lock().await;
+            srv.status = ServerStatus::Stopped;
+            srv.stdin = None;
+            srv.pid = None;
+        }
+        app3.emit("server-status", ServerStatus::Stopped).ok();
+        let cfg = crate::config::load_config();
+        let _ = std::fs::remove_file(
+            PathBuf::from(&cfg.server_path).join(".lbby-server.pid"),
+        );
+        let mut st = s.stats.lock().await;
+        *st = ServerStats::default();
+        app3.emit("server-stats", st.clone()).ok();
+        let mut players = s.online_players.lock().await;
+        players.clear();
+        app3.emit("players-update", &Vec::<String>::new()).ok();
+        drop(players);
+        drop(st);
+
+        // Auto-restart if enabled and exit was unexpected
+        if was_unexpected && cfg.auto_restart {
+            let now = std::time::Instant::now();
+            let window = std::time::Duration::from_secs(RESTART_WINDOW_SECS);
+            let allow = {
+                let mut hist = s.recent_auto_restarts.lock().await;
+                while let Some(&front) = hist.front() {
+                    if now.duration_since(front) > window { hist.pop_front(); } else { break; }
+                }
+                if hist.len() >= MAX_RESTARTS_IN_WINDOW {
+                    false
+                } else {
+                    hist.push_back(now);
+                    true
+                }
+            };
+
+            if !allow {
+                let msg = format!(
+                    "[lbby] Auto-restart disabled — server crashed {}+ times in {} seconds. Fix the issue and start manually.",
+                    MAX_RESTARTS_IN_WINDOW, RESTART_WINDOW_SECS
+                );
+                s.push_console_line(msg.clone());
+                app3.emit("mc-line", &msg).ok();
+                return;
+            }
+
+            let msg = "[lbby] Server exited unexpectedly. Auto-restart in 3s…".to_string();
+            s.push_console_line(msg.clone());
+            app3.emit("mc-line", &msg).ok();
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let _ = crate::server::start_server(app3).await;
+        }
+    });
+
+    // Spawn stderr reader task
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        let reader = BufReader::new(stderr);
+        let mut lines = reader.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let formatted = format!("[stderr] {}", line);
+            let s = app2.state();
+            s.push_console_line(formatted.clone());
+            app2.emit("mc-line", &formatted).ok();
+        }
+    });
+
+    // ── Stats poller task ──────────────────────────────────────────────────
+    let app_stats = app.clone();
+    let started_at = std::time::Instant::now();
+    let server_dir_for_stats = server_dir.clone();
+    let loader_label = cfg.server_type.label().to_string();
+    let mods_folder = extras_folder(&cfg);
+    let cfg_stats = cfg.clone();
+
+    tokio::spawn(async move {
+        let cfg = cfg_stats;
+        let mut poller = crate::stats::StatsPoller::new();
+        let mut tick: u32 = 0;
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            let s = app_stats.state();
+            let server_pid = {
+                let srv = s.server.lock().await;
+                if srv.status == ServerStatus::Stopped { break; }
+                match srv.pid { Some(p) => p, None => continue }
+            };
+            if let Some((cpu, ram_mb, disk_r, disk_w, disk_used, disk_total)) =
+                poller.sample(server_pid, &server_dir_for_stats)
+            {
+                let mut st = s.stats.lock().await;
+                st.cpu_percent = cpu;
+                st.ram_used_mb = ram_mb;
+                st.disk_read_kb_s = disk_r;
+                st.disk_write_kb_s = disk_w;
+                st.disk_used_mb = disk_used;
+                st.disk_total_mb = disk_total;
+                st.uptime_seconds = started_at.elapsed().as_secs();
+                st.loader_label = loader_label.clone();
+                if tick.is_multiple_of(5) {
+                    st.mods_count = crate::stats::count_mods(&server_dir_for_stats.join(&mods_folder));
+                    let world_dir = if cfg.is_terraria() {
+                        server_dir_for_stats.join("Worlds")
+                    } else {
+                        server_dir_for_stats.join("world")
+                    };
+                    st.world_size_mb = crate::stats::dir_size_mb(&world_dir);
+                }
+                tick = tick.wrapping_add(1);
+                app_stats.emit("server-stats", st.clone()).ok();
+            }
+        }
+    });
+
+    // ── Reset gametime tracker ─────────────────────────────────────────────
+    {
+        let state = app.state();
+        *state.last_gametime_sample.lock().await = None;
+    }
+
+    // ── TPS query loop ─────────────────────────────────────────────────────
+    let tps_cmd: Option<&'static str> = match cfg.server_type {
+        ServerType::Paper | ServerType::Bukkit | ServerType::Spigot
+        | ServerType::Folia | ServerType::Purpur => Some("tps\n"),
+        ServerType::Forge | ServerType::NeoForge => Some("forge tps\n"),
+        ServerType::Vanilla | ServerType::Fabric
+        | ServerType::SpongeVanilla | ServerType::SpongeForge => Some("time query gametime\n"),
+        ServerType::Terraria | ServerType::TModLoader => None,
+    };
+    if let Some(cmd_bytes) = tps_cmd {
+        let app_tps = app.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+            loop {
+                let s = app_tps.state();
+                {
+                    let mut srv = s.server.lock().await;
+                    if srv.status == ServerStatus::Stopped { break; }
+                    if srv.status == ServerStatus::Running {
+                        if let Some(stdin) = &mut srv.stdin {
+                            let _ = tokio::io::AsyncWriteExt::write_all(stdin, cmd_bytes.as_bytes()).await;
+                        }
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            }
+        });
+    }
+
+    Ok(())
+}
+
+/// Gracefully stop the Minecraft server.
+///
+/// Sends `stop` to stdin, waits up to 10 seconds for a clean exit, then
+/// force-kills the entire process tree if it is still alive.
+pub async fn stop_server(app: Arc<crate::app_state::AppEventSender>) -> Result<(), String> {
+    let state = app.state();
+    {
+        let srv = state.server.lock().await;
+        if srv.status == ServerStatus::Stopped {
+            return Err("Server is not running".to_string());
+        }
+    }
+    graceful_or_force_stop_server(&app, 10).await;
+    Ok(())
+}
+
+/// Hard-kill variant — only waits 3 seconds before force-killing.
+pub async fn force_stop_server(app: Arc<crate::app_state::AppEventSender>) -> Result<(), String> {
+    graceful_or_force_stop_server(&app, 3).await;
+    Ok(())
+}
+
+/// Restart the server: stop, wait a moment, then start again.
+pub async fn restart_server(app: Arc<crate::app_state::AppEventSender>) -> Result<(), String> {
+    stop_server(app.clone()).await?;
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    let result = crate::helpers::do_start_server(app.clone()).await;
+    if result.is_err() {
+        let state = app.state();
+        let mut srv = state.server.lock().await;
+        if srv.status == ServerStatus::Starting {
+            srv.status = ServerStatus::Stopped;
+            srv.stdin = None;
+            srv.pid = None;
+            app.emit("server-status", ServerStatus::Stopped).ok();
+        }
+    }
+    result
+}
+
+/// Send a command string to the running server's stdin.
+pub async fn send_command(app: Arc<crate::app_state::AppEventSender>, cmd: &str) -> Result<(), String> {
+    let state = app.state();
+    let mut srv = state.server.lock().await;
+    if let Some(stdin) = &mut srv.stdin {
+        stdin
+            .write_all(format!("{}\n", cmd).as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    } else if srv.status == ServerStatus::Running {
+        Err("Server stdin is not available".to_string())
+    } else {
+        Err("Server is not running".to_string())
+    }
+}
+
+// ── Internal: graceful-or-force stop ───────────────────────────────────────
+
+/// Send `stop` to the server, wait up to `grace_secs` for a clean exit, and
+/// force-kill the entire process tree if it is still alive. Also clears stale
+/// `world/session.lock` so the next start won't hit a lock error.
+async fn graceful_or_force_stop_server(app: &Arc<crate::app_state::AppEventSender>, grace_secs: u64) {
+    let state = app.state();
+
+    // Phase 1: request graceful stop (if running)
+    let pid_to_watch: Option<u32> = {
+        let cfg = crate::config::load_config();
+        let mut srv = state.server.lock().await;
+        match srv.status {
+            ServerStatus::Running | ServerStatus::Starting => {
+                srv.stop_requested = true;
+                if let Some(stdin) = &mut srv.stdin {
+                    if cfg.is_terraria() {
+                        stdin.write_all(b"save\n").await.ok();
+                        stdin.write_all(b"exit\n").await.ok();
+                    } else {
+                        stdin.write_all(b"stop\n").await.ok();
+                    }
+                }
+                srv.status = ServerStatus::Stopping;
+                app.emit("server-status", ServerStatus::Stopping).ok();
+                srv.pid
+            }
+            ServerStatus::Stopping => srv.pid,
+            ServerStatus::Stopped => None,
+        }
+    };
+
+    if pid_to_watch.is_none() {
+        return;
+    }
+
+    // Phase 2: wait for the server to exit cleanly
+    let max_iters = (grace_secs * 2).max(2);
+    for _ in 0..max_iters {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        let stopped = {
+            let srv = state.server.lock().await;
+            srv.status == ServerStatus::Stopped || srv.pid.is_none()
+        };
+        if stopped {
+            return;
+        }
+    }
+
+    // Phase 3: force-kill the stuck process tree
+    let stuck_pid = match state.server.lock().await.pid {
+        Some(p) => p,
+        None => return,
+    };
+    eprintln!(
+        "[lbby] graceful stop timed out after {}s — force-killing PID {} and descendants",
+        grace_secs, stuck_pid
+    );
+
+    #[cfg(unix)]
+    {
+        kill_unix_process_tree(stuck_pid).await;
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = tokio::process::Command::new("taskkill");
+        cmd.args(["/PID", &stuck_pid.to_string(), "/T", "/F"]);
+        crate::helpers::hide_child_window(&mut cmd);
+        cmd.output().await.ok();
+    }
+
+    // Phase 4: clear stale session lock so next start can boot
+    let cfg = crate::config::load_config();
+    if cfg.is_minecraft() {
+        let lock = std::path::PathBuf::from(&cfg.server_path).join("world").join("session.lock");
+        if lock.exists() {
+            std::fs::remove_file(&lock).ok();
+        }
+    }
+
+    // Phase 5: reset state
+    let mut srv = state.server.lock().await;
+    srv.status = ServerStatus::Stopped;
+    srv.stdin = None;
+    srv.pid = None;
+    app.emit("server-status", ServerStatus::Stopped).ok();
 }
 
 // ── Extracted generic server functions ────────────────────────────────────────
@@ -1489,4 +2105,153 @@ async fn install_tmodloader(app: &Arc<AppEventSender>, _cfg: &ServerConfig, serv
 
     emit_progress(app, "tModLoader server installed", 1.0);
     Ok(())
+}
+
+// ── Pregenerate chunks ───────────────────────────────────────────────────────
+
+pub async fn pregenerate_chunks(app: Arc<crate::app_state::AppEventSender>, total_chunks: u32) -> Result<(), String> {
+    do_pregenerate_chunks(app, total_chunks).await
+}
+
+pub async fn do_pregenerate_chunks(app: Arc<crate::app_state::AppEventSender>, total_chunks: u32) -> Result<(), String> {
+    let lic = crate::license::current();
+    let cap = crate::license::max_pregen_chunks(lic.tier);
+    if total_chunks > cap {
+        return Err(format!(
+            "Requested {} chunks exceeds your {:?} tier limit of {}. Upgrade for larger pre-generations.",
+            total_chunks, lic.tier, cap
+        ));
+    }
+    if total_chunks == 0 {
+        return Err("total_chunks must be > 0".to_string());
+    }
+    {
+        let s = app.state();
+        let srv = s.server.lock().await;
+        if srv.status != ServerStatus::Running {
+            return Err("Server must be running to pre-generate chunks".to_string());
+        }
+    }
+    {
+        let s = app.state();
+        let mut pg = s.pregen.lock().await;
+        if pg.running {
+            return Err("A pre-generation task is already running".to_string());
+        }
+        let mut side = (total_chunks as f64).sqrt().ceil() as u32;
+        if side.is_multiple_of(2) { side += 1; }
+        let total = side * side;
+        *pg = crate::app_state::PregenState { running: true, total, completed: 0, cancel_requested: false };
+        app.emit("pregen-update", pg.clone()).ok();
+    }
+
+    let app_task = app.clone();
+    tokio::spawn(async move {
+        let result = run_pregen(&app_task, total_chunks).await;
+        let s = app_task.state();
+
+        {
+            let mut srv = s.server.lock().await;
+            if srv.status == ServerStatus::Running {
+                if let Some(stdin) = &mut srv.stdin {
+                    let _ = tokio::io::AsyncWriteExt::write_all(stdin, b"forceload remove all\n").await;
+                }
+            }
+        }
+
+        let final_msg = match result {
+            Ok(completed) => format!("[lbby] Pre-generation complete: {} chunks", completed),
+            Err(e) if e == "cancelled" => "[lbby] Pre-generation cancelled".to_string(),
+            Err(e) => format!("[lbby] Pre-generation failed: {}", e),
+        };
+        s.push_console_line(final_msg.clone());
+        app_task.emit("mc-line", &final_msg).ok();
+
+        let mut pg = s.pregen.lock().await;
+        pg.running = false;
+        pg.cancel_requested = false;
+        app_task.emit("pregen-update", pg.clone()).ok();
+    });
+
+    Ok(())
+}
+
+async fn run_pregen(app: &Arc<crate::app_state::AppEventSender>, _requested_total: u32) -> Result<u32, String> {
+    let s = app.state();
+    let total = { s.pregen.lock().await.total };
+    let side_len = (total as f64).sqrt() as u32;
+    let half = (side_len / 2) as i32;
+
+    const BATCH: i32 = 16;
+    let mut completed: u32 = 0;
+
+    let banner = format!(
+        "[lbby] Pre-generating {} chunks ({}x{} grid centered on spawn)…",
+        total, side_len, side_len
+    );
+    s.push_console_line(banner.clone());
+    app.emit("mc-line", &banner).ok();
+
+    let mut z = -half;
+    while z <= half {
+        let z_end = (z + BATCH - 1).min(half);
+        let mut x = -half;
+        while x <= half {
+            {
+                let pg = s.pregen.lock().await;
+                if pg.cancel_requested { return Err("cancelled".to_string()); }
+            }
+            {
+                let srv = s.server.lock().await;
+                if srv.status != ServerStatus::Running {
+                    return Err("Server stopped during pre-generation".to_string());
+                }
+            }
+
+            let x_end = (x + BATCH - 1).min(half);
+            let cmd = format!("forceload add {} {} {} {}\n", x, z, x_end, z_end);
+            {
+                let mut srv = s.server.lock().await;
+                if let Some(stdin) = &mut srv.stdin {
+                    tokio::io::AsyncWriteExt::write_all(stdin, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
+                }
+            }
+
+            let batch_chunks = ((x_end - x + 1) as u32) * ((z_end - z + 1) as u32);
+            tokio::time::sleep(std::time::Duration::from_millis(
+                (batch_chunks as u64 * 30).max(700),
+            )).await;
+
+            completed += batch_chunks;
+            {
+                let mut pg = s.pregen.lock().await;
+                pg.completed = completed.min(total);
+                app.emit("pregen-update", pg.clone()).ok();
+            }
+
+            if completed.is_multiple_of(1024) {
+                let mut srv = s.server.lock().await;
+                if let Some(stdin) = &mut srv.stdin {
+                    let _ = tokio::io::AsyncWriteExt::write_all(stdin, b"forceload remove all\n").await;
+                }
+            }
+
+            x += BATCH;
+        }
+        z += BATCH;
+    }
+
+    Ok(completed.min(total))
+}
+
+pub async fn cancel_pregenerate(state: &crate::app_state::AppState) -> Result<(), String> {
+    let mut pg = state.pregen.lock().await;
+    if pg.running {
+        pg.cancel_requested = true;
+    }
+    Ok(())
+}
+
+pub async fn get_pregen_state(state: &crate::app_state::AppState) -> Result<crate::app_state::PregenState, String> {
+    Ok(state.pregen.lock().await.clone())
 }
