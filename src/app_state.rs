@@ -54,9 +54,12 @@ pub struct ModInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionResult {
-    pub id: String,
-    pub status: String,
+    /// Action ID — serialized as "actionId" for the dashboard API.
+    #[serde(rename = "actionId")]
+    pub action_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
