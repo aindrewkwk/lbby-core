@@ -52,61 +52,121 @@ pub fn default_server_path_value(game: Option<&str>) -> String {
         .to_string()
 }
 
-/// Read mod info from a JAR/ZIP file.
-pub fn read_mod_info(path: &std::path::Path) -> Option<crate::app_state::ModInfo> {
-    use std::io::Read;
-
-    let file = std::fs::File::open(path).ok()?;
-    let mut archive = zip::ZipArchive::new(file).ok()?;
-
-    // Try fabric.mod.json first
-    if let Ok(mut f) = archive.by_name("fabric.mod.json") {
-        let mut contents = String::new();
-        f.read_to_string(&mut contents).ok()?;
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
-            let name = json["name"].as_str().unwrap_or("").to_string();
-            let version = json["version"].as_str().unwrap_or("").to_string();
-            let authors = json["authors"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            let description = json["description"].as_str().unwrap_or("").to_string();
-            return Some(crate::app_state::ModInfo {
-                file_name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
-                display_name: name,
-                version,
-                authors,
-                description,
-                icon_data_url: None,
-            });
-        }
+fn normalize_mod_info(mut info: crate::app_state::ModInfo) -> crate::app_state::ModInfo {
+    if info.display_name.trim().is_empty() {
+        info.display_name = info.file_name.trim_end_matches(".jar").trim_end_matches(".tmod").to_string();
     }
+    info.version = info.version.trim().to_string();
+    info.authors = info
+        .authors
+        .into_iter()
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty() && !a.starts_with("${"))
+        .collect();
+    info
+}
 
-    // Try mods.toml (Forge)
-    if let Ok(mut f) = archive.by_name("META-INF/mods.toml") {
-        let mut contents = String::new();
-        f.read_to_string(&mut contents).ok()?;
-        if let Ok(toml) = contents.parse::<toml::Value>() {
-            let mods = toml.get("mods").and_then(|m| m.as_array());
-            if let Some(mods) = mods {
-                if let Some(first) = mods.first() {
-                    let name = first.get("displayName").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let version = first.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let description = first.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    return Some(crate::app_state::ModInfo {
-                        file_name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
-                        display_name: name,
-                        version,
-                        authors: vec![],
-                        description,
-                        icon_data_url: None,
-                    });
-                }
+fn read_fabric_mod_info<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    file_name: &str,
+) -> Option<crate::app_state::ModInfo> {
+    let text = read_zip_text(zip, "fabric.mod.json")?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let display_name = {
+        let name = json_string(&value, "name");
+        if name.is_empty() { json_string(&value, "id") } else { name }
+    };
+    let version = json_string(&value, "version");
+    let description = json_string(&value, "description");
+    let authors = match value.get("authors") {
+        Some(serde_json::Value::Array(items)) => items.iter().filter_map(|item| {
+            if let Some(s) = item.as_str() {
+                Some(s.to_string())
+            } else {
+                item.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
             }
-        }
-    }
+        }).collect(),
+        _ => Vec::new(),
+    };
+    let icon_path = match value.get("icon") {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Object(map)) => map
+            .get("64")
+            .or_else(|| map.values().next())
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        _ => None,
+    };
+    let icon_data_url = icon_path.as_deref().and_then(|p| read_zip_icon_data_url(zip, p));
+    Some(crate::app_state::ModInfo {
+        file_name: file_name.to_string(),
+        display_name: if display_name.is_empty() { file_name.trim_end_matches(".jar").trim_end_matches(".tmod").to_string() } else { display_name },
+        version,
+        authors,
+        description,
+        icon_data_url,
+    })
+}
 
-    None
+fn read_forge_mod_info<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    file_name: &str,
+) -> Option<crate::app_state::ModInfo> {
+    let text = read_zip_text(zip, "META-INF/mods.toml")
+        .or_else(|| read_zip_text(zip, "mods.toml"))?;
+    let value: toml::Value = text.parse().ok()?;
+    let mods = value.get("mods")?.as_array()?;
+    let first = mods.first()?;
+    let display_name = toml_string(first, "displayName");
+    let mod_id = toml_string(first, "modId");
+    let raw_version = toml_string(first, "version");
+    let version = if raw_version.starts_with("${") { String::new() } else { raw_version };
+    let authors_raw = toml_string(first, "authors");
+    let authors = authors_raw
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let description = toml_string(first, "description");
+    let icon_path = toml_string(first, "logoFile");
+    let icon_data_url = read_zip_icon_data_url(zip, &icon_path);
+    Some(crate::app_state::ModInfo {
+        file_name: file_name.to_string(),
+        display_name: if display_name.is_empty() { mod_id } else { display_name },
+        version,
+        authors,
+        description,
+        icon_data_url,
+    })
+}
+
+/// Read mod info from a JAR/ZIP file. Always returns a ModInfo — falls back
+/// to the filename if no metadata can be extracted.
+pub fn read_mod_info(path: &std::path::Path) -> crate::app_state::ModInfo {
+    let file_name = path
+        .file_name()
+        .map(|v| v.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    let fallback = crate::app_state::ModInfo {
+        display_name: file_name.trim_end_matches(".jar").trim_end_matches(".tmod").to_string(),
+        file_name: file_name.clone(),
+        version: String::new(),
+        authors: Vec::new(),
+        description: String::new(),
+        icon_data_url: None,
+    };
+
+    let Ok(file) = std::fs::File::open(path) else { return fallback; };
+    let Ok(mut zip) = zip::ZipArchive::new(file) else { return fallback; };
+
+    if let Some(info) = read_fabric_mod_info(&mut zip, &file_name) {
+        return normalize_mod_info(info);
+    }
+    if let Some(info) = read_forge_mod_info(&mut zip, &file_name) {
+        return normalize_mod_info(info);
+    }
+    fallback
 }
 
 /// Stub: start server — to be implemented by agent/app.
@@ -128,10 +188,9 @@ pub async fn remote_kill_server_and_playit(app: &Arc<AppEventSender>) {
     let _ = crate::playit::stop(app.clone()).await;
 }
 
-/// Stub: install server — full implementation to be migrated from monolithic lib.rs.
+/// Install a game server — delegates to the full implementation in server.rs.
 pub async fn do_install_server(app: Arc<AppEventSender>, cfg: ServerConfig) -> Result<ServerConfig, String> {
-    let _ = (app, cfg);
-    Err("Server installation not yet implemented in lbby-core".to_string())
+    crate::server::do_install_server(app, cfg).await
 }
 
 // ── Generic helpers (migrated from lbby-agent/src/lib.rs) ────────────────────

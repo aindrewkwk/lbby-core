@@ -312,10 +312,37 @@ impl Default for PlayitState {
     }
 }
 
-/// Stub: stop the playit.gg tunnel — full implementation to be migrated from monolithic lib.rs.
+/// Stop the running playit.gg process and update shared state.
 pub async fn stop(app: std::sync::Arc<crate::app_state::AppEventSender>) -> Result<(), String> {
-    let _ = app;
-    Err("playit::stop not yet implemented in lbby-core".to_string())
+    let state = app.state();
+    let mut pl = state.playit.lock().await;
+
+    if !pl.running {
+        return Ok(());
+    }
+
+    if let Some(pid) = pl.pid {
+        #[cfg(unix)]
+        unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+        #[cfg(windows)]
+        {
+            let mut cmd = tokio::process::Command::new("taskkill");
+            cmd.args(["/PID", &pid.to_string(), "/F"]);
+            hide_tokio_child_window(&mut cmd);
+            cmd.output().await.ok();
+        }
+    }
+
+    pl.running = false;
+    pl.pid = None;
+    pl.address = None;
+
+    let snapshot = pl.clone();
+    drop(pl);
+
+    let _ = app.emit("playit-status", &snapshot);
+
+    Ok(())
 }
 
 pub fn playit_dir() -> PathBuf {

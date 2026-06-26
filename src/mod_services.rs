@@ -428,7 +428,7 @@ pub fn list_installed_mods() -> Result<Vec<ModInfo>, String> {
     let mut mods: Vec<ModInfo> = std::fs::read_dir(&dir).map_err(|e| e.to_string())?
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == ext))
-        .filter_map(|e| read_mod_info(&e.path()))
+        .map(|e| read_mod_info(&e.path()))
         .collect();
     mods.sort_by_key(|a| a.display_name.to_lowercase());
     Ok(mods)
@@ -444,7 +444,7 @@ pub async fn check_mod_updates() -> Result<Vec<ModUpdateInfo>, String> {
         if path.extension().is_none_or(|x| x != "jar") {
             continue;
         }
-        let Some(info) = read_mod_info(&path) else { continue; };
+        let info = read_mod_info(&path);
         let hash = {
             let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
             format!("{:x}", Sha512::digest(&bytes))
@@ -829,4 +829,68 @@ pub async fn install_modpack_from_file(app: std::sync::Arc<crate::app_state::App
     } else {
         Err("Choose a .mrpack or CurseForge .zip file.".to_string())
     }
+}
+
+pub async fn add_mod(file_path: String, overwrite: Option<bool>) -> Result<(), String> {
+    let cfg = config::load_config();
+    let src = PathBuf::from(&file_path);
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let allowed = match cfg.server_type {
+        ServerType::Terraria | ServerType::TModLoader => ext == "tmod",
+        _ => ext == "jar",
+    };
+    if !allowed {
+        return Err(format!("Only {} files can be imported as mods for this server type.",
+            if cfg.is_terraria() { ".tmod" } else { ".jar" }));
+    }
+    let name = src.file_name().ok_or("Invalid file path")?.to_string_lossy().to_string();
+    let dest = mods_dir(&cfg)?.join(&name);
+    tokio::fs::create_dir_all(dest.parent().unwrap()).await.map_err(|e| e.to_string())?;
+    if dest.exists() && !overwrite.unwrap_or(false) {
+        return Err(format!("A mod named {} already exists.", name));
+    }
+    tokio::fs::copy(&src, &dest).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub async fn remove_mod(mod_name: String) -> Result<(), String> {
+    let cfg = config::load_config();
+    let path = mods_dir(&cfg)?.join(&mod_name);
+    tokio::fs::remove_file(&path).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Deletes every mod file in the mods/plugins folder. Returns the number
+/// of files removed. Used by the "Remove all mods" button in the UI — the
+/// frontend is responsible for confirming with the user before invoking.
+pub async fn remove_all_mods() -> Result<u32, String> {
+    let cfg = config::load_config();
+    let dir = mods_dir(&cfg)?;
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let is_terraria = cfg.is_terraria();
+    let mut removed: u32 = 0;
+    let mut entries = tokio::fs::read_dir(&dir).await.map_err(|e| e.to_string())?;
+    while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+        let path = entry.path();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let is_mod = if is_terraria { ext == "tmod" } else { ext == "jar" };
+        if !is_mod {
+            continue;
+        }
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            return Err(format!(
+                "Failed to remove '{}': {}",
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                e
+            ));
+        }
+        removed += 1;
+    }
+    Ok(removed)
 }

@@ -1,8 +1,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
+
+use crate::app_state::AppEventSender;
+use crate::config::{ServerConfig, ServerType};
+use crate::helpers::{InstallProgress, hide_child_window};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -611,4 +618,875 @@ pub async fn kill_unix_process_tree(root_pid: u32) {
     for pid in &pids {
         unsafe { libc::kill(*pid as i32, libc::SIGKILL); }
     }
+}
+
+// ── Server installation ──────────────────────────────────────────────────────
+
+// Internal deserialization types for Minecraft version/installer APIs.
+
+#[derive(Debug, Deserialize)]
+struct VersionManifest {
+    versions: Vec<VersionEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VersionEntry {
+    id: String,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct VersionData {
+    downloads: Downloads,
+}
+
+#[derive(Debug, Deserialize)]
+struct Downloads {
+    server: Option<DownloadItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DownloadItem {
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaperBuild {
+    downloads: PaperDownloads,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaperDownloads {
+    application: PaperApp,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaperApp {
+    name: String,
+}
+
+// ── Download + progress helpers ──────────────────────────────────────────────
+
+/// Download a file from a URL to a local path, emitting progress events.
+async fn download_file(app: &Arc<AppEventSender>, url: &str, dest: &Path, label: &str) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .user_agent("MCHost/0.1")
+        .build().map_err(|e| e.to_string())?;
+
+    let resp = client.get(url).send().await.map_err(|e| format!("Download failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("Download failed with HTTP {} for {}", resp.status(), url));
+    }
+    let total = resp.content_length().unwrap_or(0);
+    let mut stream = resp.bytes_stream();
+    let mut file = tokio::fs::File::create(dest).await.map_err(|e| e.to_string())?;
+    let mut downloaded: u64 = 0;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+        downloaded += chunk.len() as u64;
+        let progress = if total > 0 { downloaded as f32 / total as f32 } else { 0.0 };
+        app.emit("install-progress", InstallProgress {
+            stage: "download".to_string(),
+            label: format!("Downloading {}\u{2026} {:.1}%", label, progress * 100.0),
+            current: downloaded as u32,
+            total: total as u32,
+        }).ok();
+    }
+    Ok(())
+}
+
+/// Emit a simple progress event (not download-related).
+fn emit_progress(app: &Arc<AppEventSender>, message: &str, progress: f32) {
+    app.emit("install-progress", InstallProgress {
+        stage: "install".to_string(),
+        label: message.to_string(),
+        current: (progress * 100.0) as u32,
+        total: 100,
+    }).ok();
+}
+
+/// Find any system Java binary — used as a fallback when auto-download fails.
+async fn check_java() -> Result<String, String> {
+    for path in crate::java::java_candidates() {
+        if path.exists() {
+            if crate::java::detect_java_major(&path).is_some() {
+                return Ok(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    // Try bare "java" as last resort
+    let bin = std::path::PathBuf::from("java");
+    if crate::java::detect_java_major(&bin).is_some() {
+        return Ok("java".to_string());
+    }
+    Err("Java not found. Please install Java 17+ (e.g. Eclipse Temurin).".to_string())
+}
+
+// ── Main install entry point ─────────────────────────────────────────────────
+
+/// Install a game server based on the provided configuration.
+///
+/// Validates config, creates the server directory, dispatches to the
+/// type-specific installer, writes common files (eula.txt, server.properties),
+/// and marks setup as complete.
+pub async fn do_install_server(app: Arc<AppEventSender>, mut cfg: ServerConfig) -> Result<ServerConfig, String> {
+    let server_dir = PathBuf::from(&cfg.server_path);
+    tokio::fs::create_dir_all(&server_dir).await.map_err(|e| e.to_string())?;
+
+    // Terraria servers don't need Java — skip Java detection/download
+    if cfg.server_type.needs_java() && cfg.java_path.is_empty() {
+        // Try to auto-download the right Java version for this MC version.
+        // If download fails, fall back to system Java but verify its version
+        // is sufficient — never silently use a too-old JVM (especially for
+        // Forge/NeoForge which hang silently on version mismatch).
+        let required_major = crate::java::required_java_for_mc(&cfg.minecraft_version);
+        cfg.java_path = match crate::java::ensure_java(required_major, &app).await {
+            Ok(path) => path.to_string_lossy().to_string(),
+            Err(download_err) => {
+                let fallback = check_java().await.unwrap_or_else(|_| "java".to_string());
+                let bin = std::path::PathBuf::from(&fallback);
+                match crate::java::detect_java_major(&bin) {
+                    Some(m) if m >= required_major => fallback,
+                    _ => return Err(format!(
+                        "Java {} is required for Minecraft {} but could not be installed or found. {}",
+                        required_major, cfg.minecraft_version, download_err
+                    )),
+                }
+            }
+        };
+    }
+
+    match cfg.server_type {
+        ServerType::Vanilla => install_vanilla(&app, &cfg, &server_dir).await?,
+        ServerType::Paper => install_paper(&app, &cfg, &server_dir).await?,
+        ServerType::Forge => install_forge(&app, &cfg, &server_dir).await?,
+        ServerType::Fabric => install_fabric(&app, &cfg, &server_dir).await?,
+        ServerType::NeoForge => install_neoforge(&app, &cfg, &server_dir).await?,
+        ServerType::Folia => install_folia(&app, &cfg, &server_dir).await?,
+        ServerType::Purpur => install_purpur(&app, &cfg, &server_dir).await?,
+        ServerType::Bukkit => install_buildtools(&app, &cfg, &server_dir, "craftbukkit").await?,
+        ServerType::Spigot => install_buildtools(&app, &cfg, &server_dir, "spigot").await?,
+        ServerType::SpongeVanilla => install_sponge_vanilla(&app, &cfg, &server_dir).await?,
+        ServerType::SpongeForge => install_sponge_forge(&app, &cfg, &server_dir).await?,
+        ServerType::Terraria => install_terraria(&app, &cfg, &server_dir).await?,
+        ServerType::TModLoader => install_tmodloader(&app, &cfg, &server_dir).await?,
+    }
+
+    // Clean old mods when switching modloader type so incompatible jars
+    // from the previous loader don't linger and crash the new one.
+    {
+        let old_cfg = crate::config::load_config();
+        let old_dir_name = match old_cfg.server_type {
+            ServerType::Paper => "plugins",
+            _ => "mods",
+        };
+        let new_dir_name = match cfg.server_type {
+            ServerType::Paper => "plugins",
+            _ => "mods",
+        };
+        if old_cfg.setup_complete && old_cfg.server_type != cfg.server_type {
+            // Remove .jar files from the old directory
+            let old_dir = server_dir.join(old_dir_name);
+            if old_dir.exists() {
+                for entry in std::fs::read_dir(&old_dir).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|x| x == "jar") {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+            // If the directory name changed (mods <-> plugins), also clean the new one
+            if old_dir_name != new_dir_name {
+                let new_dir = server_dir.join(new_dir_name);
+                if new_dir.exists() {
+                    for entry in std::fs::read_dir(&new_dir).into_iter().flatten().flatten() {
+                        let path = entry.path();
+                        if path.extension().is_some_and(|x| x == "jar") {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "[lbby] Cleaned old {} mods \u{2014} switched from {:?} to {:?}",
+                old_dir_name, old_cfg.server_type, cfg.server_type
+            );
+        }
+    }
+
+    // Common files — game-aware
+    if cfg.is_minecraft() {
+        // Minecraft: eula.txt + server.properties
+        tokio::fs::write(server_dir.join("eula.txt"), "eula=true\n").await
+            .map_err(|e| e.to_string())?;
+        let (view_distance, simulation_distance) = match cfg.performance_preset.as_str() {
+            "low_cpu" => (6, 4),
+            "heavy_modpack" => (8, 5),
+            "max_performance" => (10, 8),
+            _ => (8, 6),
+        };
+        tokio::fs::write(
+            server_dir.join("server.properties"),
+            format!(
+                "online-mode=false\nmax-players={}\nmotd={}\nserver-port=25565\nview-distance={}\nsimulation-distance={}\n",
+                cfg.max_players, cfg.server_name, view_distance, simulation_distance
+            ),
+        ).await.map_err(|e| e.to_string())?;
+    } else if cfg.is_terraria() {
+        // Terraria: serverconfig.txt + Worlds directory
+        let worlds_dir = server_dir.join("Worlds");
+        tokio::fs::create_dir_all(&worlds_dir).await.map_err(|e| e.to_string())?;
+        let _world_path = worlds_dir.join(format!("{}.wld", cfg.server_name));
+        let config_text = crate::terraria_config::generate_config(
+            cfg.max_players,
+            &cfg.server_name,
+            "",  // no world path yet — use autocreate
+            cfg.terraria_difficulty,
+            cfg.terraria_world_size,
+        );
+        tokio::fs::write(
+            server_dir.join("serverconfig.txt"),
+            config_text,
+        ).await.map_err(|e| e.to_string())?;
+    }
+
+    // Always create mods/plugins folder (game-aware)
+    if cfg.is_minecraft() {
+        let extras_dir = match cfg.server_type {
+            ServerType::Forge | ServerType::Fabric | ServerType::NeoForge
+            | ServerType::SpongeVanilla | ServerType::SpongeForge | ServerType::Vanilla => "mods",
+            ServerType::Paper | ServerType::Bukkit | ServerType::Spigot
+            | ServerType::Folia | ServerType::Purpur => "plugins",
+            _ => "mods",
+        };
+        tokio::fs::create_dir_all(server_dir.join(extras_dir)).await.ok();
+    } else if cfg.is_terraria() {
+        // tModLoader uses a Mods directory
+        tokio::fs::create_dir_all(server_dir.join("Mods")).await.ok();
+    }
+
+    // Validate that the server binary/jar exists before marking setup complete
+    if cfg.is_minecraft() {
+        let jar_path = server_dir.join("server.jar");
+        if !jar_path.exists() {
+            return Err("Installation completed but server.jar was not found. The installer may have failed.".to_string());
+        }
+        let meta = tokio::fs::metadata(&jar_path).await.map_err(|e| e.to_string())?;
+        if meta.len() < 1024 {
+            return Err("server.jar appears to be corrupted (too small). Try again.".to_string());
+        }
+    } else if cfg.is_terraria() {
+        if cfg.server_type == ServerType::TModLoader {
+            // tModLoader uses a shell script, not a standalone binary
+            let script = if cfg!(target_os = "windows") {
+                server_dir.join("start-tModLoaderServer.bat")
+            } else {
+                server_dir.join("start-tModLoaderServer.sh")
+            };
+            if !script.exists() {
+                return Err("Installation completed but tModLoader start script was not found. The installer may have failed.".to_string());
+            }
+        } else {
+            // Vanilla Terraria needs the binary — but install_terraria may
+            // have used an existing tModLoader installation as a fallback,
+            // so also accept tModLoader files.
+            let binary = terraria_server_binary(&server_dir);
+            let tmod_script = server_dir.join("start-tModLoaderServer.bat");
+            let tmod_dll = server_dir.join("tModLoader.dll");
+            if !binary.exists() && !tmod_script.exists() && !tmod_dll.exists() {
+                return Err("Installation completed but TerrariaServer was not found. The installer may have failed.".to_string());
+            }
+        }
+    }
+
+    cfg.setup_complete = true;
+    crate::config::save_config(&cfg)?;
+    emit_progress(&app, "Setup complete!", 1.0);
+    Ok(cfg)
+}
+
+// ── Type-specific installers ─────────────────────────────────────────────────
+
+async fn install_vanilla(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+    emit_progress(app, "Fetching version info\u{2026}", 0.05);
+    let client = reqwest::Client::new();
+    let manifest: VersionManifest = client
+        .get("https://launchermeta.mojang.com/mc/game/version_manifest_v2.json")
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+    let url = manifest.versions.iter()
+        .find(|v| v.id == cfg.minecraft_version)
+        .map(|v| v.url.clone())
+        .ok_or_else(|| format!("Version {} not found", cfg.minecraft_version))?;
+    let data: VersionData = client.get(&url).send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+    let server_url = data.downloads.server.ok_or("No server download")?.url;
+    emit_progress(app, "Downloading Minecraft server\u{2026}", 0.15);
+    download_file(app, &server_url, &server_dir.join("server.jar"), "server.jar").await
+}
+
+async fn install_paper(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+    let build = cfg.loader_version.as_deref().ok_or("No build selected")?;
+    let mc = &cfg.minecraft_version;
+    emit_progress(app, "Fetching Paper build info\u{2026}", 0.1);
+    let client = reqwest::Client::new();
+    let info: PaperBuild = client
+        .get(format!("https://api.papermc.io/v2/projects/paper/versions/{}/builds/{}", mc, build))
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+    let url = format!(
+        "https://api.papermc.io/v2/projects/paper/versions/{}/builds/{}/downloads/{}",
+        mc, build, info.downloads.application.name
+    );
+    emit_progress(app, "Downloading Paper\u{2026}", 0.2);
+    download_file(app, &url, &server_dir.join("server.jar"), "Paper").await
+}
+
+async fn install_forge(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+    let lv = cfg.loader_version.as_deref().ok_or("No Forge version")?;
+    let url = format!(
+        "https://maven.minecraftforge.net/net/minecraftforge/forge/{mc}-{fv}/forge-{mc}-{fv}-installer.jar",
+        mc = cfg.minecraft_version, fv = lv
+    );
+    let installer = server_dir.join("forge-installer.jar");
+    emit_progress(app, "Downloading Forge installer\u{2026}", 0.2);
+    download_file(app, &url, &installer, "Forge installer").await?;
+    emit_progress(app, "Running Forge installer (may take a minute)\u{2026}", 0.6);
+    let mut cmd = tokio::process::Command::new(&cfg.java_path);
+    cmd.args(["-jar", "forge-installer.jar", "--installServer"])
+        .current_dir(server_dir);
+    hide_child_window(&mut cmd);
+    let out = cmd.output().await
+        .map_err(|e| format!("Failed to run Forge installer: {}", e))?;
+    if !out.status.success() {
+        return Err(format!("Forge installer failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    tokio::fs::remove_file(&installer).await.ok();
+    Ok(())
+}
+
+async fn install_fabric(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+    let loader = cfg.loader_version.as_deref().ok_or("No Fabric loader version")?;
+    // Direct server-launcher download endpoint
+    let url = format!(
+        "https://meta.fabricmc.net/v2/versions/loader/{mc}/{loader}/1.0.1/server/jar",
+        mc = cfg.minecraft_version, loader = loader
+    );
+    emit_progress(app, "Downloading Fabric server\u{2026}", 0.2);
+    download_file(app, &url, &server_dir.join("server.jar"), "Fabric server").await
+}
+
+async fn install_neoforge(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+    let lv = cfg.loader_version.as_deref().ok_or("No NeoForge version")?;
+    let url = format!(
+        "https://maven.neoforged.net/releases/net/neoforged/neoforge/{v}/neoforge-{v}-installer.jar",
+        v = lv
+    );
+    let installer = server_dir.join("neoforge-installer.jar");
+    emit_progress(app, "Downloading NeoForge installer\u{2026}", 0.2);
+    download_file(app, &url, &installer, "NeoForge installer").await?;
+    emit_progress(app, "Running NeoForge installer\u{2026}", 0.6);
+    let mut cmd = tokio::process::Command::new(&cfg.java_path);
+    cmd.args(["-jar", "neoforge-installer.jar", "--installServer"])
+        .current_dir(server_dir);
+    hide_child_window(&mut cmd);
+    let out = cmd.output().await
+        .map_err(|e| format!("Failed to run NeoForge installer: {}", e))?;
+    if !out.status.success() {
+        return Err(format!("NeoForge installer failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    tokio::fs::remove_file(&installer).await.ok();
+    Ok(())
+}
+
+async fn install_folia(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+    let build = cfg.loader_version.as_deref().ok_or("No Folia build selected")?;
+    let mc = &cfg.minecraft_version;
+    emit_progress(app, "Fetching Folia build info\u{2026}", 0.1);
+    let client = reqwest::Client::new();
+    let info: PaperBuild = client
+        .get(format!("https://api.papermc.io/v2/projects/folia/versions/{}/builds/{}", mc, build))
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+    let url = format!(
+        "https://api.papermc.io/v2/projects/folia/versions/{}/builds/{}/downloads/{}",
+        mc, build, info.downloads.application.name
+    );
+    emit_progress(app, "Downloading Folia\u{2026}", 0.2);
+    download_file(app, &url, &server_dir.join("server.jar"), "Folia").await
+}
+
+async fn install_purpur(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+    let build = cfg.loader_version.as_deref().ok_or("No Purpur build selected")?;
+    let mc = &cfg.minecraft_version;
+    let url = format!(
+        "https://api.purpurmc.org/v2/purpur/{}/{}/download",
+        mc, build
+    );
+    emit_progress(app, "Downloading Purpur\u{2026}", 0.2);
+    download_file(app, &url, &server_dir.join("server.jar"), "Purpur").await
+}
+
+async fn install_buildtools(
+    app: &Arc<AppEventSender>,
+    cfg: &ServerConfig,
+    server_dir: &Path,
+    product: &str, // "craftbukkit" or "spigot"
+) -> Result<(), String> {
+    let mc = &cfg.minecraft_version;
+
+    // Verify Git is available before attempting BuildTools
+    let git_check = tokio::process::Command::new(if cfg!(target_os = "windows") { "where" } else { "which" })
+        .arg("git")
+        .output().await;
+    if !matches!(git_check.as_ref().map(|o| o.status.success()), Ok(true)) {
+        return Err("BuildTools requires Git. Please install Git from https://git-scm.com/downloads and restart the app.".to_string());
+    }
+
+    // Run BuildTools in a temporary directory to keep the server dir clean
+    let build_dir = std::env::temp_dir().join(format!("lbby-buildtools-{}", mc));
+    tokio::fs::create_dir_all(&build_dir).await.map_err(|e| e.to_string())?;
+    let buildtools_jar = build_dir.join("BuildTools.jar");
+
+    // Download BuildTools.jar
+    emit_progress(app, "Downloading BuildTools\u{2026}", 0.1);
+    let bt_url = "https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccessfulBuild/artifact/target/BuildTools.jar";
+    download_file(app, bt_url, &buildtools_jar, "BuildTools.jar").await?;
+
+    // Run BuildTools
+    let label = if product == "spigot" { "Spigot" } else { "CraftBukkit" };
+    emit_progress(app, &format!("Compiling {} (this may take a few minutes)\u{2026}", label), 0.3);
+
+    let mut cmd = tokio::process::Command::new(&cfg.java_path);
+    cmd.arg("-jar").arg("BuildTools.jar")
+        .arg("--rev").arg(mc)
+        .current_dir(&build_dir);
+    if product == "craftbukkit" {
+        cmd.arg("--compile").arg("craftbukkit");
+    }
+    hide_child_window(&mut cmd);
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(600), // 10 minutes
+        cmd.output()
+    ).await
+    .map_err(|_| "BuildTools timed out after 10 minutes. Check your internet connection and try again.".to_string())?
+    .map_err(|e| format!("Failed to run BuildTools: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Clean up temp dir before returning error
+        tokio::fs::remove_dir_all(&build_dir).await.ok();
+        return Err(format!("BuildTools failed:\n{}\n{}", stderr, stdout));
+    }
+
+    // Find the resulting server JAR in the temp dir and copy it to server_dir
+    let prefix = if product == "spigot" { "spigot-" } else { "craftbukkit-" };
+    let mut found = false;
+    for entry in std::fs::read_dir(&build_dir).map_err(|e| e.to_string())?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(prefix) && name.ends_with(".jar") && !name.contains("original") {
+            tokio::fs::copy(entry.path(), server_dir.join("server.jar")).await
+                .map_err(|e| e.to_string())?;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        tokio::fs::remove_dir_all(&build_dir).await.ok();
+        return Err(format!("BuildTools completed but no {}server.jar was found.", prefix));
+    }
+
+    // Clean up the temporary build directory
+    tokio::fs::remove_dir_all(&build_dir).await.ok();
+    Ok(())
+}
+
+async fn install_sponge_vanilla(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+    let version_tag = cfg.loader_version.as_deref()
+        .ok_or("No SpongeVanilla version selected")?;
+    let url = format!(
+        "https://dl-api.spongepowered.org/v2/groups/org.spongepowered/artifacts/spongevanilla/versions/{}/assets/installer/download",
+        version_tag
+    );
+    emit_progress(app, "Downloading SpongeVanilla server\u{2026}", 0.2);
+    download_file(app, &url, &server_dir.join("server.jar"), "SpongeVanilla server").await
+}
+
+async fn install_sponge_forge(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+    let mc = &cfg.minecraft_version;
+    let sponge_ver = cfg.loader_version.as_deref().ok_or("No SpongeForge version selected")?;
+
+    // Fetch the Sponge API to find the specific Forge version for this Sponge version
+    let client = reqwest::Client::new();
+    let api_url = format!(
+        "https://dl-api.spongepowered.org/v2/groups/org.spongepowered/artifacts/spongeforge/versions?tags=minecraft:{}&limit=50",
+        mc
+    );
+    let resp = client.get(&api_url).send().await.map_err(|e| e.to_string())?;
+    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    // Find the matching Sponge version and extract its Forge version
+    let artifacts = data.get("artifacts")
+        .and_then(|v| v.as_object())
+        .ok_or("Failed to parse Sponge versions")?;
+
+    let mut forge_version = None;
+    for (ver, info) in artifacts {
+        if ver == sponge_ver {
+            forge_version = info.get("tagValues")
+                .and_then(|tv| tv.get("forge"))
+                .and_then(|f| f.as_str())
+                .map(|s| s.to_string());
+            break;
+        }
+    }
+
+    let forge_ver = forge_version
+        .ok_or(format!("Could not find Forge version for SpongeForge {}", sponge_ver))?;
+
+    // Install the specific Forge version required by this SpongeForge build
+    let mut forge_cfg = cfg.clone();
+    forge_cfg.loader_version = Some(forge_ver);
+    install_forge(app, &forge_cfg, server_dir).await?;
+
+    // Then download SpongeForge JAR into mods/
+    let version_tag = cfg.loader_version.as_deref()
+        .ok_or("No SpongeForge version selected")?;
+    let url = format!(
+        "https://dl-api.spongepowered.org/v2/groups/org.spongepowered/artifacts/spongeforge/versions/{}/assets/installer/download",
+        version_tag
+    );
+    let mods_dir = server_dir.join("mods");
+    tokio::fs::create_dir_all(&mods_dir).await.map_err(|e| e.to_string())?;
+    emit_progress(app, "Downloading SpongeForge\u{2026}", 0.8);
+    download_file(app, &url, &mods_dir.join("spongeforge.jar"), "SpongeForge").await?;
+    Ok(())
+}
+
+// ── Terraria / tModLoader install ─────────────────────────────────────────────
+
+async fn install_terraria(app: &Arc<AppEventSender>, _cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+
+    emit_progress(app, "Setting up Terraria server\u{2026}", 0.1);
+
+    // 0. Check if tModLoader is already installed (it includes Terraria server functionality)
+    let mut tmodloader_paths = vec![
+        dirs::home_dir().unwrap_or_default().join("terraria-server"),
+    ];
+    if cfg!(target_os = "windows") {
+        if let Ok(pf) = std::env::var("ProgramFiles(x86)") {
+            tmodloader_paths.push(PathBuf::from(pf).join("Steam/steamapps/common/tModLoader"));
+        }
+    } else {
+        tmodloader_paths.push(dirs::home_dir().unwrap_or_default().join(".steam/steam/steamapps/common/tModLoader"));
+    }
+    for tmod_path in &tmodloader_paths {
+        if tmod_path.join("start-tModLoaderServer.sh").exists() || tmod_path.join("start-tModLoaderServer.bat").exists() {
+            // Skip if source and destination are the same directory
+            if tmod_path.canonicalize().ok() == server_dir.canonicalize().ok() {
+                emit_progress(app, "Server directory is already a tModLoader installation", 1.0);
+                return Ok(());
+            }
+            emit_progress(app, "Found tModLoader installation, linking\u{2026}", 0.3);
+            tokio::fs::create_dir_all(server_dir).await.map_err(|e| e.to_string())?;
+            let src = tmod_path.to_string_lossy().to_string();
+            let dst = server_dir.to_string_lossy().to_string();
+            #[cfg(unix)]
+            {
+                let _ = std::process::Command::new("cp")
+                    .args(["-R", &format!("{}/.", src), &dst])
+                    .output();
+            }
+            #[cfg(windows)]
+            {
+                let xcopy_ok = std::process::Command::new("xcopy")
+                    .args([&format!("{}\\*", src), &dst, "/E", "/I", "/Y", "/Q"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !xcopy_ok {
+                    let bat_src = tmod_path.join("start-tModLoaderServer.bat");
+                    let bat_dst = server_dir.join("start-tModLoaderServer.bat");
+                    if bat_src.exists() {
+                        let _ = std::fs::copy(&bat_src, &bat_dst);
+                    }
+                    for entry in std::fs::read_dir(tmod_path).into_iter().flatten().flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.ends_with(".dll") || name.ends_with(".config") || name.ends_with(".xml") || name.ends_with(".bat") {
+                            let dest_file = server_dir.join(&name);
+                            if !dest_file.exists() {
+                                let _ = std::fs::copy(entry.path(), dest_file);
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let sh = server_dir.join("start-tModLoaderServer.sh");
+                if sh.exists() {
+                    let _ = std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755));
+                }
+            }
+            emit_progress(app, "Server installed (via tModLoader)", 1.0);
+            return Ok(());
+        }
+    }
+
+    // 1. Check if the server is bundled with an existing Terraria installation
+    let terraria_dir = if cfg!(target_os = "macos") {
+        dirs::home_dir().unwrap_or_default().join("Library/Application Support/Steam/steamapps/common/Terraria")
+    } else if cfg!(target_os = "windows") {
+        let prog_files = std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| "C:\\Program Files (x86)".to_string());
+        PathBuf::from(prog_files).join("Steam/steamapps/common/Terraria")
+    } else {
+        dirs::home_dir().unwrap_or_default().join(".steam/steam/steamapps/common/Terraria")
+    };
+
+    if terraria_dir.exists() {
+        if let Some(found) = find_terraria_binary(&terraria_dir) {
+            emit_progress(app, "Found bundled Terraria server, copying\u{2026}", 0.3);
+            tokio::fs::create_dir_all(server_dir).await.map_err(|e| e.to_string())?;
+
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(parent) = found.parent() {
+                    let src = format!("{}\\*", parent.to_string_lossy());
+                    let dst = server_dir.to_string_lossy().to_string();
+                    let status = std::process::Command::new("xcopy")
+                        .args([&src, &dst, "/E", "/I", "/Y", "/Q"])
+                        .status();
+                    if !status.map(|s| s.success()).unwrap_or(false) {
+                        let dest = terraria_server_binary(server_dir);
+                        let _ = tokio::fs::copy(&found, &dest).await;
+                        for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if name.ends_with(".dll") || name.ends_with(".config") || name.ends_with(".xml") {
+                                let dest_file = server_dir.join(&name);
+                                if !dest_file.exists() {
+                                    let _ = std::fs::copy(entry.path(), dest_file);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            #[cfg(unix)]
+            {
+                let dest = terraria_server_binary(server_dir);
+                tokio::fs::copy(&found, &dest).await.map_err(|e| format!("Failed to copy server: {}", e))?;
+                if let Some(parent) = found.parent() {
+                    for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.ends_with(".dll") || name.ends_with(".config") || name.ends_with(".xml") {
+                            let dest_file = server_dir.join(&name);
+                            if !dest_file.exists() {
+                                let _ = std::fs::copy(entry.path(), dest_file);
+                            }
+                        }
+                    }
+                }
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+            }
+
+            emit_progress(app, "Terraria server installed", 1.0);
+            return Ok(());
+        }
+    }
+
+    // 2. Try SteamCMD
+    if let Some(_steamcmd_path) = crate::steamcmd::find_steamcmd() {
+        emit_progress(app, "Downloading via SteamCMD\u{2026}", 0.2);
+        match crate::steamcmd::download_server(
+            app,
+            crate::steamcmd::TERRARIA_APP_ID,
+            server_dir,
+            "anonymous",
+        ).await {
+            Ok(()) => {
+                let binary = terraria_server_binary(server_dir);
+                if binary.exists() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755));
+                    }
+                    emit_progress(app, "Terraria server installed", 1.0);
+                    return Ok(());
+                }
+                // Check if binary is in a subdirectory (SteamCMD sometimes nests)
+                for entry in walkdir::WalkDir::new(server_dir).max_depth(3).into_iter().flatten() {
+                    let name = entry.file_name().to_string_lossy();
+                    if name == "TerrariaServer" || name == "TerrariaServer.exe" {
+                        let dest = terraria_server_binary(server_dir);
+                        let _ = std::fs::rename(entry.path(), &dest);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+                        }
+                        emit_progress(app, "Terraria server installed", 1.0);
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[lbby] SteamCMD failed: {}", e);
+            }
+        }
+    }
+
+    // 3. No method worked — provide helpful error
+    let steamcmd_hint = if cfg!(target_os = "windows") {
+        "Download SteamCMD from https://developer.valvesoftware.com/wiki/SteamCMD and extract it to a folder"
+    } else if cfg!(target_os = "macos") {
+        "Install SteamCMD: brew install steamcmd"
+    } else {
+        "Install SteamCMD: sudo apt install steamcmd (or your distro's equivalent)"
+    };
+    Err(
+        format!("Could not install Terraria server. Please do one of the following:\n\n\
+         \u{2022} {}\n\
+         \u{2022} Install Terraria via Steam (the server is bundled with the game)\n\
+         \u{2022} Download the server manually from terraria.org and place TerrariaServer in the server folder",
+         steamcmd_hint)
+    )
+}
+
+async fn install_tmodloader(app: &Arc<AppEventSender>, _cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+    emit_progress(app, "Fetching tModLoader release info\u{2026}", 0.05);
+
+    // Get the latest release from GitHub
+    let client = reqwest::Client::new();
+    let releases_url = "https://api.github.com/repos/tModLoader/tModLoader/releases/latest";
+    let release: serde_json::Value = client
+        .get(releases_url)
+        .header("User-Agent", "Lbby-App")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch tModLoader releases: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse tModLoader release: {}", e))?;
+
+    let tag = release["tag_name"]
+        .as_str()
+        .ok_or("Could not find tModLoader version tag")?;
+
+    emit_progress(app, &format!("Downloading tModLoader {}\u{2026}", tag), 0.1);
+
+    // Find the correct asset for this platform
+    let assets = release["assets"]
+        .as_array()
+        .ok_or("No assets found in release")?;
+
+    let asset_name = if cfg!(target_os = "windows") {
+        "tModLoader.zip"
+    } else if cfg!(target_os = "macos") {
+        "tModLoader-mac.zip"
+    } else {
+        "tModLoader-Linux.zip"
+    };
+
+    // Try to find the platform-specific asset, fall back to generic
+    let download_url = assets
+        .iter()
+        .find(|a| a["name"].as_str() == Some(asset_name))
+        .or_else(|| assets.iter().find(|a| a["name"].as_str() == Some("tModLoader.zip")))
+        .and_then(|a| a["browser_download_url"].as_str())
+        .ok_or(format!("Could not find download URL for {}", asset_name))?;
+
+    // Download the zip
+    let resp = client
+        .get(download_url)
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Download failed with HTTP {}", resp.status()));
+    }
+
+    let total = resp.content_length().unwrap_or(0);
+    let mut stream = resp.bytes_stream();
+    let mut bytes = Vec::new();
+    let mut downloaded = 0u64;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+        bytes.extend_from_slice(&chunk);
+        downloaded += chunk.len() as u64;
+        if total > 0 {
+            let progress = 0.1 + (downloaded as f64 / total as f64) * 0.7;
+            emit_progress(app, &format!("Downloading tModLoader\u{2026} {:.0}%", downloaded as f64 / total as f64 * 100.0), progress as f32);
+        }
+    }
+
+    emit_progress(app, "Extracting tModLoader\u{2026}", 0.8);
+
+    // Save to temp file and extract
+    let zip_path = server_dir.join("tmodloader-download.zip");
+    tokio::fs::write(&zip_path, &bytes)
+        .await
+        .map_err(|e| format!("Failed to write zip: {}", e))?;
+
+    // Extract
+    let file = std::fs::File::open(&zip_path).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip: {}", e))?;
+    zip.extract(server_dir)
+        .map_err(|e| format!("Failed to extract: {}", e))?;
+
+    // Clean up zip
+    let _ = tokio::fs::remove_file(&zip_path).await;
+
+    // Verify the start script exists
+    let start_script = if cfg!(target_os = "windows") {
+        server_dir.join("start-tModLoaderServer.bat")
+    } else {
+        server_dir.join("start-tModLoaderServer.sh")
+    };
+    if !start_script.exists() {
+        // Try looking in a subdirectory
+        let alt = server_dir.join("tModLoader").join(if cfg!(target_os = "windows") {
+            "start-tModLoaderServer.bat"
+        } else {
+            "start-tModLoaderServer.sh"
+        });
+        if alt.exists() {
+            // Move contents up
+            let src = server_dir.join("tModLoader");
+            for entry in std::fs::read_dir(&src).map_err(|e| e.to_string())?.flatten() {
+                let dest = server_dir.join(entry.file_name());
+                let _ = std::fs::rename(entry.path(), dest);
+            }
+            let _ = std::fs::remove_dir(src);
+        } else {
+            return Err("tModLoader start script not found after extraction. The download may have failed.".to_string());
+        }
+    }
+
+    // Make script executable on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = server_dir.join("start-tModLoaderServer.sh");
+        if script.exists() {
+            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    // Create Mods directory and empty enabled.json
+    let mods = crate::tmod_services::mods_dir(server_dir);
+    tokio::fs::create_dir_all(&mods).await.map_err(|e| e.to_string())?;
+    if !crate::tmod_services::enabled_json_path(server_dir).exists() {
+        crate::tmod_services::write_enabled_json(server_dir, &[])?;
+    }
+
+    emit_progress(app, "tModLoader server installed", 1.0);
+    Ok(())
 }
