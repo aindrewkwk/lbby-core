@@ -400,13 +400,30 @@ pub fn profiles_state() -> ProfilesState {
         .unwrap_or_default();
     ProfilesState {
         active_id: file.active_id.clone(),
-        profiles: file.profiles.iter().map(|p| profile_summary(p, &file.active_id)).collect(),
+        profiles: file
+            .profiles
+            .iter()
+            .map(|p| profile_summary(p, &file.active_id))
+            .collect(),
         active_game,
     }
 }
 
-pub fn create_profile(name: String, duplicate_current: bool, activate: bool, game: Option<Game>) -> Result<ProfilesState, String> {
+pub fn create_profile(
+    name: String,
+    duplicate_current: bool,
+    activate: bool,
+    game: Option<Game>,
+) -> Result<ProfilesState, String> {
     let mut file = load_profiles_file();
+    let source_server_path = if duplicate_current {
+        file.profiles
+            .iter()
+            .find(|p| p.id == file.active_id)
+            .map(|p| p.config.server_path.clone())
+    } else {
+        None
+    };
     let mut cfg = if duplicate_current {
         file.profiles
             .iter()
@@ -430,36 +447,47 @@ pub fn create_profile(name: String, duplicate_current: bool, activate: bool, gam
         cfg.performance_preset = default_performance_preset();
     }
     let clean_name = name.trim();
-    // Give fresh profiles a unique server directory so each profile's
-    // mods/plugins stay isolated.  Duplicated profiles keep the source path.
-    if !duplicate_current {
-        let display_name = if clean_name.is_empty() { "server" } else { clean_name };
-        let slug: String = display_name
-            .to_lowercase()
-            .replace(' ', "-")
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-')
-            .collect();
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        // Collect paths already used by other profiles so we never collide
-        let used: std::collections::HashSet<String> = file
-            .profiles
-            .iter()
-            .map(|p| p.config.server_path.clone())
-            .collect();
-        let game_prefix = cfg.game().display_name().to_lowercase();
-        let mut path = home.join(format!("{}-{}", game_prefix, slug));
-        let mut n = 2u32;
-        while path.exists() || used.contains(&path.to_string_lossy().to_string()) {
-            path = home.join(format!("{}-{}-{}", game_prefix, slug, n));
-            n += 1;
-        }
-        cfg.server_path = path.to_string_lossy().to_string();
-    }
     let id = uuid::Uuid::new_v4().simple().to_string();
+    let isolated_path = base_dir().join("profiles").join(&id).join("server");
+    if duplicate_current {
+        if let Some(source) = source_server_path {
+            let source_path = PathBuf::from(source);
+            if source_path.exists() {
+                std::fs::create_dir_all(&isolated_path)
+                    .map_err(|e| format!("failed to create isolated profile directory: {e}"))?;
+                for entry in walkdir::WalkDir::new(&source_path) {
+                    let entry = entry.map_err(|e| format!("failed to copy profile data: {e}"))?;
+                    let relative = entry
+                        .path()
+                        .strip_prefix(&source_path)
+                        .map_err(|e| format!("failed to copy profile data: {e}"))?;
+                    if relative.as_os_str().is_empty() {
+                        continue;
+                    }
+                    let target = isolated_path.join(relative);
+                    if entry.file_type().is_dir() {
+                        std::fs::create_dir_all(&target)
+                            .map_err(|e| format!("failed to copy profile directory: {e}"))?;
+                    } else if entry.file_type().is_file() {
+                        if let Some(parent) = target.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|e| format!("failed to create profile directory: {e}"))?;
+                        }
+                        std::fs::copy(entry.path(), &target)
+                            .map_err(|e| format!("failed to copy profile file: {e}"))?;
+                    }
+                }
+            }
+        }
+    }
+    cfg.server_path = isolated_path.to_string_lossy().to_string();
     file.profiles.push(ServerProfile {
         id: id.clone(),
-        name: if clean_name.is_empty() { "New Server".to_string() } else { clean_name.to_string() },
+        name: if clean_name.is_empty() {
+            "New Server".to_string()
+        } else {
+            clean_name.to_string()
+        },
         config: cfg,
     });
     if activate {
