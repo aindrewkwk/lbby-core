@@ -437,16 +437,17 @@ pub fn list_installed_mods() -> Result<Vec<ModInfo>, String> {
 pub async fn check_mod_updates() -> Result<Vec<ModUpdateInfo>, String> {
     let cfg = config::load_config();
     let dir = mods_dir(&cfg)?;
-    if !dir.exists() { return Ok(vec![]); }
+    if !tokio::fs::try_exists(&dir).await.unwrap_or(false) { return Ok(vec![]); }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
+    let mut entries = tokio::fs::read_dir(&dir).await.map_err(|e| e.to_string())?;
+    while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
         let path = entry.path();
         if path.extension().is_none_or(|x| x != "jar") {
             continue;
         }
         let info = read_mod_info(&path);
         let hash = {
-            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
             format!("{:x}", Sha512::digest(&bytes))
         };
         let found: Result<ModrinthVersion, _> = client()?.get(format!("https://api.modrinth.com/v2/version_file/{}?algorithm=sha512", hash))
@@ -759,11 +760,12 @@ pub async fn add_resource_pack(file_path: String, overwrite: bool) -> Result<Vec
     let dir = server_dir(&cfg)?.join("resourcepacks");
     tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
     let dest = safe_join(&dir, &name)?;
-    if dest.exists() && !overwrite {
+    let dest_exists = tokio::fs::try_exists(&dest).await.unwrap_or(false);
+    if dest_exists && !overwrite {
         return Err(format!("A resource pack named {} already exists.", name));
     }
-    if dest.exists() {
-        if dest.is_dir() {
+    if dest_exists {
+        if meta.is_dir() {
             tokio::fs::remove_dir_all(&dest).await.map_err(|e| e.to_string())?;
         } else {
             tokio::fs::remove_file(&dest).await.map_err(|e| e.to_string())?;
@@ -928,7 +930,7 @@ pub async fn remove_mod(mod_name: String) -> Result<(), String> {
 pub async fn remove_all_mods() -> Result<u32, String> {
     let cfg = config::load_config();
     let dir = mods_dir(&cfg)?;
-    if !dir.exists() {
+    if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
         return Ok(0);
     }
     let is_terraria = cfg.is_terraria();

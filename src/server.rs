@@ -1185,10 +1185,30 @@ pub async fn get_banned_ips() -> Result<Vec<crate::app_state::BannedIp>, String>
     Ok(ips)
 }
 
+use std::sync::Mutex;
+use std::time::SystemTime;
+
+static PROPS_CACHE: Mutex<Option<(HashMap<String, String>, SystemTime)>> = Mutex::new(None);
+
 /// Read and parse server.properties into a key-value map.
+/// Uses in-memory cache with file-modification-time check.
 pub fn get_server_properties() -> Result<HashMap<String, String>, String> {
     let cfg = crate::config::load_config();
     let path = PathBuf::from(&cfg.server_path).join("server.properties");
+
+    // Check cache
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if let Ok(modified) = meta.modified() {
+            let cache = PROPS_CACHE.lock().unwrap();
+            if let Some((ref cached, cached_time)) = *cache {
+                if modified == cached_time {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+    }
+
+    // Cache miss
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let mut map = HashMap::new();
     for line in content.lines() {
@@ -1198,6 +1218,14 @@ pub fn get_server_properties() -> Result<HashMap<String, String>, String> {
             map.insert(k.trim().to_string(), v.trim().to_string());
         }
     }
+
+    // Update cache
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if let Ok(modified) = meta.modified() {
+            *PROPS_CACHE.lock().unwrap() = Some((map.clone(), modified));
+        }
+    }
+
     Ok(map)
 }
 
@@ -1211,7 +1239,10 @@ pub fn save_server_properties(props: HashMap<String, String>) -> Result<(), Stri
     for (k, v) in sorted {
         lines.push(format!("{}={}", k, v));
     }
-    std::fs::write(&path, lines.join("\n") + "\n").map_err(|e| e.to_string())
+    let result = std::fs::write(&path, lines.join("\n") + "\n").map_err(|e| e.to_string());
+    // Invalidate cache
+    *PROPS_CACHE.lock().unwrap() = None;
+    result
 }
 
 /// Save an uploaded PNG as server-icon.png after validation.

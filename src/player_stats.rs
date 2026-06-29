@@ -39,6 +39,18 @@ fn init_db(conn: &Connection) -> SqlResult<()> {
         let _ = conn.execute("ALTER TABLE player_stats ADD COLUMN ip_address TEXT", []);
     }
 
+    // Index on ip_address for fast ban lookups
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_player_stats_ip ON player_stats(ip_address)",
+        [],
+    )?;
+
+    // Index on last_seen for efficient "recent players" queries
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_player_stats_last_seen ON player_stats(last_seen DESC)",
+        [],
+    )?;
+
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
