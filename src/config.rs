@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::file_cache::FileCache;
+
 fn default_true() -> bool {
     true
 }
@@ -310,71 +312,45 @@ fn default_profiles_file() -> ProfilesFile {
     }
 }
 
-use std::sync::Mutex;
-use std::time::SystemTime;
-
-static CONFIG_CACHE: Mutex<Option<(ProfilesFile, SystemTime)>> = Mutex::new(None);
+static CONFIG_CACHE: FileCache<ProfilesFile> = FileCache::new();
 
 fn load_profiles_file() -> ProfilesFile {
     let path = profiles_path();
 
-    // Check if we can serve from cache (file unchanged)
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if let Ok(modified) = meta.modified() {
-            let cache = CONFIG_CACHE.lock().unwrap();
-            if let Some((ref cached, cached_time)) = *cache {
-                if modified == cached_time {
-                    return cached.clone();
+    // ponytail: cache with mtime check, identical pattern to server.properties
+    let cached = CONFIG_CACHE.get_or_load(&path, || {
+        if let Some(raw) = std::fs::read_to_string(&path).ok() {
+            if let Some(mut file) = serde_json::from_str::<ProfilesFile>(&raw).ok() {
+                file.profiles.retain(|p| !p.id.trim().is_empty());
+                if file.profiles.is_empty() {
+                    file = default_profiles_file();
                 }
+                if !file.profiles.iter().any(|p| p.id == file.active_id) {
+                    file.active_id = file.profiles[0].id.clone();
+                }
+                let _ = save_profiles_file(&file);
+                return Ok(file);
             }
+            // Corrupted — back up before overwriting
+            let backup = path.with_extension("json.corrupted");
+            eprintln!("[lbby] profiles.json corrupted — backing up to {}", backup.display());
+            let _ = std::fs::rename(&path, &backup);
         }
-    }
+        let file = default_profiles_file();
+        let _ = save_profiles_file(&file);
+        Ok(file)
+    });
 
-    // Cache miss — read from disk
-    if let Some(raw) = std::fs::read_to_string(&path).ok() {
-        if let Some(mut file) = serde_json::from_str::<ProfilesFile>(&raw).ok() {
-            file.profiles.retain(|p| !p.id.trim().is_empty());
-            if file.profiles.is_empty() {
-                file = default_profiles_file();
-            }
-            if !file.profiles.iter().any(|p| p.id == file.active_id) {
-                file.active_id = file.profiles[0].id.clone();
-            }
-            // Update cache
-            if let Ok(meta) = std::fs::metadata(&path) {
-                if let Ok(modified) = meta.modified() {
-                    *CONFIG_CACHE.lock().unwrap() = Some((file.clone(), modified));
-                }
-            }
-            let _ = save_profiles_file(&file);
-            return file;
-        }
-        // File exists but is corrupted — back it up before overwriting so
-        // the user can manually recover their data.
-        let backup = path.with_extension("json.corrupted");
-        eprintln!(
-            "[lbby] profiles.json is corrupted — backing up to {}",
-            backup.display()
-        );
-        let _ = std::fs::rename(&path, &backup);
-    }
-    let file = default_profiles_file();
-    let _ = save_profiles_file(&file);
-    // Invalidate cache on write
-    *CONFIG_CACHE.lock().unwrap() = None;
-    file
+    cached.unwrap_or_else(|_| default_profiles_file())
 }
 
 fn save_profiles_file(file: &ProfilesFile) -> Result<(), String> {
     let path = profiles_path();
     let json = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
-    // Atomic write: write to a temp file first, then rename. This prevents
-    // corruption if the process crashes or loses power mid-write.
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &json).map_err(|e| e.to_string())?;
     let result = std::fs::rename(&tmp, &path).map_err(|e| e.to_string());
-    // Invalidate cache so next load_config() picks up the new file
-    *CONFIG_CACHE.lock().unwrap() = None;
+    CONFIG_CACHE.invalidate();
     result
 }
 

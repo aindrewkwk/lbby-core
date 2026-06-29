@@ -2,6 +2,7 @@
 // Contains all game server management logic, without any UI or web server dependencies.
 
 pub mod app_state;
+pub mod file_cache;
 pub mod helpers;
 pub mod automodpack;
 pub mod backup;
