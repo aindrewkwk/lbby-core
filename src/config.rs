@@ -310,8 +310,27 @@ fn default_profiles_file() -> ProfilesFile {
     }
 }
 
+use std::sync::Mutex;
+use std::time::SystemTime;
+
+static CONFIG_CACHE: Mutex<Option<(ProfilesFile, SystemTime)>> = Mutex::new(None);
+
 fn load_profiles_file() -> ProfilesFile {
     let path = profiles_path();
+
+    // Check if we can serve from cache (file unchanged)
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if let Ok(modified) = meta.modified() {
+            let cache = CONFIG_CACHE.lock().unwrap();
+            if let Some((ref cached, cached_time)) = *cache {
+                if modified == cached_time {
+                    return cached.clone();
+                }
+            }
+        }
+    }
+
+    // Cache miss — read from disk
     if let Some(raw) = std::fs::read_to_string(&path).ok() {
         if let Some(mut file) = serde_json::from_str::<ProfilesFile>(&raw).ok() {
             file.profiles.retain(|p| !p.id.trim().is_empty());
@@ -320,6 +339,12 @@ fn load_profiles_file() -> ProfilesFile {
             }
             if !file.profiles.iter().any(|p| p.id == file.active_id) {
                 file.active_id = file.profiles[0].id.clone();
+            }
+            // Update cache
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if let Ok(modified) = meta.modified() {
+                    *CONFIG_CACHE.lock().unwrap() = Some((file.clone(), modified));
+                }
             }
             let _ = save_profiles_file(&file);
             return file;
@@ -335,6 +360,8 @@ fn load_profiles_file() -> ProfilesFile {
     }
     let file = default_profiles_file();
     let _ = save_profiles_file(&file);
+    // Invalidate cache on write
+    *CONFIG_CACHE.lock().unwrap() = None;
     file
 }
 
@@ -345,7 +372,10 @@ fn save_profiles_file(file: &ProfilesFile) -> Result<(), String> {
     // corruption if the process crashes or loses power mid-write.
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &json).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+    let result = std::fs::rename(&tmp, &path).map_err(|e| e.to_string());
+    // Invalidate cache so next load_config() picks up the new file
+    *CONFIG_CACHE.lock().unwrap() = None;
+    result
 }
 
 fn profile_summary(profile: &ServerProfile, active_id: &str) -> ProfileSummary {
