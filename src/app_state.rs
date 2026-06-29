@@ -43,6 +43,16 @@ pub struct BannedPlayer {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BannedIp {
+    pub ip: String,
+    pub name: String,
+    pub created: String,
+    pub source: String,
+    pub expires: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModInfo {
     pub file_name: String,
     pub display_name: String,

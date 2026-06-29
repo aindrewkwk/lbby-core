@@ -135,6 +135,9 @@ pub struct ServerConfig {
     pub ram_mb: u32,
     pub max_players: u32,
     pub server_name: String,
+    /// Minecraft world seed. Empty = random.
+    #[serde(default)]
+    pub minecraft_seed: String,
     pub setup_complete: bool,
     /// Auto-restart the server when it exits unexpectedly (not via Stop button).
     /// Defaults to true so existing users get the new behavior automatically.

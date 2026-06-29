@@ -576,7 +576,16 @@ pub async fn install_modrinth_modpack(app: std::sync::Arc<crate::app_state::AppE
     let root = server_dir(&cfg)?;
     let total = manifest.files.len() as u32;
     for (idx, file) in manifest.files.iter().enumerate() {
+        // Skip mods that are explicitly unsupported on the server
         if file.env.get("server").is_some_and(|v| v == "unsupported") {
+            continue;
+        }
+        // Skip client-only mods: if the mod is marked as client-required
+        // but has no server env specified, it's a client-side mod (e.g.
+        // Sodium, Iris, shaders, minimap, etc.) that would crash a server.
+        let server_env = file.env.get("server").map(|s| s.as_str());
+        let client_env = file.env.get("client").map(|s| s.as_str());
+        if server_env.is_none() && client_env == Some("required") {
             continue;
         }
         let url = file.downloads.first().ok_or_else(|| format!("No download URL for {}", file.path))?;
@@ -765,6 +774,8 @@ pub async fn add_resource_pack(file_path: String, overwrite: bool) -> Result<Vec
     } else {
         tokio::fs::copy(&src, &dest).await.map_err(|e| e.to_string())?;
     }
+    // Auto-enable resource pack requirement in server.properties
+    update_resource_pack_requirement(&cfg, true)?;
     list_resource_packs()
 }
 
@@ -791,7 +802,58 @@ pub async fn remove_resource_pack(name: String) -> Result<Vec<ResourcePackInfo>,
     } else {
         tokio::fs::remove_file(&path).await.map_err(|e| e.to_string())?;
     }
+    // If no more resource packs, disable requirement
+    let remaining = list_resource_packs_internal(&cfg)?;
+    if remaining.is_empty() {
+        update_resource_pack_requirement(&cfg, false)?;
+    }
     list_resource_packs()
+}
+
+/// Update require-resource-pack setting in server.properties.
+fn update_resource_pack_requirement(cfg: &crate::config::ServerConfig, require: bool) -> Result<(), String> {
+    let path = std::path::PathBuf::from(&cfg.server_path).join("server.properties");
+    if !path.exists() {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    let key = "require-resource-pack=";
+    let value = if require { "true" } else { "false" };
+    let mut found = false;
+    for line in lines.iter_mut() {
+        if line.starts_with(key) {
+            *line = format!("{}{}", key, value);
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        lines.push(format!("{}{}", key, value));
+    }
+    std::fs::write(&path, lines.join("\n") + "\n").map_err(|e| e.to_string())
+}
+
+/// Internal helper to list resource packs without going through the public API.
+fn list_resource_packs_internal(cfg: &crate::config::ServerConfig) -> Result<Vec<ResourcePackInfo>, String> {
+    let dir = server_dir(cfg)?.join("resourcepacks");
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut packs = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let meta = entry.metadata().map_err(|e| e.to_string())?;
+        let is_dir = meta.is_dir();
+        let is_zip = name.ends_with(".zip");
+        if is_dir || is_zip {
+            let kind = if is_dir { "folder" } else { "zip" }.to_string();
+            let bytes = if is_dir { 0 } else { meta.len() };
+            packs.push(ResourcePackInfo { name, kind, bytes });
+        }
+    }
+    packs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(packs)
 }
 
 pub fn open_mods_folder() -> Result<(), String> {

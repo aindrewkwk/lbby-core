@@ -340,6 +340,11 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
                 }
                 *last = Some((tick, now));
             }
+            // Extract IP from "logged in" lines (separate from "joined the game")
+            if let Some((login_name, ip)) = parse_player_login_ip(&line) {
+                let _ = crate::player_stats::record_player_ip(&app3, &login_name, &ip);
+                app3.emit("player-ip-update", serde_json::json!({ "name": login_name, "ip": ip })).ok();
+            }
             if let Some((name, is_join)) = parse_player_event(&line) {
                 let s = app3.state();
                 let mut players = s.online_players.lock().await;
@@ -889,6 +894,39 @@ pub fn parse_player_event(line: &str) -> Option<(String, bool)> {
     None
 }
 
+/// Parse a player's IP address from a Minecraft "logged in" line.
+/// MC log format: "...MinecraftServer/]: PlayerName[/192.168.1.1:25565] logged in with entity id ..."
+/// Returns (player_name, ip_address) on success.
+pub fn parse_player_login_ip(line: &str) -> Option<(String, String)> {
+    let body = line.rsplit("]:").next()?.trim();
+    // Must contain " logged in"
+    if !body.contains(" logged in") {
+        return None;
+    }
+    // Find the [/ip:port] part — look for "[/" after the player name
+    let login_pos = body.find(" logged in")?;
+    let before_login = &body[..login_pos];
+    // Pattern: "PlayerName[/ip:port]"
+    let bracket_start = before_login.find("[/")?;
+    let name = before_login[..bracket_start].trim();
+    if !is_valid_player_name(name) {
+        return None;
+    }
+    let bracket_end = before_login[bracket_start..].find(']')?;
+    let ip_port = &before_login[bracket_start + 2..bracket_start + bracket_end];
+    // Strip the port — we only want the IP
+    let ip = if let Some(colon_pos) = ip_port.rfind(':') {
+        &ip_port[..colon_pos]
+    } else {
+        ip_port
+    };
+    // Skip local/private IPs (127.x, 0:0:0:0, etc.)
+    if ip == "127.0.0.1" || ip == "0:0:0:0:0:0:0:1" || ip == "localhost" {
+        return None;
+    }
+    Some((name.to_string(), ip.to_string()))
+}
+
 /// Parse Terraria/tModLoader player join/leave messages.
 /// Terraria format: "<name> has joined." / "<name> has left."
 /// tModLoader may also use: "<name> has joined" (no period)
@@ -1123,6 +1161,30 @@ pub async fn get_banned_players() -> Result<Vec<crate::app_state::BannedPlayer>,
     }
 }
 
+/// Read banned IPs from the server's banned-ips.json (Minecraft only).
+/// Terraria does not support IP bans natively.
+pub async fn get_banned_ips() -> Result<Vec<crate::app_state::BannedIp>, String> {
+    let cfg = crate::config::load_config();
+    if cfg.is_terraria() {
+        // Terraria has no native IP ban support
+        return Ok(Vec::new());
+    }
+    let path = PathBuf::from(&cfg.server_path).join("banned-ips.json");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ips: Vec<crate::app_state::BannedIp> = serde_json::from_str(&raw)
+        .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
+    ips.sort_by_key(|a| a.ip.clone());
+    Ok(ips)
+}
+
 /// Read and parse server.properties into a key-value map.
 pub fn get_server_properties() -> Result<HashMap<String, String>, String> {
     let cfg = crate::config::load_config();
@@ -1178,6 +1240,28 @@ pub fn validate_server_icon_png(bytes: &[u8]) -> Result<(), String> {
     if width != 64 || height != 64 {
         return Err(format!("Server icon must be exactly 64x64 pixels, got {}x{}", width, height));
     }
+    Ok(())
+}
+
+/// Delete the world folder so the server generates a fresh one on next start.
+/// This is needed when changing the seed — Minecraft won't apply a new seed
+/// to an existing world.
+pub async fn regenerate_world() -> Result<(), String> {
+    let cfg = crate::config::load_config();
+    if cfg.is_terraria() {
+        return Err("World regeneration is not supported for Terraria. Delete the .wld file manually.".to_string());
+    }
+    let server_dir = std::path::PathBuf::from(&cfg.server_path);
+    let world_dir = server_dir.join("world");
+    if !world_dir.exists() {
+        return Ok(());
+    }
+    // Backup the old world before deleting
+    let backup_name = format!("world-backup-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+    let backup_dir = server_dir.join(&backup_name);
+    tokio::fs::rename(&world_dir, &backup_dir)
+        .await
+        .map_err(|e| format!("Failed to backup world: {}", e))?;
     Ok(())
 }
 
@@ -1443,13 +1527,35 @@ pub async fn do_install_server(app: Arc<AppEventSender>, mut cfg: ServerConfig) 
             "max_performance" => (10, 8),
             _ => (8, 6),
         };
-        tokio::fs::write(
-            server_dir.join("server.properties"),
-            format!(
-                "online-mode=false\nmax-players={}\nmotd={}\nserver-port=25565\nview-distance={}\nsimulation-distance={}\n",
-                cfg.max_players, cfg.server_name, view_distance, simulation_distance
-            ),
-        ).await.map_err(|e| e.to_string())?;
+        // Preserve existing server-port if server.properties already exists
+        // (user may have changed it via Settings > Server Properties).
+        let port = {
+            let props_path = server_dir.join("server.properties");
+            if props_path.exists() {
+                if let Ok(existing) = std::fs::read_to_string(&props_path) {
+                    existing.lines()
+                        .find(|l| l.starts_with("server-port="))
+                        .and_then(|l| l.split('=').nth(1))
+                        .and_then(|v| v.trim().parse::<u16>().ok())
+                        .unwrap_or(cfg.default_port())
+                } else {
+                    cfg.default_port()
+                }
+            } else {
+                cfg.default_port()
+            }
+        };
+        // Build server.properties content
+        let mut props = format!(
+            "online-mode=false\nmax-players={}\nmotd={}\nserver-port={}\nview-distance={}\nsimulation-distance={}\n",
+            cfg.max_players, cfg.server_name, port, view_distance, simulation_distance
+        );
+        // Add seed if configured
+        if !cfg.minecraft_seed.trim().is_empty() {
+            props.push_str(&format!("level-seed={}\n", cfg.minecraft_seed.trim()));
+        }
+        tokio::fs::write(server_dir.join("server.properties"), props)
+            .await.map_err(|e| e.to_string())?;
     } else if cfg.is_terraria() {
         // Terraria: serverconfig.txt + Worlds directory
         let worlds_dir = server_dir.join("Worlds");

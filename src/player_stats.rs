@@ -10,6 +10,7 @@ pub struct PlayerSummary {
     pub last_seen: i64,
     pub deaths: u32,
     pub kills: u32,
+    pub ip_address: Option<String>,
 }
 
 fn get_db_path(_app: &std::sync::Arc<crate::app_state::AppEventSender>) -> PathBuf {
@@ -29,7 +30,15 @@ fn init_db(conn: &Connection) -> SqlResult<()> {
         )",
         [],
     )?;
-    
+
+    // Add ip_address column if missing (migration for existing databases)
+    let has_ip = conn
+        .prepare("SELECT ip_address FROM player_stats LIMIT 0")
+        .is_ok();
+    if !has_ip {
+        let _ = conn.execute("ALTER TABLE player_stats ADD COLUMN ip_address TEXT", []);
+    }
+
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,7 +123,7 @@ pub fn record_session_end(app: &std::sync::Arc<crate::app_state::AppEventSender>
 
 pub fn list_all_summaries(app: std::sync::Arc<crate::app_state::AppEventSender>) -> Result<Vec<PlayerSummary>, String> {
     let conn = get_conn(&app)?;
-    let mut stmt = conn.prepare("SELECT player_id, total_playtime_seconds, last_seen, deaths, kills FROM player_stats ORDER BY total_playtime_seconds DESC").map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("SELECT player_id, total_playtime_seconds, last_seen, deaths, kills, ip_address FROM player_stats ORDER BY total_playtime_seconds DESC").map_err(|e| e.to_string())?;
     let iter = stmt.query_map([], |row| {
         Ok(PlayerSummary {
             player_id: row.get(0)?,
@@ -122,14 +131,15 @@ pub fn list_all_summaries(app: std::sync::Arc<crate::app_state::AppEventSender>)
             last_seen: row.get(2)?,
             deaths: row.get(3)?,
             kills: row.get(4)?,
+            ip_address: row.get(5)?,
         })
     }).map_err(|e| e.to_string())?;
-    
+
     let mut summaries = Vec::new();
     for s in iter {
         summaries.push(s.map_err(|e| e.to_string())?);
     }
-    
+
     Ok(summaries)
 }
 
@@ -139,4 +149,33 @@ pub fn player_record_start(app: std::sync::Arc<crate::app_state::AppEventSender>
 
 pub fn player_record_end(app: std::sync::Arc<crate::app_state::AppEventSender>, player_id: String, timestamp: i64, deaths: u32, kills: u32) -> Result<(), String> {
     record_session_end(&app, &player_id, timestamp, deaths, kills)
+}
+
+/// Record a player's IP address (from "logged in" console line).
+/// Updates the ip_address field for the player in player_stats.
+pub fn record_player_ip(app: &std::sync::Arc<crate::app_state::AppEventSender>, player_id: &str, ip: &str) -> Result<(), String> {
+    let conn = get_conn(app)?;
+    // Upsert: ensure player row exists, then update IP
+    conn.execute(
+        "INSERT OR IGNORE INTO player_stats (player_id, ip_address) VALUES (?1, ?2)",
+        params![player_id, ip],
+    ).map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE player_stats SET ip_address = ?2 WHERE player_id = ?1",
+        params![player_id, ip],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Get a player's last known IP address.
+pub fn get_player_ip(app: &std::sync::Arc<crate::app_state::AppEventSender>, player_id: &str) -> Result<Option<String>, String> {
+    let conn = get_conn(app)?;
+    let mut stmt = conn.prepare("SELECT ip_address FROM player_stats WHERE player_id = ?1").map_err(|e| e.to_string())?;
+    let mut rows = stmt.query(params![player_id]).map_err(|e| e.to_string())?;
+    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let ip: Option<String> = row.get(0).map_err(|e| e.to_string())?;
+        Ok(ip)
+    } else {
+        Ok(None)
+    }
 }
