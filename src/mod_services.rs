@@ -405,25 +405,49 @@ pub async fn install_modrinth_mod(app: std::sync::Arc<crate::app_state::AppEvent
 
 /// Install a resource pack from Modrinth by project ID.
 /// Downloads the .zip to the resourcepacks/ directory and auto-enables
-/// require-resource-pack in server.properties.
+/// require-resource-pack in server.properties. Also installs required
+/// dependency resource packs recursively.
 pub async fn install_modrinth_resource_pack(app: std::sync::Arc<crate::app_state::AppEventSender>, project_id: String) -> Result<Vec<ResourcePackInfo>, String> {
     let cfg = config::load_config();
     let root = server_dir(&cfg)?;
     let rp_dir = root.join("resourcepacks");
     tokio::fs::create_dir_all(&rp_dir).await.map_err(|e| e.to_string())?;
 
-    let version = latest_modrinth_version(&project_id, &cfg).await?;
-    let file = primary_file(&version)?;
-    let dest = rp_dir.join(&file.filename);
-
-    emit_mod_progress(&app, "Downloading resource pack", &format!("Installing {}", version.name), 1, 1);
-    download_bytes_to_file(&app, &file.url, &dest, "Downloading resource pack", &file.filename, 1, 1).await?;
-    verify_sha512(&dest, file.hashes.get("sha512").map(String::as_str))?;
+    let mut installed = HashSet::new();
+    install_resource_pack_recursive(&app, &cfg, &rp_dir, &project_id, &mut installed).await?;
 
     // Auto-enable require-resource-pack
     let _ = update_resource_pack_requirement(&cfg, true);
 
     list_resource_packs()
+}
+
+async fn install_resource_pack_recursive(
+    app: &std::sync::Arc<crate::app_state::AppEventSender>,
+    cfg: &ServerConfig,
+    rp_dir: &Path,
+    project_id: &str,
+    installed: &mut HashSet<String>,
+) -> Result<(), String> {
+    if !installed.insert(project_id.to_string()) {
+        return Ok(());
+    }
+    let version = latest_modrinth_version(project_id, cfg).await?;
+
+    // Install required dependencies first
+    for dep in version.dependencies.iter().filter(|d| d.dependency_type == "required") {
+        if let Some(dep_project_id) = dep.project_id.as_deref() {
+            Box::pin(install_resource_pack_recursive(app, cfg, rp_dir, dep_project_id, installed)).await?;
+        }
+    }
+
+    let file = primary_file(&version)?;
+    let dest = rp_dir.join(&file.filename);
+
+    emit_mod_progress(app, "Downloading resource pack", &format!("Installing {}", version.name), 1, 1);
+    download_bytes_to_file(app, &file.url, &dest, "Downloading resource pack", &file.filename, 1, 1).await?;
+    verify_sha512(&dest, file.hashes.get("sha512").map(String::as_str))?;
+    Ok(())
 }
 
 async fn install_modrinth_project_recursive(
