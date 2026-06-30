@@ -406,6 +406,11 @@ async fn route_request(request: HttpRequest, app: std::sync::Arc<crate::app_stat
         return html_response(remote_page());
     }
 
+    // Public status endpoint — no auth required
+    if request.path == "/status" && request.method == "GET" {
+        return public_status_response(app).await;
+    }
+
     if !authorized(&request, token) {
         return json_response(
             401,
@@ -474,6 +479,31 @@ async fn remote_status_response(app: std::sync::Arc<crate::app_state::AppEventSe
             "stats": stats,
             "players": players,
             "playit": playit,
+        }),
+    )
+}
+
+/// Public status endpoint — no auth required. Returns basic server info
+/// for sharing (e.g. a status page for friends to check if the server is up).
+async fn public_status_response(app: std::sync::Arc<crate::app_state::AppEventSender>) -> String {
+    let state = app.state();
+    let cfg = config::load_config();
+    let status = state.server.lock().await.status.clone();
+    let player_count = state.online_players.lock().await.len();
+    let is_online = matches!(status, ServerStatus::Running);
+
+    json_response(
+        200,
+        &serde_json::json!({
+            "app": "Lbby",
+            "server_name": cfg.server_name,
+            "version": cfg.minecraft_version,
+            "loader": cfg.server_type,
+            "online": is_online,
+            "status": status,
+            "players_online": player_count,
+            "max_players": cfg.max_players,
+            "motd": cfg.server_name,
         }),
     )
 }
