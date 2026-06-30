@@ -394,6 +394,43 @@ pub async fn search_modrinth_resource_packs(query: String, mc_version: String) -
     }).collect())
 }
 
+/// Search Modrinth for shader packs compatible with the given MC version.
+pub async fn search_modrinth_shader_packs(query: String, mc_version: String) -> Result<Vec<ModrinthSearchHit>, String> {
+    let facets = format!("[[\"project_type:shader\"],[\"versions:{}\"]]", mc_version);
+    let resp: ModrinthSearchResponse = client()?
+        .get("https://api.modrinth.com/v2/search")
+        .query(&[("query", query), ("facets", facets), ("limit", "20".to_string())])
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+    Ok(resp.hits.into_iter().map(|hit| ModrinthSearchHit {
+        project_id: hit.project_id,
+        slug: hit.slug,
+        title: hit.title,
+        description: hit.description,
+        icon_url: hit.icon_url,
+        versions: hit.versions,
+        loaders: vec![],
+    }).collect())
+}
+
+/// Install a shader pack from Modrinth into the server's shaderpacks/ folder.
+pub async fn install_modrinth_shader_pack(app: std::sync::Arc<crate::app_state::AppEventSender>, project_id: String) -> Result<(), String> {
+    let cfg = config::load_config();
+    let root = server_dir(&cfg)?;
+    let shader_dir = root.join("shaderpacks");
+    tokio::fs::create_dir_all(&shader_dir).await.map_err(|e| e.to_string())?;
+
+    let version = latest_modrinth_version(&project_id, &cfg).await?;
+    let file = primary_file(&version)?;
+    let dest = shader_dir.join(&file.filename);
+
+    emit_mod_progress(&app, "Downloading shader pack", &format!("Installing {}", version.name), 1, 1);
+    download_bytes_to_file(&app, &file.url, &dest, "Downloading shader pack", &file.filename, 1, 1).await?;
+    verify_sha512(&dest, file.hashes.get("sha512").map(String::as_str))?;
+
+    Ok(())
+}
+
 pub async fn install_modrinth_mod(app: std::sync::Arc<crate::app_state::AppEventSender>, project_id: String) -> Result<Vec<ModInfo>, String> {
     let cfg = config::load_config();
     let target_dir = mods_dir(&cfg)?;
