@@ -43,6 +43,12 @@ pub struct BannedPlayer {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhitelistEntry {
+    pub name: String,
+    pub uuid: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BannedIp {
     pub ip: String,
     pub name: String,
