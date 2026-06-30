@@ -605,6 +605,19 @@ pub async fn install_modrinth_modpack(app: std::sync::Arc<crate::app_state::AppE
     emit_mod_progress(&app, "Applying overrides", "Copying modpack override files", 1, 1);
     safe_extract_prefix(&mut zip, "overrides", &root)?;
     ensure_server_properties(&root, &cfg.server_name)?;
+
+    // Auto-enable require-resource-pack if the modpack included resource packs
+    let rp_dir = root.join("resourcepacks");
+    if rp_dir.exists() {
+        let has_packs = std::fs::read_dir(&rp_dir)
+            .ok()
+            .and_then(|mut d| d.find_map(|e| e.ok().filter(|e| e.path().extension().is_some_and(|ext| ext == "zip"))))
+            .is_some();
+        if has_packs {
+            let _ = update_resource_pack_requirement(&cfg, true);
+        }
+    }
+
     emit_mod_progress(&app, "Finalizing", "Modpack is ready", 1, 1);
     Ok(cfg)
 }
@@ -685,6 +698,19 @@ pub async fn install_curseforge_modpack(app: std::sync::Arc<crate::app_state::Ap
         safe_extract_prefix(&mut zip, overrides, &root)?;
     }
     ensure_server_properties(&root, &cfg.server_name)?;
+
+    // Auto-enable require-resource-pack if the modpack included resource packs
+    let rp_dir = root.join("resourcepacks");
+    if rp_dir.exists() {
+        let has_packs = std::fs::read_dir(&rp_dir)
+            .ok()
+            .and_then(|mut d| d.find_map(|e| e.ok().filter(|e| e.path().extension().is_some_and(|ext| ext == "zip"))))
+            .is_some();
+        if has_packs {
+            let _ = update_resource_pack_requirement(&cfg, true);
+        }
+    }
+
     emit_mod_progress(&app, "Finalizing", "CurseForge modpack is ready", 1, 1);
     Ok(cfg)
 }
