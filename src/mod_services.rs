@@ -340,7 +340,7 @@ fn primary_file(version: &ModrinthVersion) -> Result<ModrinthFile, String> {
         .ok_or_else(|| "Modrinth version has no downloadable files.".to_string())
 }
 
-pub async fn search_modrinth_mods(query: String, mc_version: String, loader: String) -> Result<Vec<ModrinthSearchHit>, String> {
+pub async fn search_modrinth_mods(query: String, mc_version: String, loader: String, project_type: Option<String>) -> Result<Vec<ModrinthSearchHit>, String> {
     // Both mod loaders and plugin platforms are valid categories on Modrinth.
     let valid_loaders = [
         "forge", "fabric", "neoforge", "paper", "bukkit", "spigot",
@@ -349,7 +349,14 @@ pub async fn search_modrinth_mods(query: String, mc_version: String, loader: Str
     if !valid_loaders.contains(&loader.as_str()) {
         return Err(format!("Unsupported loader: {}", loader));
     }
-    let facets = format!("[[\"project_type:mod\"],[\"versions:{}\"],[\"categories:{}\"]]", mc_version, loader);
+    // Determine project type: explicit param > infer from loader
+    let pt = project_type.unwrap_or_else(|| {
+        match loader.as_str() {
+            "paper" | "bukkit" | "spigot" | "folia" | "purpur" | "sponge" => "plugin".to_string(),
+            _ => "mod".to_string(),
+        }
+    });
+    let facets = format!("[[\"project_type:{}\"],[\"versions:{}\"],[\"categories:{}\"]]", pt, mc_version, loader);
     let resp: ModrinthSearchResponse = client()?
         .get("https://api.modrinth.com/v2/search")
         .query(&[("query", query), ("facets", facets), ("limit", "20".to_string())])
@@ -363,8 +370,27 @@ pub async fn search_modrinth_mods(query: String, mc_version: String, loader: Str
         icon_url: hit.icon_url,
         versions: hit.versions,
         loaders: hit.categories.into_iter()
-            .filter(|c| matches!(c.as_str(), "forge" | "fabric" | "neoforge" | "quilt"))
+            .filter(|c| matches!(c.as_str(), "forge" | "fabric" | "neoforge" | "quilt" | "paper" | "bukkit" | "spigot" | "folia" | "purpur" | "sponge"))
             .collect(),
+    }).collect())
+}
+
+/// Search Modrinth for resource packs compatible with the given MC version.
+pub async fn search_modrinth_resource_packs(query: String, mc_version: String) -> Result<Vec<ModrinthSearchHit>, String> {
+    let facets = format!("[[\"project_type:resourcepack\"],[\"versions:{}\"]]", mc_version);
+    let resp: ModrinthSearchResponse = client()?
+        .get("https://api.modrinth.com/v2/search")
+        .query(&[("query", query), ("facets", facets), ("limit", "20".to_string())])
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+    Ok(resp.hits.into_iter().map(|hit| ModrinthSearchHit {
+        project_id: hit.project_id,
+        slug: hit.slug,
+        title: hit.title,
+        description: hit.description,
+        icon_url: hit.icon_url,
+        versions: hit.versions,
+        loaders: vec![],
     }).collect())
 }
 
@@ -375,6 +401,29 @@ pub async fn install_modrinth_mod(app: std::sync::Arc<crate::app_state::AppEvent
     let mut installed_projects = HashSet::new();
     install_modrinth_project_recursive(&app, &cfg, &target_dir, &project_id, &mut installed_projects, 1, 1).await?;
     list_installed_mods()
+}
+
+/// Install a resource pack from Modrinth by project ID.
+/// Downloads the .zip to the resourcepacks/ directory and auto-enables
+/// require-resource-pack in server.properties.
+pub async fn install_modrinth_resource_pack(app: std::sync::Arc<crate::app_state::AppEventSender>, project_id: String) -> Result<Vec<ResourcePackInfo>, String> {
+    let cfg = config::load_config();
+    let root = server_dir(&cfg)?;
+    let rp_dir = root.join("resourcepacks");
+    tokio::fs::create_dir_all(&rp_dir).await.map_err(|e| e.to_string())?;
+
+    let version = latest_modrinth_version(&project_id, &cfg).await?;
+    let file = primary_file(&version)?;
+    let dest = rp_dir.join(&file.filename);
+
+    emit_mod_progress(&app, "Downloading resource pack", &format!("Installing {}", version.name), 1, 1);
+    download_bytes_to_file(&app, &file.url, &dest, "Downloading resource pack", &file.filename, 1, 1).await?;
+    verify_sha512(&dest, file.hashes.get("sha512").map(String::as_str))?;
+
+    // Auto-enable require-resource-pack
+    let _ = update_resource_pack_requirement(&cfg, true);
+
+    list_resource_packs()
 }
 
 async fn install_modrinth_project_recursive(
