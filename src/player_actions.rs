@@ -3,9 +3,32 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use crate::config;
+
+// ── Caches ───────────────────────────────────────────────────────────────────
+// Avoid re-reading and re-parsing usercache.json and player .dat files on
+// every call. Entries are invalidated when the file's mtime changes.
+
+struct UsercacheEntry {
+    name: String,
+    uuid: String,
+}
+
+struct UsercacheState {
+    entries: Vec<UsercacheEntry>,
+    mtime: SystemTime,
+}
+
+struct PlayerDatCache {
+    data: PlayerData,
+    mtime: SystemTime,
+}
+
+static USERCACHE: Mutex<Option<UsercacheState>> = Mutex::new(None);
+static PLAYER_CACHE: Mutex<Option<HashMap<String, PlayerDatCache>>> = Mutex::new(None);
 
 // ── Types returned to the frontend ──────────────────────────────────────────
 
@@ -150,6 +173,7 @@ fn get_server_path() -> Result<PathBuf, String> {
 }
 
 /// Resolve a player name to a UUID by reading `usercache.json`.
+/// Results are cached in memory and refreshed when the file changes.
 fn resolve_uuid(name: &str, server_path: &Path) -> Result<String, String> {
     let cache_path = server_path.join("usercache.json");
     if !cache_path.exists() {
@@ -158,19 +182,52 @@ fn resolve_uuid(name: &str, server_path: &Path) -> Result<String, String> {
             cache_path.display()
         ));
     }
+
+    let mtime = std::fs::metadata(&cache_path)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    // Check cache
+    {
+        let guard = USERCACHE.lock().unwrap();
+        if let Some(ref state) = *guard {
+            if state.mtime == mtime {
+                if let Some(entry) = state.entries.iter().find(|e| e.name.eq_ignore_ascii_case(name)) {
+                    return Ok(entry.uuid.clone());
+                }
+                return Err(format!("Player '{}' not found in usercache.json. They must have joined the server at least once.", name));
+            }
+        }
+    }
+
+    // Cache miss — parse file
     let raw = std::fs::read_to_string(&cache_path)
         .map_err(|e| format!("Failed to read usercache.json: {}", e))?;
     let entries: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("Failed to parse usercache.json: {}", e))?;
 
+    let mut parsed = Vec::new();
     if let Some(arr) = entries.as_array() {
         for entry in arr {
-            let n = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if n.eq_ignore_ascii_case(name) {
-                if let Some(uuid) = entry.get("uuid").and_then(|v| v.as_str()) {
-                    return Ok(uuid.to_string());
-                }
+            let n = entry.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let u = entry.get("uuid").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if !n.is_empty() && !u.is_empty() {
+                parsed.push(UsercacheEntry { name: n, uuid: u });
             }
+        }
+    }
+
+    // Store in cache
+    {
+        let mut guard = USERCACHE.lock().unwrap();
+        *guard = Some(UsercacheState { entries: parsed, mtime });
+    }
+
+    // Lookup from cache
+    let guard = USERCACHE.lock().unwrap();
+    if let Some(ref state) = *guard {
+        if let Some(entry) = state.entries.iter().find(|e| e.name.eq_ignore_ascii_case(name)) {
+            return Ok(entry.uuid.clone());
         }
     }
     Err(format!("Player '{}' not found in usercache.json. They must have joined the server at least once.", name))
@@ -286,6 +343,25 @@ fn parse_gamemode(id: i32) -> String {
 pub fn get_player_full_data(name: String) -> Result<PlayerData, String> {
     let server_path = get_server_path()?;
     let uuid = resolve_uuid(&name, &server_path)?;
+
+    // Check player data cache (invalidated on file mtime change)
+    let dat_path = server_path.join("world").join("playerdata").join(format!("{}.dat", uuid));
+    let dat_mtime = std::fs::metadata(&dat_path)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    {
+        let guard = PLAYER_CACHE.lock().unwrap();
+        if let Some(ref cache) = *guard {
+            if let Some(entry) = cache.get(&uuid) {
+                if entry.mtime == dat_mtime {
+                    return Ok(entry.data.clone());
+                }
+            }
+        }
+    }
+
+    // Cache miss — read and parse
     let root = read_player_dat(&server_path, &uuid)?;
 
     let pos = nbt_list(&root, "Pos")
@@ -319,9 +395,9 @@ pub fn get_player_full_data(name: String) -> Result<PlayerData, String> {
         .map(|l| parse_effects(l))
         .unwrap_or_default();
 
-    Ok(PlayerData {
+    let player_data = PlayerData {
         name,
-        uuid,
+        uuid: uuid.clone(),
         health: nbt_f64(&root, "Health").unwrap_or(20.0),
         max_health: nbt_list(&root, "Attributes")
             .and_then(|attrs| {
@@ -350,12 +426,39 @@ pub fn get_player_full_data(name: String) -> Result<PlayerData, String> {
         inventory,
         ender_chest,
         active_effects,
-    })
+    };
+
+    // Store in cache
+    {
+        let mut guard = PLAYER_CACHE.lock().unwrap();
+        let cache = guard.get_or_insert_with(HashMap::new);
+        cache.insert(uuid, PlayerDatCache { data: player_data.clone(), mtime: dat_mtime });
+    }
+
+    Ok(player_data)
 }
 
 pub fn get_player_inventory_only(name: String) -> Result<Vec<InventorySlot>, String> {
     let server_path = get_server_path()?;
     let uuid = resolve_uuid(&name, &server_path)?;
+
+    // Check cache — reuse full player data if available
+    let dat_path = server_path.join("world").join("playerdata").join(format!("{}.dat", uuid));
+    let dat_mtime = std::fs::metadata(&dat_path)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    {
+        let guard = PLAYER_CACHE.lock().unwrap();
+        if let Some(ref cache) = *guard {
+            if let Some(entry) = cache.get(&uuid) {
+                if entry.mtime == dat_mtime {
+                    return Ok(entry.data.inventory.clone());
+                }
+            }
+        }
+    }
+
     let root = read_player_dat(&server_path, &uuid)?;
     Ok(nbt_list(&root, "Inventory")
         .map(|l| parse_inventory(l))
