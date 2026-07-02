@@ -379,7 +379,13 @@ pub fn load_config() -> ServerConfig {
 pub fn save_config(cfg: &ServerConfig) -> Result<(), String> {
     let mut file = load_profiles_file();
     if let Some(profile) = file.profiles.iter_mut().find(|p| p.id == file.active_id) {
+        // SAFEGUARD: Always preserve the profile's isolated server_path.
+        // Never allow incoming config to overwrite it.
+        let preserved_path = profile.config.server_path.clone();
         profile.config = cfg.clone();
+        if !preserved_path.is_empty() {
+            profile.config.server_path = preserved_path;
+        }
         if profile.name.trim().is_empty() {
             profile.name = default_profile_name(cfg);
         }
