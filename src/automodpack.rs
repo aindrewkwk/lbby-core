@@ -17,11 +17,8 @@
 //! updates often and we want to follow head without an app update.
 
 use crate::config::{ServerConfig, ServerType};
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-
-use tokio::io::AsyncWriteExt;
 
 const GITHUB_API: &str = "https://api.github.com/repos/Skidamek/AutoModpack/releases";
 
@@ -229,14 +226,7 @@ pub async fn install(app: std::sync::Arc<crate::app_state::AppEventSender>, cfg:
     }
 
     let dest = dir.join(&asset.name);
-    emit_progress(
-        &app,
-        "Downloading AutoModpack",
-        &format!("{} ({})", asset.name, tag),
-        0,
-        100,
-    );
-    download_with_progress(&app, &asset.browser_download_url, &dest, &asset.name).await?;
+    crate::helpers::download_to_file(&app, &asset.browser_download_url, &dest, &asset.name).await?;
     emit_progress(&app, "AutoModpack installed", &asset.name, 100, 100);
 
     Ok(AutoModpackStatus {
@@ -288,7 +278,7 @@ pub async fn generate_client_pack(
         0,
         100,
     );
-    download_with_progress(&app, &asset.browser_download_url, &tmp_jar, &asset.name).await?;
+    crate::helpers::download_to_file(&app, &asset.browser_download_url, &tmp_jar, &asset.name).await?;
 
     // README that ships inside the ZIP.
     let loader_pretty = match cfg.server_type {
@@ -403,33 +393,3 @@ fn emit_progress(app: &std::sync::Arc<crate::app_state::AppEventSender>, stage: 
     );
 }
 
-async fn download_with_progress(
-    app: &std::sync::Arc<crate::app_state::AppEventSender>,
-    url: &str,
-    dest: &Path,
-    label: &str,
-) -> Result<(), String> {
-    let resp = http()?
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("Download failed: {}", e))?
-        .error_for_status()
-        .map_err(|e| format!("Download failed: {}", e))?;
-    let size = resp.content_length().unwrap_or(0);
-    let mut stream = resp.bytes_stream();
-    let mut file = tokio::fs::File::create(dest)
-        .await
-        .map_err(|e| format!("Couldn't write to mods folder: {}", e))?;
-    let mut downloaded: u64 = 0;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
-        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-        downloaded += chunk.len() as u64;
-        if size > 0 {
-            let pct = ((downloaded as f64 / size as f64) * 100.0).round() as u32;
-            emit_progress(app, "Downloading AutoModpack", label, pct.min(99), 100);
-        }
-    }
-    Ok(())
-}

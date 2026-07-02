@@ -38,4 +38,4 @@ codegen-units = 1
 strip = "symbols"
 panic = "abort"
 incremental = false
-overflow-checks = false
+overflow-checks = true

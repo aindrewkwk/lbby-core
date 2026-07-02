@@ -3,21 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use futures_util::StreamExt;
 use serde::Deserialize;
 
-
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-#[cfg(target_os = "windows")]
-fn hide_std_child_window(cmd: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(target_os = "windows"))]
-fn hide_std_child_window(_cmd: &mut std::process::Command) {}
 
 /// Map a Minecraft version like "1.20.1" to the Java major version that should run it.
 /// Conservative — picks the highest Java the version is well-tested with.
@@ -92,7 +79,7 @@ pub fn java_candidates() -> Vec<PathBuf> {
     {
         let mut where_cmd = std::process::Command::new("where");
         where_cmd.arg("java");
-        hide_std_child_window(&mut where_cmd);
+        crate::helpers::hide_std_child_window(&mut where_cmd);
         if let Ok(out) = where_cmd.output() {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 let path = line.trim();
@@ -146,7 +133,7 @@ pub fn java_candidates() -> Vec<PathBuf> {
     {
         let mut which_cmd = std::process::Command::new("which");
         which_cmd.arg("java");
-        hide_std_child_window(&mut which_cmd);
+        crate::helpers::hide_std_child_window(&mut which_cmd);
         if let Ok(out) = which_cmd.output() {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 let path = line.trim();
@@ -201,7 +188,7 @@ pub fn detect_java_major(bin: &std::path::Path) -> Option<u8> {
     }
     let mut cmd = std::process::Command::new(bin);
     cmd.arg("-version");
-    hide_std_child_window(&mut cmd);
+    crate::helpers::hide_std_child_window(&mut cmd);
     let out = cmd.output().ok()?;
     let combined = format!(
         "{}{}",
@@ -328,29 +315,7 @@ async fn download_jre(major: u8, app: &std::sync::Arc<crate::app_state::AppEvent
     std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
     let temp_file = temp_dir.join(format!(".download-{}", file_name));
 
-    {
-        let resp = client.get(download_url).send().await
-            .map_err(|e| format!("Download failed: {}", e))?;
-        let total = resp.content_length().unwrap_or(0);
-        let mut stream = resp.bytes_stream();
-        let mut file = tokio::fs::File::create(&temp_file).await
-            .map_err(|e| e.to_string())?;
-        let mut downloaded: u64 = 0;
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| e.to_string())?;
-            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await
-                .map_err(|e| e.to_string())?;
-            downloaded += chunk.len() as u64;
-            let progress = if total > 0 { downloaded as f32 / total as f32 } else { 0.0 };
-            app.emit("install-progress", crate::helpers::InstallProgress {
-                stage: "download".into(),
-                label: format!("Downloading Java {}… {:.1}%", major, progress * 100.0),
-                current: downloaded as u32,
-                total: total as u32,
-            }).ok();
-        }
-    }
+    crate::helpers::download_to_file(app, download_url, &temp_file, &format!("Java {}", major)).await?;
 
     // Extract
     app.emit("install-progress", crate::helpers::InstallProgress {

@@ -1,3 +1,27 @@
+// ── Limitations of this hand-rolled HTTP server ────────────────────────────
+//
+// This module implements a minimal HTTP/1.1 server using raw TCP sockets
+// (tokio::net::TcpStream) for the LAN remote-control feature. It was chosen
+// to avoid pulling in a full web framework for what amounts to ~10 API
+// endpoints. The trade-offs:
+//
+//  * No TLS — the LAN remote is plain HTTP by design (Cloudflare tunnels
+//    provide HTTPS for the public path). Do not expose this port to the
+//    internet.
+//  * No HTTP/2, chunked transfer encoding, or keep-alive — every connection
+//    is request-response then close. Fine for the low-traffic LAN use case
+//    but not suitable for high-concurrency workloads.
+//  * The request parser is hand-rolled and not fuzz-tested. It handles the
+//    subset of HTTP/1.1 that browsers and `curl` send, but may choke on
+//    edge cases (e.g. malformed chunked bodies, duplicate headers).
+//  * Response bodies are fully buffered in memory before sending.
+//
+// Future improvement: Replace with `axum` (which builds on `hyper` + tokio)
+// for a more robust, standards-compliant HTTP server with middleware support,
+// proper error handling, and TLS via `axum-server`. The API surface is small
+// enough that migration would be straightforward.
+// ──────────────────────────────────────────────────────────────────────────
+
 use crate::{backup, config};
 use crate::server::ServerStatus;
 use std::path::PathBuf;

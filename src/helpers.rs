@@ -2,10 +2,12 @@
 // These were originally in the monolithic lib.rs — extracted here for reuse.
 
 use base64::Engine;
+use futures_util::StreamExt;
 use serde::Serialize;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 
 use crate::app_state::AppEventSender;
 use crate::config::ServerConfig;
@@ -38,6 +40,69 @@ pub fn hide_std_child_window(cmd: &mut std::process::Command) {
 
 #[cfg(not(target_os = "windows"))]
 pub fn hide_std_child_window(_cmd: &mut std::process::Command) {}
+
+/// Download a file from a URL to a local path with progress reporting.
+///
+/// Streams the HTTP response to disk in chunks, calling `progress(downloaded,
+/// total)` after each chunk so the caller can emit UI events. Uses
+/// `install-progress` / `InstallProgress` events by default; callers that
+/// need a different event type can wrap this function and emit their own
+/// events after it returns.
+pub async fn download_to_file(
+    app: &Arc<AppEventSender>,
+    url: &str,
+    dest: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .user_agent("Lbby")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Download failed with HTTP {} for {}",
+            resp.status(),
+            url
+        ));
+    }
+    let total = resp.content_length().unwrap_or(0);
+    let mut stream = resp.bytes_stream();
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut downloaded: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+        downloaded += chunk.len() as u64;
+        let progress = if total > 0 {
+            downloaded as f32 / total as f32
+        } else {
+            0.0
+        };
+        app.emit(
+            "install-progress",
+            InstallProgress {
+                stage: "download".to_string(),
+                label: format!("Downloading {}\u{2026} {:.1}%", label, progress * 100.0),
+                current: downloaded as u32,
+                total: total as u32,
+            },
+        )
+        .ok();
+    }
+    Ok(())
+}
 
 /// Default server path value — used by config and mod_services.
 pub fn default_server_path_value(game: Option<&str>) -> String {

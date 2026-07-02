@@ -10,26 +10,6 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-#[cfg(target_os = "windows")]
-fn hide_std_child_window(cmd: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(target_os = "windows"))]
-fn hide_std_child_window(_cmd: &mut std::process::Command) {}
-
-#[cfg(target_os = "windows")]
-fn hide_tokio_child_window(cmd: &mut tokio::process::Command) {
-    cmd.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(target_os = "windows"))]
-fn hide_tokio_child_window(_cmd: &mut tokio::process::Command) {}
-
 /// Where playit-cli stores the agent secret on this OS
 pub fn secret_file_path() -> PathBuf {
     let lbby_secret = lbby_secret_file_path();
@@ -328,7 +308,7 @@ pub async fn stop(app: std::sync::Arc<crate::app_state::AppEventSender>) -> Resu
         {
             let mut cmd = tokio::process::Command::new("taskkill");
             cmd.args(["/PID", &pid.to_string(), "/F"]);
-            hide_tokio_child_window(&mut cmd);
+            crate::helpers::hide_child_window(&mut cmd);
             cmd.output().await.ok();
         }
     }
@@ -373,7 +353,7 @@ pub fn playit_cached_binary() -> PathBuf {
 pub fn is_supported_agent_cli(path: &PathBuf) -> bool {
     let mut cmd = std::process::Command::new(path);
     cmd.arg("--help");
-    hide_std_child_window(&mut cmd);
+    crate::helpers::hide_std_child_window(&mut cmd);
     let Ok(out) = cmd.output() else { return false };
     if !out.status.success() {
         return false;
@@ -397,7 +377,7 @@ pub fn find_existing_playit() -> Option<PathBuf> {
     for name in &names {
         let mut cmd = std::process::Command::new(if cfg!(target_os = "windows") { "where" } else { "which" });
         cmd.arg(name);
-        hide_std_child_window(&mut cmd);
+        crate::helpers::hide_std_child_window(&mut cmd);
         if let Ok(out) = cmd.output() {
             if out.status.success() {
                 let stdout = String::from_utf8_lossy(&out.stdout);
@@ -525,7 +505,7 @@ pub async fn cargo_install_playit() -> Result<PathBuf, String> {
     // Verify cargo is available
     let mut cargo_check_cmd = tokio::process::Command::new(if cfg!(target_os = "windows") { "where" } else { "which" });
     cargo_check_cmd.arg("cargo");
-    hide_tokio_child_window(&mut cargo_check_cmd);
+    crate::helpers::hide_child_window(&mut cargo_check_cmd);
     let cargo_check = cargo_check_cmd.output().await
         .map_err(|e| e.to_string())?;
     if !cargo_check.status.success() {
@@ -542,7 +522,7 @@ pub async fn cargo_install_playit() -> Result<PathBuf, String> {
             "--locked",
             "playit-cli",
         ]);
-    hide_tokio_child_window(&mut cargo_cmd);
+    crate::helpers::hide_child_window(&mut cargo_cmd);
     let out = cargo_cmd.output().await
         .map_err(|e| format!("cargo install failed to launch: {}", e))?;
 

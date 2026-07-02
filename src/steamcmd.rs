@@ -245,12 +245,7 @@ pub async fn install_steamcmd(app: &std::sync::Arc<crate::app_state::AppEventSen
 pub async fn run_steamcmd(steamcmd_path: &Path, args: &[&str]) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new(steamcmd_path);
     cmd.args(args);
-    // Hide console window on Windows
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
+    crate::helpers::hide_child_window(&mut cmd);
 
     let output = cmd
         .output()

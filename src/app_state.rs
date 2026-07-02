@@ -161,7 +161,4 @@ impl AppEventSender {
         self.state.clone()
     }
 
-    pub fn path(&self) -> &std::path::Path {
-        std::path::Path::new("")
-    }
 }

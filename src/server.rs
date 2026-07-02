@@ -10,7 +10,7 @@ use tokio::process::ChildStdin;
 
 use crate::app_state::AppEventSender;
 use crate::config::{ServerConfig, ServerType};
-use crate::helpers::{InstallProgress, check_port_available, hide_child_window};
+use crate::helpers::{InstallProgress, check_port_available, download_to_file, hide_child_window};
 use crate::stats::ServerStats;
 
 const RESTART_WINDOW_SECS: u64 = 300;
@@ -342,7 +342,7 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
             }
             // Extract IP from "logged in" lines (separate from "joined the game")
             if let Some((login_name, ip)) = parse_player_login_ip(&line) {
-                let _ = crate::player_stats::record_player_ip(&app3, &login_name, &ip);
+                let _ = crate::player_stats::record_player_ip(app3.clone(), login_name.clone(), ip.clone()).await;
                 app3.emit("player-ip-update", serde_json::json!({ "name": login_name, "ip": ip })).ok();
             }
             if let Some((name, is_join)) = parse_player_event(&line) {
@@ -1375,36 +1375,6 @@ struct PaperApp {
 
 // ── Download + progress helpers ──────────────────────────────────────────────
 
-/// Download a file from a URL to a local path, emitting progress events.
-async fn download_file(app: &Arc<AppEventSender>, url: &str, dest: &Path, label: &str) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .user_agent("MCHost/0.1")
-        .build().map_err(|e| e.to_string())?;
-
-    let resp = client.get(url).send().await.map_err(|e| format!("Download failed: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("Download failed with HTTP {} for {}", resp.status(), url));
-    }
-    let total = resp.content_length().unwrap_or(0);
-    let mut stream = resp.bytes_stream();
-    let mut file = tokio::fs::File::create(dest).await.map_err(|e| e.to_string())?;
-    let mut downloaded: u64 = 0;
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
-        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-        downloaded += chunk.len() as u64;
-        let progress = if total > 0 { downloaded as f32 / total as f32 } else { 0.0 };
-        app.emit("install-progress", InstallProgress {
-            stage: "download".to_string(),
-            label: format!("Downloading {}\u{2026} {:.1}%", label, progress * 100.0),
-            current: downloaded as u32,
-            total: total as u32,
-        }).ok();
-    }
-    Ok(())
-}
-
 /// Emit a simple progress event (not download-related).
 fn emit_progress(app: &Arc<AppEventSender>, message: &str, progress: f32) {
     app.emit("install-progress", InstallProgress {
@@ -1654,7 +1624,7 @@ async fn install_vanilla(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_d
         .json().await.map_err(|e| e.to_string())?;
     let server_url = data.downloads.server.ok_or("No server download")?.url;
     emit_progress(app, "Downloading Minecraft server\u{2026}", 0.15);
-    download_file(app, &server_url, &server_dir.join("server.jar"), "server.jar").await
+    download_to_file(app, &server_url, &server_dir.join("server.jar"), "server.jar").await
 }
 
 async fn install_paper(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
@@ -1671,7 +1641,7 @@ async fn install_paper(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir
         mc, build, info.downloads.application.name
     );
     emit_progress(app, "Downloading Paper\u{2026}", 0.2);
-    download_file(app, &url, &server_dir.join("server.jar"), "Paper").await
+    download_to_file(app, &url, &server_dir.join("server.jar"), "Paper").await
 }
 
 async fn install_forge(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
@@ -1682,7 +1652,7 @@ async fn install_forge(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir
     );
     let installer = server_dir.join("forge-installer.jar");
     emit_progress(app, "Downloading Forge installer\u{2026}", 0.2);
-    download_file(app, &url, &installer, "Forge installer").await?;
+    download_to_file(app, &url, &installer, "Forge installer").await?;
     emit_progress(app, "Running Forge installer (may take a minute)\u{2026}", 0.6);
     let mut cmd = tokio::process::Command::new(&cfg.java_path);
     cmd.args(["-jar", "forge-installer.jar", "--installServer"])
@@ -1705,7 +1675,7 @@ async fn install_fabric(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_di
         mc = cfg.minecraft_version, loader = loader
     );
     emit_progress(app, "Downloading Fabric server\u{2026}", 0.2);
-    download_file(app, &url, &server_dir.join("server.jar"), "Fabric server").await
+    download_to_file(app, &url, &server_dir.join("server.jar"), "Fabric server").await
 }
 
 async fn install_neoforge(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
@@ -1716,7 +1686,7 @@ async fn install_neoforge(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_
     );
     let installer = server_dir.join("neoforge-installer.jar");
     emit_progress(app, "Downloading NeoForge installer\u{2026}", 0.2);
-    download_file(app, &url, &installer, "NeoForge installer").await?;
+    download_to_file(app, &url, &installer, "NeoForge installer").await?;
     emit_progress(app, "Running NeoForge installer\u{2026}", 0.6);
     let mut cmd = tokio::process::Command::new(&cfg.java_path);
     cmd.args(["-jar", "neoforge-installer.jar", "--installServer"])
@@ -1745,7 +1715,7 @@ async fn install_folia(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir
         mc, build, info.downloads.application.name
     );
     emit_progress(app, "Downloading Folia\u{2026}", 0.2);
-    download_file(app, &url, &server_dir.join("server.jar"), "Folia").await
+    download_to_file(app, &url, &server_dir.join("server.jar"), "Folia").await
 }
 
 async fn install_purpur(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
@@ -1756,7 +1726,7 @@ async fn install_purpur(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_di
         mc, build
     );
     emit_progress(app, "Downloading Purpur\u{2026}", 0.2);
-    download_file(app, &url, &server_dir.join("server.jar"), "Purpur").await
+    download_to_file(app, &url, &server_dir.join("server.jar"), "Purpur").await
 }
 
 async fn install_buildtools(
@@ -1783,7 +1753,7 @@ async fn install_buildtools(
     // Download BuildTools.jar
     emit_progress(app, "Downloading BuildTools\u{2026}", 0.1);
     let bt_url = "https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccessfulBuild/artifact/target/BuildTools.jar";
-    download_file(app, bt_url, &buildtools_jar, "BuildTools.jar").await?;
+    download_to_file(app, bt_url, &buildtools_jar, "BuildTools.jar").await?;
 
     // Run BuildTools
     let label = if product == "spigot" { "Spigot" } else { "CraftBukkit" };
@@ -1841,7 +1811,7 @@ async fn install_sponge_vanilla(app: &Arc<AppEventSender>, cfg: &ServerConfig, s
         version_tag
     );
     emit_progress(app, "Downloading SpongeVanilla server\u{2026}", 0.2);
-    download_file(app, &url, &server_dir.join("server.jar"), "SpongeVanilla server").await
+    download_to_file(app, &url, &server_dir.join("server.jar"), "SpongeVanilla server").await
 }
 
 async fn install_sponge_forge(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
@@ -1891,7 +1861,7 @@ async fn install_sponge_forge(app: &Arc<AppEventSender>, cfg: &ServerConfig, ser
     let mods_dir = server_dir.join("mods");
     tokio::fs::create_dir_all(&mods_dir).await.map_err(|e| e.to_string())?;
     emit_progress(app, "Downloading SpongeForge\u{2026}", 0.8);
-    download_file(app, &url, &mods_dir.join("spongeforge.jar"), "SpongeForge").await?;
+    download_to_file(app, &url, &mods_dir.join("spongeforge.jar"), "SpongeForge").await?;
     Ok(())
 }
 

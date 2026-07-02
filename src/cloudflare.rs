@@ -5,26 +5,6 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-#[cfg(target_os = "windows")]
-fn hide_child_window(cmd: &mut tokio::process::Command) {
-    cmd.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(target_os = "windows"))]
-fn hide_child_window(_cmd: &mut tokio::process::Command) {}
-
-#[cfg(target_os = "windows")]
-fn hide_std_child_window(cmd: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(target_os = "windows"))]
-fn hide_std_child_window(_cmd: &mut std::process::Command) {}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudflareTunnelState {
     pub running: bool,
@@ -76,7 +56,7 @@ pub fn find_existing_cloudflared() -> Option<PathBuf> {
         "which"
     });
     which.arg("cloudflared");
-    hide_std_child_window(&mut which);
+    crate::helpers::hide_std_child_window(&mut which);
     if let Ok(out) = which.output() {
         if out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -239,7 +219,7 @@ pub async fn start_quick_tunnel(app: std::sync::Arc<crate::app_state::AppEventSe
     cmd.args(["tunnel", "--url", &local_url, "--no-autoupdate"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    hide_child_window(&mut cmd);
+    crate::helpers::hide_child_window(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -336,7 +316,7 @@ pub async fn stop_quick_tunnel(app: std::sync::Arc<crate::app_state::AppEventSen
         {
             let mut cmd = tokio::process::Command::new("taskkill");
             cmd.args(["/PID", &pid.to_string(), "/F"]);
-            hide_child_window(&mut cmd);
+            crate::helpers::hide_child_window(&mut cmd);
             cmd.output().await.ok();
         }
     }
