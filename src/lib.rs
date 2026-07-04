@@ -9,6 +9,7 @@ pub mod backup;
 pub mod cloudflare;
 pub mod config;
 pub mod debug_report;
+pub mod heartbeat;
 pub mod java;
 pub mod license;
 pub mod mod_services;

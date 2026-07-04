@@ -15,6 +15,12 @@ fn default_remote_control_port() -> u16 {
 fn default_terraria_world_size() -> u8 {
     2 // medium
 }
+fn default_dashboard_url() -> String {
+    "https://web.rstudio.live".to_string()
+}
+fn default_heartbeat_interval() -> u64 {
+    300 // 5 minutes
+}
 
 /// Which game a server profile is for.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -213,6 +219,16 @@ pub struct ServerConfig {
     /// tModLoader modpack name. Empty = use enabled.json.
     #[serde(default)]
     pub tmod_modpack: String,
+    // ── Dashboard sync ───────────────────────────────────────────────────
+    /// Dashboard URL for heartbeat and license sync.
+    #[serde(default = "default_dashboard_url")]
+    pub dashboard_url: String,
+    /// JWT token for authenticating with the dashboard API.
+    #[serde(default)]
+    pub app_token: String,
+    /// Heartbeat interval in seconds. 0 = disabled.
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval_secs: u64,
 }
 
 impl ServerConfig {
