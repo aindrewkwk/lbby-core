@@ -444,6 +444,25 @@ pub fn get_player_full_data(name: String) -> Result<PlayerData, String> {
     Ok(player_data)
 }
 
+/// Invalidate the player data cache for a specific player (or all players).
+/// Call this after sending commands that change player state (gamemode, etc.)
+pub fn invalidate_player_cache(player_name: Option<&str>) {
+    let mut guard = PLAYER_CACHE.lock().unwrap();
+    if let Some(ref mut cache) = *guard {
+        if let Some(name) = player_name {
+            // Invalidate specific player — need to resolve UUID first
+            if let Ok(server_path) = get_server_path() {
+                if let Ok(uuid) = resolve_uuid(name, &server_path) {
+                    cache.remove(&uuid);
+                }
+            }
+        } else {
+            // Invalidate all
+            cache.clear();
+        }
+    }
+}
+
 pub fn get_player_inventory_only(name: String) -> Result<Vec<InventorySlot>, String> {
     let server_path = get_server_path()?;
     let uuid = resolve_uuid(&name, &server_path)?;
