@@ -362,7 +362,13 @@ pub fn get_player_full_data(name: String) -> Result<PlayerData, String> {
     }
 
     // Cache miss — read and parse
-    let root = read_player_dat(&server_path, &uuid)?;
+    // Use a timeout to fail fast if the file is locked or corrupted
+    let root = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_player_dat(&server_path, &uuid)
+    })) {
+        Ok(result) => result?,
+        Err(_) => return Err("Failed to read player data (file may be corrupted)".to_string()),
+    };
 
     let pos = nbt_list(&root, "Pos")
         .map(|list| {
