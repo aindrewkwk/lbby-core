@@ -193,8 +193,15 @@ fn walk_and_zip<W: Write + std::io::Seek>(
     Ok(())
 }
 
-/// Extract a backup ZIP into the server directory, overwriting matching files.
-/// Returns the number of files restored.
+/// Extract a backup ZIP into the server directory using a transactional
+/// staging approach. Returns the number of files restored.
+///
+/// Transactional flow:
+///   1. Extract to a staging directory (`.restore-staging-{timestamp}`)
+///   2. Rename original server dir → `.rollback-{timestamp}`
+///   3. Rename staging → server dir (atomic on same filesystem)
+///   4. On success, remove rollback dir
+///   5. On failure, rollback: rename rollback → server dir, clean staging
 ///
 /// Safety: rejects entries with absolute paths or `..` components (zip-slip).
 pub fn restore_server_backup(
@@ -205,9 +212,67 @@ pub fn restore_server_backup(
     if !zip_path.exists() {
         return Err(format!("Backup file does not exist: {}", zip_path.display()));
     }
-    std::fs::create_dir_all(server_path)
-        .map_err(|e| format!("Cannot create server dir: {}", e))?;
 
+    let ts = chrono::Local::now().format("%Y%m%d%H%M%S");
+    let parent = server_path.parent().unwrap_or(Path::new("/"));
+    let staging_path = parent.join(format!(".restore-staging-{}", ts));
+    let rollback_path = parent.join(format!(".rollback-{}", ts));
+
+    // ── Step 1: Extract ZIP into staging directory ──────────────────────
+    std::fs::create_dir_all(&staging_path)
+        .map_err(|e| format!("Cannot create staging dir: {}", e))?;
+
+    let extract_result = extract_zip_to_dir(app, zip_path, &staging_path);
+
+    if let Err(e) = extract_result {
+        // Extraction failed — clean up staging dir and return error
+        let _ = std::fs::remove_dir_all(&staging_path);
+        return Err(e);
+    }
+
+    let count = extract_result.unwrap();
+
+    // ── Step 2: Atomic swap ─────────────────────────────────────────────
+    // Rename original → rollback (if original exists)
+    if server_path.exists() {
+        if let Err(e) = std::fs::rename(server_path, &rollback_path) {
+            // Swap failed — clean up staging and return error
+            let _ = std::fs::remove_dir_all(&staging_path);
+            return Err(format!("Cannot rename server dir for rollback: {}", e));
+        }
+    }
+
+    // Rename staging → server_path
+    if let Err(e) = std::fs::rename(&staging_path, server_path) {
+        // staging → server failed — rollback the original
+        if rollback_path.exists() {
+            if let Err(rb_err) = std::fs::rename(&rollback_path, server_path) {
+                // Rollback also failed — critical state, leave staging in place
+                return Err(format!(
+                    "CRITICAL: staging→server failed ({}), rollback also failed ({}). \
+                     Staging dir preserved at: {}",
+                    e,
+                    rb_err,
+                    staging_path.display()
+                ));
+            }
+        }
+        return Err(format!("Cannot rename staging to server dir: {}", e));
+    }
+
+    // ── Step 3: Clean up rollback dir (best-effort) ─────────────────────
+    let _ = std::fs::remove_dir_all(&rollback_path);
+
+    Ok(count)
+}
+
+/// Extract a ZIP archive into the given directory. Returns the file count.
+/// Safety: rejects entries with absolute paths or `..` components (zip-slip).
+fn extract_zip_to_dir(
+    app: &std::sync::Arc<crate::app_state::AppEventSender>,
+    zip_path: &Path,
+    dest_dir: &Path,
+) -> Result<u64, String> {
     let file = File::open(zip_path).map_err(|e| format!("Cannot open zip: {}", e))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| format!("Invalid zip: {}", e))?;
@@ -226,7 +291,7 @@ pub fn restore_server_backup(
             Some(p) => p.to_path_buf(),
             None => continue, // unsafe path (absolute or contains `..`) — skip
         };
-        let outpath = server_path.join(&safe_path);
+        let outpath = dest_dir.join(&safe_path);
 
         if entry.is_dir() {
             std::fs::create_dir_all(&outpath)
