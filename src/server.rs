@@ -39,6 +39,10 @@ pub struct ServerManager {
     pub profile_id: Option<String>,
     /// The server directory captured at start time.
     pub server_dir: Option<PathBuf>,
+    /// Monotonic generation counter — incremented each time a server starts.
+    /// Used by auto-restart to invalidate stale restart requests (e.g. if the
+    /// user manually started a new server between crash and delayed restart).
+    pub restart_generation: u64,
 }
 
 impl ServerManager {
@@ -50,6 +54,7 @@ impl ServerManager {
             stop_requested: false,
             profile_id: None,
             server_dir: None,
+            restart_generation: 0,
         }
     }
 }
@@ -106,6 +111,7 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
         // and all operations resolve to the correct profile.
         srv.profile_id = Some(current_profile_id.clone());
         srv.server_dir = Some(PathBuf::from(&cfg.server_path));
+        srv.restart_generation = srv.restart_generation.wrapping_add(1);
     }
     app.emit("server-status", ServerStatus::Starting).ok();
 
@@ -386,9 +392,9 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
         }
         // Stream ended — server process exited
         let s = app3.state();
-        let (was_unexpected, captured_profile_id, captured_server_dir) = {
+        let (was_unexpected, captured_profile_id, captured_server_dir, captured_generation) = {
             let srv = s.server.lock().await;
-            (!srv.stop_requested, srv.profile_id.clone(), srv.server_dir.clone())
+            (!srv.stop_requested, srv.profile_id.clone(), srv.server_dir.clone(), srv.restart_generation)
         };
         {
             let mut srv = s.server.lock().await;
@@ -447,6 +453,15 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
             s.push_console_line(msg.clone());
             app3.emit("mc-line", &msg).ok();
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            // Staleness check: if the user started a new server manually
+            // during the 3s delay, skip this restart.
+            {
+                let current_gen = s.server.lock().await.restart_generation;
+                if current_gen != captured_generation {
+                    s.push_console_line("[lbby] Auto-restart skipped — server was started manually.".to_string());
+                    return;
+                }
+            }
             let _ = crate::server::start_server(app3).await;
         }
     });
