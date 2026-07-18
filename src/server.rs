@@ -33,6 +33,12 @@ pub struct ServerManager {
     /// server exited on its own (crash). The wait task uses this to decide
     /// whether to trigger an auto-restart.
     pub stop_requested: bool,
+    /// The profile ID that owns this running server process.
+    /// Captured at start time so auto-restart and all operations resolve
+    /// to the correct profile, regardless of which profile is active in the UI.
+    pub profile_id: Option<String>,
+    /// The server directory captured at start time.
+    pub server_dir: Option<PathBuf>,
 }
 
 impl ServerManager {
@@ -42,6 +48,8 @@ impl ServerManager {
             stdin: None,
             pid: None,
             stop_requested: false,
+            profile_id: None,
+            server_dir: None,
         }
     }
 }
@@ -74,6 +82,7 @@ pub fn start_server(app: Arc<AppEventSender>) -> std::pin::Pin<Box<dyn std::futu
 /// auto-restart task on the wait-for-child handler.
 pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
     let cfg = crate::config::load_config();
+    let current_profile_id = crate::config::active_profile_id();
     if !cfg.setup_complete {
         return Err("Server not set up yet".to_string());
     }
@@ -93,6 +102,10 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
         let mut srv = state.server.lock().await;
         srv.status = ServerStatus::Starting;
         srv.stop_requested = false;
+        // CRITICAL: Capture the profile ID at start time so auto-restart
+        // and all operations resolve to the correct profile.
+        srv.profile_id = Some(current_profile_id.clone());
+        srv.server_dir = Some(PathBuf::from(&cfg.server_path));
     }
     app.emit("server-status", ServerStatus::Starting).ok();
 
@@ -119,7 +132,8 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
     // delete the lock so this start can succeed instead of hitting a
     // confusing `DirectoryLock$LockException` from Forge.
     if cfg.is_minecraft() {
-        let lock_path = server_dir.join("world").join("session.lock");
+        let world_name = crate::config::resolve_world_name(&server_dir);
+        let lock_path = server_dir.join(&world_name).join("session.lock");
         if lock_path.exists() {
             let pid_file = server_dir.join(".lbby-server.pid");
             #[cfg(unix)]
@@ -372,9 +386,9 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
         }
         // Stream ended — server process exited
         let s = app3.state();
-        let was_unexpected = {
+        let (was_unexpected, captured_profile_id, captured_server_dir) = {
             let srv = s.server.lock().await;
-            !srv.stop_requested
+            (!srv.stop_requested, srv.profile_id.clone(), srv.server_dir.clone())
         };
         {
             let mut srv = s.server.lock().await;
@@ -383,10 +397,10 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
             srv.pid = None;
         }
         app3.emit("server-status", ServerStatus::Stopped).ok();
-        let cfg = crate::config::load_config();
-        let _ = std::fs::remove_file(
-            PathBuf::from(&cfg.server_path).join(".lbby-server.pid"),
-        );
+        // Use captured server_dir for PID cleanup (not active profile)
+        if let Some(ref dir) = captured_server_dir {
+            let _ = std::fs::remove_file(dir.join(".lbby-server.pid"));
+        }
         let mut st = s.stats.lock().await;
         *st = ServerStats::default();
         app3.emit("server-stats", st.clone()).ok();
@@ -396,8 +410,14 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
         drop(players);
         drop(st);
 
-        // Auto-restart if enabled and exit was unexpected
-        if was_unexpected && cfg.auto_restart {
+        // Auto-restart: use CAPTURED profile_id, not the active profile.
+        // This ensures the correct profile restarts even if the user switched.
+        let restart_cfg = if let Some(ref pid) = captured_profile_id {
+            crate::config::load_profile_config(pid).unwrap_or_default()
+        } else {
+            crate::config::load_config()
+        };
+        if was_unexpected && restart_cfg.auto_restart {
             let now = std::time::Instant::now();
             let window = std::time::Duration::from_secs(RESTART_WINDOW_SECS);
             let allow = {
@@ -481,7 +501,8 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
                     let world_dir = if cfg.is_terraria() {
                         server_dir_for_stats.join("Worlds")
                     } else {
-                        server_dir_for_stats.join("world")
+                        let world_name = crate::config::resolve_world_name(&server_dir_for_stats);
+                        server_dir_for_stats.join(&world_name)
                     };
                     st.world_size_mb = crate::stats::dir_size_mb(&world_dir);
                 }
@@ -660,7 +681,9 @@ async fn graceful_or_force_stop_server(app: &Arc<crate::app_state::AppEventSende
     // Phase 4: clear stale session lock so next start can boot
     let cfg = crate::config::load_config();
     if cfg.is_minecraft() {
-        let lock = std::path::PathBuf::from(&cfg.server_path).join("world").join("session.lock");
+        let server_dir = std::path::PathBuf::from(&cfg.server_path);
+        let world_name = crate::config::resolve_world_name(&server_dir);
+        let lock = server_dir.join(&world_name).join("session.lock");
         if lock.exists() {
             std::fs::remove_file(&lock).ok();
         }
@@ -1260,7 +1283,8 @@ pub async fn regenerate_world() -> Result<(), String> {
         return Err("World regeneration is not supported for Terraria. Delete the .wld file manually.".to_string());
     }
     let server_dir = std::path::PathBuf::from(&cfg.server_path);
-    let world_dir = server_dir.join("world");
+    let world_name = crate::config::resolve_world_name(&server_dir);
+    let world_dir = server_dir.join(&world_name);
     if !world_dir.exists() {
         return Ok(());
     }

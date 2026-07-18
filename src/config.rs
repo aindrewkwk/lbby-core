@@ -392,6 +392,106 @@ pub fn load_config() -> ServerConfig {
         .unwrap_or_default()
 }
 
+/// Get the currently active profile ID.
+pub fn active_profile_id() -> String {
+    let file = load_profiles_file();
+    file.active_id.clone()
+}
+
+/// Resolve the configured world folder name from server.properties.
+/// Reads `level-name` from the server's server.properties file.
+/// Returns "world" as default if the file or key is missing.
+/// Rejects traversal and absolute paths for safety.
+pub fn resolve_world_name(server_dir: &std::path::Path) -> String {
+    let props_path = server_dir.join("server.properties");
+    let content = match std::fs::read_to_string(&props_path) {
+        Ok(c) => c,
+        Err(_) => return "world".to_string(),
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() { continue; }
+        if let Some((key, value)) = line.split_once('=') {
+            if key.trim() == "level-name" {
+                let name = value.trim();
+                // Safety: reject traversal, absolute paths, drive letters
+                if name.is_empty()
+                    || name.contains("..")
+                    || name.contains('/')
+                    || name.contains('\\')
+                    || name.starts_with('.')
+                    || (name.len() >= 2 && name.as_bytes()[1] == b':')
+                {
+                    return "world".to_string();
+                }
+                return name.to_string();
+            }
+        }
+    }
+    "world".to_string()
+}
+
+/// Resolve all world-related directories for a profile.
+/// Returns (primary_world, nether_world, end_world) paths.
+pub fn resolve_world_dirs(server_dir: &std::path::Path) -> (std::path::PathBuf, Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    let world_name = resolve_world_name(server_dir);
+    let primary = server_dir.join(&world_name);
+    let nether = server_dir.join(format!("{}_nether", world_name));
+    let end = server_dir.join(format!("{}_the_end", world_name));
+    let nether_opt = if nether.exists() { Some(nether) } else { None };
+    let end_opt = if end.exists() { Some(end) } else { None };
+    (primary, nether_opt, end_opt)
+}
+
+/// Load a profile's config by its ID (not the active profile).
+pub fn load_profile_config(profile_id: &str) -> Option<ServerConfig> {
+    let file = load_profiles_file();
+    file.profiles
+        .iter()
+        .find(|p| p.id == profile_id)
+        .map(|p| p.config.clone())
+}
+
+/// Validate that a server path does not collide with another profile's path.
+/// Returns Ok(()) if safe, Err with affected profile IDs if collision detected.
+pub fn validate_server_path_ownership(exclude_profile_id: &str, server_path: &str) -> Result<(), String> {
+    if server_path.is_empty() {
+        return Ok(());
+    }
+    let file = load_profiles_file();
+    let normalized = normalize_path(server_path);
+    for profile in &file.profiles {
+        if profile.id == exclude_profile_id { continue; }
+        let other_normalized = normalize_path(&profile.config.server_path);
+        if normalized == other_normalized {
+            return Err(format!(
+                "Server path collision: profile '{}' and profile '{}' both use '{}'",
+                exclude_profile_id, profile.id, server_path
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Normalize a path for comparison: resolve . and .., normalize separators.
+fn normalize_path(path_str: &str) -> String {
+    let path = std::path::Path::new(path_str);
+    // Try to canonicalize if it exists
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical.to_string_lossy().to_string();
+    }
+    // Otherwise normalize manually
+    let mut components: Vec<String> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => { components.pop(); }
+            std::path::Component::CurDir => {}
+            other => components.push(other.as_os_str().to_string_lossy().to_string()),
+        }
+    }
+    components.join(std::path::MAIN_SEPARATOR_STR)
+}
+
 pub fn save_config(cfg: &ServerConfig) -> Result<(), String> {
     let mut file = load_profiles_file();
     if let Some(profile) = file.profiles.iter_mut().find(|p| p.id == file.active_id) {
@@ -512,6 +612,8 @@ pub fn create_profile(
         }
     }
     cfg.server_path = isolated_path.to_string_lossy().to_string();
+    // Validate no collision with existing profiles
+    validate_server_path_ownership(&id, &cfg.server_path)?;
     file.profiles.push(ServerProfile {
         id: id.clone(),
         name: if clean_name.is_empty() {
