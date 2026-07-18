@@ -26,7 +26,7 @@ pub mod tmod_services;
 pub mod version_fetch;
 
 // Re-export commonly used types for convenience
-pub use app_state::{ActionResult, AppState, AppEventSender, BannedIp, BannedPlayer, ModInfo, PregenState, ShutdownStatus, WhitelistEntry};
+pub use app_state::{ActionResult, AppState, AppEventSender, BannedIp, BannedPlayer, ModInfo, OperationKind, PregenState, ShutdownStatus, WhitelistEntry};
 pub use config::{Game, ServerConfig, ServerType};
 pub use errors::SafetyError;
 pub use helpers::remote_kill_server_and_playit;

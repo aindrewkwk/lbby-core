@@ -117,6 +117,7 @@ pub struct AppState {
     pub remote_control_active_token: Mutex<String>,
     pub cloudflare_remote: Mutex<CloudflareTunnelState>,
     pub action_results: Mutex<Vec<ActionResult>>,
+    pub current_operation: Mutex<OperationKind>,
 }
 
 impl AppState {
@@ -136,6 +137,7 @@ impl AppState {
             remote_control_active_token: Mutex::new(String::new()),
             cloudflare_remote: Mutex::new(CloudflareTunnelState::default()),
             action_results: Mutex::new(Vec::new()),
+            current_operation: Mutex::new(OperationKind::None),
         }
     }
 
