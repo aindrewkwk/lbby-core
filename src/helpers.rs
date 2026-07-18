@@ -384,6 +384,88 @@ pub fn read_zip_text<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name
     Some(text)
 }
 
+/// Safely extract a ZIP archive into `dest_root`.
+///
+/// For each entry:
+/// 1. Calls `enclosed_name()` — rejects absolute paths or `..` components.
+/// 2. Canonicalises the resolved output path and verifies it is still
+///    inside `dest_root`, preventing symlink / traversal escapes.
+///
+/// `strip_prefix` is optional — when non-empty the leading prefix is
+/// removed from every entry name before joining with `dest_root`.
+pub fn safe_extract_zip<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    dest_root: &Path,
+    strip_prefix: &str,
+) -> Result<(), String> {
+    let canonical_root = dest_root
+        .canonicalize()
+        .or_else(|_| {
+            std::fs::create_dir_all(dest_root)?;
+            dest_root.canonicalize()
+        })
+        .map_err(|e| format!("Cannot resolve destination root: {}", e))?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("Read zip entry {}: {}", i, e))?;
+
+        // 1) enclosed_name filters absolute paths and `..` components
+        let enclosed: PathBuf = match entry.enclosed_name() {
+            Some(p) => p.to_path_buf(),
+            None => continue, // skip unsafe paths silently
+        };
+
+        // 2) Strip optional prefix (e.g. "world/")
+        let relative = if !strip_prefix.is_empty() {
+            enclosed
+                .strip_prefix(strip_prefix)
+                .unwrap_or(&enclosed)
+                .to_path_buf()
+        } else {
+            enclosed
+        };
+
+        let outpath = dest_root.join(&relative);
+
+        // 3) Canonicalize parent (or the dir itself) and verify containment
+        if let Some(parent) = outpath.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let canonical_out = if outpath.is_dir() {
+            std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
+            outpath.canonicalize().map_err(|e| format!("Cannot resolve {}: {}", outpath.display(), e))?
+        } else {
+            // For files, canonicalize the parent since the file may not exist yet
+            let parent = outpath.parent().unwrap_or(dest_root);
+            parent.canonicalize().map_err(|e| format!("Cannot resolve parent {}: {}", parent.display(), e))?
+                .join(outpath.file_name().unwrap_or_default())
+        };
+
+        if !canonical_out.starts_with(&canonical_root) {
+            return Err(format!(
+                "Zip entry escapes destination: {} -> {}",
+                entry.name(),
+                canonical_out.display()
+            ));
+        }
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
+        } else {
+            if let Some(p) = outpath.parent() {
+                std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+            }
+            let mut outfile = std::fs::File::create(&outpath)
+                .map_err(|e| format!("Create {}: {}", outpath.display(), e))?;
+            std::io::copy(&mut entry, &mut outfile)
+                .map_err(|e| format!("Write {}: {}", outpath.display(), e))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn read_zip_icon_data_url<R: Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     path: &str,

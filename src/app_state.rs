@@ -15,6 +15,29 @@ use crate::stats::ServerStats;
 const CONSOLE_BUFFER_CAP: usize = 2000;
 const RECENT_PLAYERS_CAP: usize = 50;
 
+/// Tracks which safety-critical operation is currently in progress.
+/// Used to prevent conflicting operations from running concurrently.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OperationKind {
+    None,
+    Starting,
+    Stopping,
+    Restoring,
+    Importing,
+    Exporting,
+    Installing,
+    BackingUp,
+    Resetting,
+    DeletingProfile,
+}
+
+impl Default for OperationKind {
+    fn default() -> Self {
+        OperationKind::None
+    }
+}
+
 #[derive(Default, Clone, Serialize)]
 pub struct PregenState {
     pub running: bool,

@@ -2,6 +2,7 @@
 // Contains all game server management logic, without any UI or web server dependencies.
 
 pub mod app_state;
+pub mod errors;
 pub mod file_cache;
 pub mod helpers;
 pub mod automodpack;
@@ -27,6 +28,7 @@ pub mod version_fetch;
 // Re-export commonly used types for convenience
 pub use app_state::{ActionResult, AppState, AppEventSender, BannedIp, BannedPlayer, ModInfo, PregenState, ShutdownStatus, WhitelistEntry};
 pub use config::{Game, ServerConfig, ServerType};
+pub use errors::SafetyError;
 pub use helpers::remote_kill_server_and_playit;
 pub use playit::PlayitState;
 pub use server::{ServerManager, ServerStatus};
