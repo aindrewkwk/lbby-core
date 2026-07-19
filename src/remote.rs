@@ -22,12 +22,12 @@
 // enough that migration would be straightforward.
 // ──────────────────────────────────────────────────────────────────────────
 
-use crate::{backup, config};
 use crate::server::ServerStatus;
-use std::path::PathBuf;
+use crate::{backup, config};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::path::PathBuf;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -96,22 +96,43 @@ fn classify(ip: Ipv4Addr, adapter: &str) -> &'static str {
     let o = ip.octets();
     let name = adapter.to_lowercase();
     // Range-based detection first (most reliable for Hamachi/Radmin/Tailscale).
-    if o[0] == 25 { return "hamachi"; }
-    if o[0] == 26 { return "radmin"; }
-    if o[0] == 100 && (64..=127).contains(&o[1]) { return "tailscale"; } // 100.64.0.0/10 CGNAT
-    // Name-based detection for anything else.
-    if name.contains("hamachi") { return "hamachi"; }
-    if name.contains("radmin") { return "radmin"; }
-    if name.contains("tailscale") { return "tailscale"; }
-    if name.contains("zerotier") { return "zerotier"; }
-    if name.contains("vpn") || name.contains("wireguard") || name.contains("tap") || name.contains("tun") {
+    if o[0] == 25 {
+        return "hamachi";
+    }
+    if o[0] == 26 {
+        return "radmin";
+    }
+    if o[0] == 100 && (64..=127).contains(&o[1]) {
+        return "tailscale";
+    } // 100.64.0.0/10 CGNAT
+      // Name-based detection for anything else.
+    if name.contains("hamachi") {
+        return "hamachi";
+    }
+    if name.contains("radmin") {
+        return "radmin";
+    }
+    if name.contains("tailscale") {
+        return "tailscale";
+    }
+    if name.contains("zerotier") {
+        return "zerotier";
+    }
+    if name.contains("vpn")
+        || name.contains("wireguard")
+        || name.contains("tap")
+        || name.contains("tun")
+    {
         return "vpn";
     }
     // RFC1918 private ranges → physical/local network.
-    let is_private = o[0] == 10
-        || (o[0] == 172 && (16..=31).contains(&o[1]))
-        || (o[0] == 192 && o[1] == 168);
-    if is_private { "local" } else { "other" }
+    let is_private =
+        o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168);
+    if is_private {
+        "local"
+    } else {
+        "other"
+    }
 }
 
 /// Every usable IPv4 address on this machine, VPN adapters included, ordered
@@ -121,12 +142,16 @@ pub fn list_lan_addresses() -> Vec<LanAddress> {
     let mut out: Vec<LanAddress> = Vec::new();
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
         for iface in ifaces {
-            if iface.is_loopback() { continue; }
+            if iface.is_loopback() {
+                continue;
+            }
             let ip = match iface.ip() {
                 IpAddr::V4(v4) => v4,
                 IpAddr::V6(_) => continue,
             };
-            if ip.is_loopback() || ip.is_link_local() { continue; }
+            if ip.is_loopback() || ip.is_link_local() {
+                continue;
+            }
             out.push(LanAddress {
                 ip: ip.to_string(),
                 adapter: iface.name.clone(),
@@ -197,7 +222,9 @@ fn build_public_url(raw: &str, token: &str) -> String {
     }
 }
 
-pub async fn sync(app: &std::sync::Arc<crate::app_state::AppEventSender>) -> Result<RemoteControlState, String> {
+pub async fn sync(
+    app: &std::sync::Arc<crate::app_state::AppEventSender>,
+) -> Result<RemoteControlState, String> {
     let cfg = config::load_config();
     let state = app.state();
     let mut task = state.remote_control.lock().await;
@@ -284,7 +311,9 @@ pub async fn sync(app: &std::sync::Arc<crate::app_state::AppEventSender>) -> Res
 /// actually released. Unlike `sync()` (which just aborts and returns), this
 /// retries the port-check in a tight loop so the caller is guaranteed the
 /// port is free by the time it returns.
-pub async fn stop(app: &std::sync::Arc<crate::app_state::AppEventSender>) -> Result<RemoteControlState, String> {
+pub async fn stop(
+    app: &std::sync::Arc<crate::app_state::AppEventSender>,
+) -> Result<RemoteControlState, String> {
     let state = app.state();
     let mut task = state.remote_control.lock().await;
     let mut active_token = state.remote_control_active_token.lock().await;
@@ -425,7 +454,11 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-async fn route_request(request: HttpRequest, app: std::sync::Arc<crate::app_state::AppEventSender>, token: &str) -> String {
+async fn route_request(
+    request: HttpRequest,
+    app: std::sync::Arc<crate::app_state::AppEventSender>,
+    token: &str,
+) -> String {
     if request.path == "/" && request.method == "GET" {
         return html_response(remote_page());
     }
@@ -544,7 +577,10 @@ async fn remote_console_response(app: std::sync::Arc<crate::app_state::AppEventS
     json_response(200, &serde_json::json!({ "lines": lines }))
 }
 
-async fn remote_command_response(app: std::sync::Arc<crate::app_state::AppEventSender>, body: Vec<u8>) -> String {
+async fn remote_command_response(
+    app: std::sync::Arc<crate::app_state::AppEventSender>,
+    body: Vec<u8>,
+) -> String {
     let cmd = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| v.get("cmd").and_then(|c| c.as_str()).map(str::to_string))
@@ -583,10 +619,16 @@ async fn remote_stop_server(app: std::sync::Arc<crate::app_state::AppEventSender
     let was_running = {
         let state = app.state();
         let srv = state.server.lock().await;
-        matches!(srv.status, ServerStatus::Running | ServerStatus::Starting | ServerStatus::Stopping)
+        matches!(
+            srv.status,
+            ServerStatus::Running | ServerStatus::Starting | ServerStatus::Stopping
+        )
     };
     if !was_running {
-        return json_response(409, &serde_json::json!({ "error": "Server is not running" }));
+        return json_response(
+            409,
+            &serde_json::json!({ "error": "Server is not running" }),
+        );
     }
 
     // "Kill everything but the Remote-Control tunnel": stop the Minecraft
@@ -627,7 +669,10 @@ async fn remote_pregen_status(app: std::sync::Arc<crate::app_state::AppEventSend
     )
 }
 
-async fn remote_pregen_start(app: std::sync::Arc<crate::app_state::AppEventSender>, body: Vec<u8>) -> String {
+async fn remote_pregen_start(
+    app: std::sync::Arc<crate::app_state::AppEventSender>,
+    body: Vec<u8>,
+) -> String {
     let total = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| v.get("total").and_then(|t| t.as_u64()))
@@ -653,7 +698,10 @@ async fn remote_pregen_cancel(app: std::sync::Arc<crate::app_state::AppEventSend
 
 // ── Backup ──────────────────────────────────────────────────────────────────
 
-async fn remote_backup_create(app: std::sync::Arc<crate::app_state::AppEventSender>, body: Vec<u8>) -> String {
+async fn remote_backup_create(
+    app: std::sync::Arc<crate::app_state::AppEventSender>,
+    body: Vec<u8>,
+) -> String {
     // Optional body: { "include_logs": bool }. Default false (matches UI default).
     let include_logs = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
@@ -688,7 +736,10 @@ async fn remote_backup_create(app: std::sync::Arc<crate::app_state::AppEventSend
             }),
         ),
         Ok(Err(e)) => json_response(500, &serde_json::json!({ "error": e })),
-        Err(e) => json_response(500, &serde_json::json!({ "error": format!("Backup task panicked: {}", e) })),
+        Err(e) => json_response(
+            500,
+            &serde_json::json!({ "error": format!("Backup task panicked: {}", e) }),
+        ),
     }
 }
 

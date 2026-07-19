@@ -73,36 +73,45 @@ fn nbt_to_json(val: &fastnbt::Value) -> serde_json::Value {
         fastnbt::Value::Short(v) => serde_json::Value::Number((*v as i64).into()),
         fastnbt::Value::Int(v) => serde_json::Value::Number((*v as i64).into()),
         fastnbt::Value::Long(v) => serde_json::Value::Number((*v).into()),
-        fastnbt::Value::Float(v) => {
-            serde_json::Number::from_f64(*v as f64)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }
+        fastnbt::Value::Float(v) => serde_json::Number::from_f64(*v as f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         fastnbt::Value::Double(v) => serde_json::Number::from_f64(*v)
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         fastnbt::Value::String(s) => serde_json::Value::String(s.clone()),
         fastnbt::Value::Compound(map) => {
-            let obj: serde_json::Map<String, serde_json::Value> =
-                map.iter().map(|(k, v)| (k.clone(), nbt_to_json(v))).collect();
+            let obj: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), nbt_to_json(v)))
+                .collect();
             serde_json::Value::Object(obj)
         }
         fastnbt::Value::List(items) => {
             serde_json::Value::Array(items.iter().map(nbt_to_json).collect())
         }
-        fastnbt::Value::ByteArray(a) => {
-            serde_json::Value::Array(a.iter().map(|b| serde_json::Value::Number((*b as i64).into())).collect())
-        }
-        fastnbt::Value::IntArray(a) => {
-            serde_json::Value::Array(a.iter().map(|b| serde_json::Value::Number((*b as i64).into())).collect())
-        }
-        fastnbt::Value::LongArray(a) => {
-            serde_json::Value::Array(a.iter().map(|b| serde_json::Value::Number((*b).into())).collect())
-        }
+        fastnbt::Value::ByteArray(a) => serde_json::Value::Array(
+            a.iter()
+                .map(|b| serde_json::Value::Number((*b as i64).into()))
+                .collect(),
+        ),
+        fastnbt::Value::IntArray(a) => serde_json::Value::Array(
+            a.iter()
+                .map(|b| serde_json::Value::Number((*b as i64).into()))
+                .collect(),
+        ),
+        fastnbt::Value::LongArray(a) => serde_json::Value::Array(
+            a.iter()
+                .map(|b| serde_json::Value::Number((*b).into()))
+                .collect(),
+        ),
     }
 }
 
-fn nbt_get<'a>(compound: &'a HashMap<String, fastnbt::Value>, key: &str) -> Option<&'a fastnbt::Value> {
+fn nbt_get<'a>(
+    compound: &'a HashMap<String, fastnbt::Value>,
+    key: &str,
+) -> Option<&'a fastnbt::Value> {
     compound.get(key)
 }
 
@@ -147,14 +156,20 @@ fn nbt_f64(compound: &HashMap<String, fastnbt::Value>, key: &str) -> Option<f64>
     }
 }
 
-fn nbt_list<'a>(compound: &'a HashMap<String, fastnbt::Value>, key: &str) -> Option<&'a Vec<fastnbt::Value>> {
+fn nbt_list<'a>(
+    compound: &'a HashMap<String, fastnbt::Value>,
+    key: &str,
+) -> Option<&'a Vec<fastnbt::Value>> {
     match nbt_get(compound, key)? {
         fastnbt::Value::List(v) => Some(v),
         _ => None,
     }
 }
 
-fn nbt_compound<'a>(compound: &'a HashMap<String, fastnbt::Value>, key: &str) -> Option<&'a HashMap<String, fastnbt::Value>> {
+fn nbt_compound<'a>(
+    compound: &'a HashMap<String, fastnbt::Value>,
+    key: &str,
+) -> Option<&'a HashMap<String, fastnbt::Value>> {
     match nbt_get(compound, key)? {
         fastnbt::Value::Compound(v) => Some(v),
         _ => None,
@@ -192,7 +207,11 @@ fn resolve_uuid(name: &str, server_path: &Path) -> Result<String, String> {
         let guard = USERCACHE.lock().unwrap();
         if let Some(ref state) = *guard {
             if state.mtime == mtime {
-                if let Some(entry) = state.entries.iter().find(|e| e.name.eq_ignore_ascii_case(name)) {
+                if let Some(entry) = state
+                    .entries
+                    .iter()
+                    .find(|e| e.name.eq_ignore_ascii_case(name))
+                {
                     return Ok(entry.uuid.clone());
                 }
                 return Err(format!("Player '{}' not found in usercache.json. They must have joined the server at least once.", name));
@@ -209,8 +228,16 @@ fn resolve_uuid(name: &str, server_path: &Path) -> Result<String, String> {
     let mut parsed = Vec::new();
     if let Some(arr) = entries.as_array() {
         for entry in arr {
-            let n = entry.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let u = entry.get("uuid").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let n = entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let u = entry
+                .get("uuid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if !n.is_empty() && !u.is_empty() {
                 parsed.push(UsercacheEntry { name: n, uuid: u });
             }
@@ -220,21 +247,34 @@ fn resolve_uuid(name: &str, server_path: &Path) -> Result<String, String> {
     // Store in cache
     {
         let mut guard = USERCACHE.lock().unwrap();
-        *guard = Some(UsercacheState { entries: parsed, mtime });
+        *guard = Some(UsercacheState {
+            entries: parsed,
+            mtime,
+        });
     }
 
     // Lookup from cache
     let guard = USERCACHE.lock().unwrap();
     if let Some(ref state) = *guard {
-        if let Some(entry) = state.entries.iter().find(|e| e.name.eq_ignore_ascii_case(name)) {
+        if let Some(entry) = state
+            .entries
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(name))
+        {
             return Ok(entry.uuid.clone());
         }
     }
-    Err(format!("Player '{}' not found in usercache.json. They must have joined the server at least once.", name))
+    Err(format!(
+        "Player '{}' not found in usercache.json. They must have joined the server at least once.",
+        name
+    ))
 }
 
 /// Read and decompress a player .dat file, returning the root NBT compound.
-fn read_player_dat(server_path: &Path, uuid: &str) -> Result<HashMap<String, fastnbt::Value>, String> {
+fn read_player_dat(
+    server_path: &Path,
+    uuid: &str,
+) -> Result<HashMap<String, fastnbt::Value>, String> {
     let dat_path = server_path
         .join("world")
         .join("playerdata")
@@ -252,8 +292,8 @@ fn read_player_dat(server_path: &Path, uuid: &str) -> Result<HashMap<String, fas
     decoder
         .read_to_end(&mut decompressed)
         .map_err(|e| format!("Failed to decompress {}: {}", dat_path.display(), e))?;
-    let nbt: fastnbt::Value = fastnbt::from_bytes(&decompressed)
-        .map_err(|e| format!("Failed to parse NBT: {}", e))?;
+    let nbt: fastnbt::Value =
+        fastnbt::from_bytes(&decompressed).map_err(|e| format!("Failed to parse NBT: {}", e))?;
     match nbt {
         fastnbt::Value::Compound(root) => Ok(root),
         _ => Err("Unexpected NBT root type (expected Compound)".into()),
@@ -345,7 +385,10 @@ pub fn get_player_full_data(name: String) -> Result<PlayerData, String> {
     let uuid = resolve_uuid(&name, &server_path)?;
 
     // Check player data cache (invalidated on file mtime change)
-    let dat_path = server_path.join("world").join("playerdata").join(format!("{}.dat", uuid));
+    let dat_path = server_path
+        .join("world")
+        .join("playerdata")
+        .join(format!("{}.dat", uuid));
     let dat_mtime = std::fs::metadata(&dat_path)
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -372,18 +415,27 @@ pub fn get_player_full_data(name: String) -> Result<PlayerData, String> {
 
     let pos = nbt_list(&root, "Pos")
         .map(|list| {
-            let x = list.first().and_then(|v| match v {
-                fastnbt::Value::Double(d) => Some(*d),
-                _ => None,
-            }).unwrap_or(0.0);
-            let y = list.get(1).and_then(|v| match v {
-                fastnbt::Value::Double(d) => Some(*d),
-                _ => None,
-            }).unwrap_or(0.0);
-            let z = list.get(2).and_then(|v| match v {
-                fastnbt::Value::Double(d) => Some(*d),
-                _ => None,
-            }).unwrap_or(0.0);
+            let x = list
+                .first()
+                .and_then(|v| match v {
+                    fastnbt::Value::Double(d) => Some(*d),
+                    _ => None,
+                })
+                .unwrap_or(0.0);
+            let y = list
+                .get(1)
+                .and_then(|v| match v {
+                    fastnbt::Value::Double(d) => Some(*d),
+                    _ => None,
+                })
+                .unwrap_or(0.0);
+            let z = list
+                .get(2)
+                .and_then(|v| match v {
+                    fastnbt::Value::Double(d) => Some(*d),
+                    _ => None,
+                })
+                .unwrap_or(0.0);
             [x, y, z]
         })
         .unwrap_or([0.0, 0.0, 0.0]);
@@ -438,7 +490,13 @@ pub fn get_player_full_data(name: String) -> Result<PlayerData, String> {
     {
         let mut guard = PLAYER_CACHE.lock().unwrap();
         let cache = guard.get_or_insert_with(HashMap::new);
-        cache.insert(uuid, PlayerDatCache { data: player_data.clone(), mtime: dat_mtime });
+        cache.insert(
+            uuid,
+            PlayerDatCache {
+                data: player_data.clone(),
+                mtime: dat_mtime,
+            },
+        );
     }
 
     Ok(player_data)
@@ -468,7 +526,10 @@ pub fn get_player_inventory_only(name: String) -> Result<Vec<InventorySlot>, Str
     let uuid = resolve_uuid(&name, &server_path)?;
 
     // Check cache — reuse full player data if available
-    let dat_path = server_path.join("world").join("playerdata").join(format!("{}.dat", uuid));
+    let dat_path = server_path
+        .join("world")
+        .join("playerdata")
+        .join(format!("{}.dat", uuid));
     let dat_mtime = std::fs::metadata(&dat_path)
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);

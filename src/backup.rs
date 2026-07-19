@@ -115,8 +115,8 @@ fn walk_and_zip<W: Write + std::io::Seek>(
     app: &std::sync::Arc<crate::app_state::AppEventSender>,
 ) -> Result<(), String> {
     let abs = base.join(rel);
-    for entry in std::fs::read_dir(&abs)
-        .map_err(|e| format!("read_dir {}: {}", abs.display(), e))?
+    for entry in
+        std::fs::read_dir(&abs).map_err(|e| format!("read_dir {}: {}", abs.display(), e))?
     {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
@@ -203,14 +203,15 @@ pub fn restore_server_backup(
     server_path: &Path,
 ) -> Result<u64, String> {
     if !zip_path.exists() {
-        return Err(format!("Backup file does not exist: {}", zip_path.display()));
+        return Err(format!(
+            "Backup file does not exist: {}",
+            zip_path.display()
+        ));
     }
-    std::fs::create_dir_all(server_path)
-        .map_err(|e| format!("Cannot create server dir: {}", e))?;
+    std::fs::create_dir_all(server_path).map_err(|e| format!("Cannot create server dir: {}", e))?;
 
     let file = File::open(zip_path).map_err(|e| format!("Cannot open zip: {}", e))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| format!("Invalid zip: {}", e))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip: {}", e))?;
 
     let mut count: u64 = 0;
     let mut bytes: u64 = 0;
@@ -243,7 +244,9 @@ pub fn restore_server_backup(
                 let n = entry
                     .read(&mut buf)
                     .map_err(|e| format!("read entry: {}", e))?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 out.write_all(&buf[..n])
                     .map_err(|e| format!("write {}: {}", outpath.display(), e))?;
                 bytes += n as u64;
@@ -267,9 +270,147 @@ pub fn restore_server_backup(
 
     app.emit(
         "restore-progress",
-        BackupProgress { files: count, bytes, current: "done".to_string() },
+        BackupProgress {
+            files: count,
+            bytes,
+            current: "done".to_string(),
+        },
     )
     .ok();
 
     Ok(count)
+}
+
+/// Transactional restore: extract to staging, validate, then atomically swap.
+///
+/// # Safety guarantees
+///
+/// - Original directory is untouched until validation succeeds
+/// - On failure before swap: original remains, staging cleaned
+/// - On failure after swap: rollback restores original
+/// - Rollback artifacts cleaned on success
+///
+/// # Stages
+///
+/// 1. Extract archive to `{server_path}.restore-staging-{timestamp}`
+/// 2. Validate staging contains at least one expected file
+/// 3. Rename original to `{server_path}.restore-rollback-{timestamp}`
+/// 4. Rename staging to `{server_path}`
+/// 5. Remove rollback directory
+///
+/// On failure at any stage, attempt to restore original state.
+pub fn restore_server_backup_transactional(
+    app: &std::sync::Arc<crate::app_state::AppEventSender>,
+    zip_path: &Path,
+    server_path: &Path,
+) -> Result<u64, String> {
+    if !zip_path.exists() {
+        return Err(format!(
+            "Backup file does not exist: {}",
+            zip_path.display()
+        ));
+    }
+
+    let ts = chrono::Local::now().format("%Y%m%d%H%M%S%3f").to_string();
+    let staging_dir = PathBuf::from(format!("{}.restore-staging-{}", server_path.display(), ts));
+    let rollback_dir = PathBuf::from(format!("{}.restore-rollback-{}", server_path.display(), ts));
+
+    // Phase 1: Extract to staging
+    let result = extract_to_staging(app, zip_path, &staging_dir);
+
+    match result {
+        Err(e) => {
+            // Extraction failed — clean staging
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(format!("Staging extraction failed: {}", e));
+        }
+        Ok(count) => {
+            // Phase 2: Validate staging has expected content
+            if count == 0 {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                return Err("Backup archive contained no files".to_string());
+            }
+
+            // Phase 3: Swap — rename original to rollback, staging to live
+            if server_path.exists() {
+                if let Err(e) = std::fs::rename(server_path, &rollback_dir) {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    return Err(format!("Failed to rename original to rollback: {}", e));
+                }
+            }
+
+            if let Err(e) = std::fs::rename(&staging_dir, server_path) {
+                // Swap failed — try to restore rollback
+                if rollback_dir.exists() {
+                    if let Err(rb_err) = std::fs::rename(&rollback_dir, server_path) {
+                        return Err(format!(
+                            "CRITICAL: staging→live failed ({}), rollback also failed ({}). Rollback data at: {}",
+                            e, rb_err, rollback_dir.display()
+                        ));
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                return Err(format!("Failed to rename staging to live: {}", e));
+            }
+
+            // Phase 4: Success — clean rollback
+            if rollback_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&rollback_dir) {
+                    // Non-fatal: rollback dir lingers but restore succeeded
+                    eprintln!("Warning: failed to clean rollback dir: {}", e);
+                }
+            }
+
+            Ok(count)
+        }
+    }
+}
+
+/// Extract a backup ZIP into a staging directory.
+/// Returns the number of files extracted.
+fn extract_to_staging(
+    app: &std::sync::Arc<crate::app_state::AppEventSender>,
+    zip_path: &Path,
+    staging_dir: &Path,
+) -> Result<u64, String> {
+    std::fs::create_dir_all(staging_dir)
+        .map_err(|e| format!("Cannot create staging dir: {}", e))?;
+
+    let file = File::open(zip_path).map_err(|e| format!("Cannot open zip: {}", e))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip: {}", e))?;
+
+    crate::helpers::safe_extract_zip(&mut archive, staging_dir, "")
+        .map_err(|e| format!("Safe extraction failed: {}", e))?;
+
+    // Count extracted files
+    let count = count_files_recursive(staging_dir);
+
+    app.emit(
+        "restore-progress",
+        BackupProgress {
+            files: count,
+            bytes: 0,
+            current: "staging_complete".to_string(),
+        },
+    )
+    .ok();
+
+    Ok(count)
+}
+
+/// Recursively count files in a directory.
+fn count_files_recursive(dir: &Path) -> u64 {
+    let mut count = 0u64;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_file() {
+                    count += 1;
+                } else if ft.is_dir() {
+                    count += count_files_recursive(&entry.path());
+                }
+            }
+        }
+    }
+    count
 }

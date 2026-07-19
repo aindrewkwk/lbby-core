@@ -103,7 +103,10 @@ pub async fn run(on_tier_change: Option<Arc<Mutex<dyn FnMut() + Send>>>) {
 
 /// Send a single heartbeat to the dashboard.
 async fn send_heartbeat(cfg: &config::ServerConfig) -> Result<HeartbeatResponse, String> {
-    let url = format!("{}/api/app/heartbeat", cfg.dashboard_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/api/app/heartbeat",
+        cfg.dashboard_url.trim_end_matches('/')
+    );
 
     let hostname = get_hostname();
 
@@ -142,10 +145,14 @@ async fn send_heartbeat(cfg: &config::ServerConfig) -> Result<HeartbeatResponse,
 fn get_hostname() -> String {
     // Try environment variables first (works on all platforms)
     if let Ok(h) = std::env::var("HOSTNAME") {
-        if !h.is_empty() { return h; }
+        if !h.is_empty() {
+            return h;
+        }
     }
     if let Ok(h) = std::env::var("COMPUTERNAME") {
-        if !h.is_empty() { return h; }
+        if !h.is_empty() {
+            return h;
+        }
     }
     // Fallback: run `hostname` command
     std::process::Command::new("hostname")

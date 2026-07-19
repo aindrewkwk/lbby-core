@@ -11,37 +11,22 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub enum SafetyError {
     /// Server is currently running and the requested operation cannot proceed.
-    ServerRunning {
-        status: String,
-        operation: String,
-    },
+    ServerRunning { status: String, operation: String },
     /// Server is starting and the requested operation cannot proceed.
-    ServerStarting {
-        operation: String,
-    },
+    ServerStarting { operation: String },
     /// A restart is pending and the requested operation cannot proceed.
     RestartPending {
         operation: String,
         profile_id: String,
     },
     /// A conflicting operation is already in progress.
-    ConflictingOperation {
-        current: String,
-        requested: String,
-    },
+    ConflictingOperation { current: String, requested: String },
     /// An unsafe archive entry was detected.
-    UnsafeArchiveEntry {
-        entry_path: String,
-        reason: String,
-    },
+    UnsafeArchiveEntry { entry_path: String, reason: String },
     /// The archive is invalid or corrupted.
-    InvalidArchive {
-        reason: String,
-    },
+    InvalidArchive { reason: String },
     /// Restore validation failed before modifying live data.
-    RestoreValidationFailed {
-        reason: String,
-    },
+    RestoreValidationFailed { reason: String },
     /// Restore rollback failed — original data may be partially restored.
     RestoreRollbackFailed {
         reason: String,
@@ -50,20 +35,11 @@ pub enum SafetyError {
     /// Access to the Playit secret is forbidden in production.
     SecretAccessForbidden,
     /// A path violates ownership boundaries.
-    PathOwnershipViolation {
-        path: PathBuf,
-        reason: String,
-    },
+    PathOwnershipViolation { path: PathBuf, reason: String },
     /// The operation was cancelled.
-    OperationCancelled {
-        operation: String,
-        reason: String,
-    },
+    OperationCancelled { operation: String, reason: String },
     /// Crash loop detected — too many restarts.
-    CrashLoopBlocked {
-        attempts: usize,
-        window_secs: u64,
-    },
+    CrashLoopBlocked { attempts: usize, window_secs: u64 },
 }
 
 impl fmt::Display for SafetyError {
@@ -73,13 +49,24 @@ impl fmt::Display for SafetyError {
                 write!(f, "Cannot {} while server is {}. Stop the server and wait for shutdown to complete.", operation, status)
             }
             SafetyError::ServerStarting { operation } => {
-                write!(f, "Cannot {} while server is starting. Wait for startup to complete or fail.", operation)
+                write!(
+                    f,
+                    "Cannot {} while server is starting. Wait for startup to complete or fail.",
+                    operation
+                )
             }
-            SafetyError::RestartPending { operation, profile_id } => {
+            SafetyError::RestartPending {
+                operation,
+                profile_id,
+            } => {
                 write!(f, "Cannot {} while a restart is pending for profile '{}'. Cancel the restart first.", operation, profile_id)
             }
             SafetyError::ConflictingOperation { current, requested } => {
-                write!(f, "Cannot {} while {} is in progress. Wait for it to complete.", requested, current)
+                write!(
+                    f,
+                    "Cannot {} while {} is in progress. Wait for it to complete.",
+                    requested, current
+                )
             }
             SafetyError::UnsafeArchiveEntry { entry_path, reason } => {
                 write!(f, "Unsafe archive entry '{}': {}", entry_path, reason)
@@ -90,23 +77,41 @@ impl fmt::Display for SafetyError {
             SafetyError::RestoreValidationFailed { reason } => {
                 write!(f, "Restore validation failed: {}", reason)
             }
-            SafetyError::RestoreRollbackFailed { reason, rollback_path } => {
+            SafetyError::RestoreRollbackFailed {
+                reason,
+                rollback_path,
+            } => {
                 if let Some(path) = rollback_path {
                     write!(f, "Restore rollback failed at '{}': {}. Original data may be partially restored.", path.display(), reason)
                 } else {
-                    write!(f, "Restore rollback failed: {}. Original data may be partially restored.", reason)
+                    write!(
+                        f,
+                        "Restore rollback failed: {}. Original data may be partially restored.",
+                        reason
+                    )
                 }
             }
             SafetyError::SecretAccessForbidden => {
-                write!(f, "Access to raw secrets is not allowed. Use safe diagnostic endpoints instead.")
+                write!(
+                    f,
+                    "Access to raw secrets is not allowed. Use safe diagnostic endpoints instead."
+                )
             }
             SafetyError::PathOwnershipViolation { path, reason } => {
-                write!(f, "Path ownership violation at '{}': {}", path.display(), reason)
+                write!(
+                    f,
+                    "Path ownership violation at '{}': {}",
+                    path.display(),
+                    reason
+                )
             }
             SafetyError::OperationCancelled { operation, reason } => {
                 write!(f, "Operation '{}' cancelled: {}", operation, reason)
             }
-            SafetyError::CrashLoopBlocked { attempts, window_secs } => {
+            SafetyError::CrashLoopBlocked {
+                attempts,
+                window_secs,
+            } => {
                 write!(f, "Auto-restart disabled — server crashed {}+ times in {} seconds. Fix the issue and start manually.", attempts, window_secs)
             }
         }

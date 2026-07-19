@@ -73,7 +73,11 @@ pub fn find_existing_cloudflared() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         if let Ok(program_files) = std::env::var("ProgramFiles") {
-            candidates.push(PathBuf::from(program_files).join("cloudflared").join("cloudflared.exe"));
+            candidates.push(
+                PathBuf::from(program_files)
+                    .join("cloudflared")
+                    .join("cloudflared.exe"),
+            );
         }
     }
 
@@ -92,9 +96,15 @@ fn download_url() -> Option<&'static str> {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     return Some("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64");
     #[cfg(not(any(
-        all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
         all(target_os = "windows", target_arch = "x86_64"),
-        all(target_os = "linux", any(target_arch = "aarch64", target_arch = "x86_64"))
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
     )))]
     return None;
 }
@@ -127,7 +137,9 @@ pub async fn ensure_cloudflared() -> Result<PathBuf, String> {
         .bytes()
         .await
         .map_err(|e| e.to_string())?;
-    tokio::fs::write(&tmp, bytes).await.map_err(|e| e.to_string())?;
+    tokio::fs::write(&tmp, bytes)
+        .await
+        .map_err(|e| e.to_string())?;
 
     if url.ends_with(".tgz") {
         extract_cloudflared_tgz(&tmp, &dest)?;
@@ -137,7 +149,9 @@ pub async fn ensure_cloudflared() -> Result<PathBuf, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&dest).map_err(|e| e.to_string())?.permissions();
+        let mut perms = std::fs::metadata(&dest)
+            .map_err(|e| e.to_string())?
+            .permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
     }
@@ -174,14 +188,19 @@ async fn kill_stray_cloudflareds(local_port: u16) {
     #[cfg(unix)]
     {
         let pattern = format!("cloudflared.*localhost:{}", local_port);
-        let out = match std::process::Command::new("pgrep").args(["-f", &pattern]).output() {
+        let out = match std::process::Command::new("pgrep")
+            .args(["-f", &pattern])
+            .output()
+        {
             Ok(o) if o.status.success() => o,
             _ => return,
         };
         let mut killed = 0u32;
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             if let Ok(pid) = line.trim().parse::<u32>() {
-                unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
                 killed += 1;
             }
         }
@@ -198,7 +217,9 @@ async fn kill_stray_cloudflareds(local_port: u16) {
     }
 }
 
-pub async fn start_quick_tunnel(app: std::sync::Arc<crate::app_state::AppEventSender>) -> Result<CloudflareTunnelState, String> {
+pub async fn start_quick_tunnel(
+    app: std::sync::Arc<crate::app_state::AppEventSender>,
+) -> Result<CloudflareTunnelState, String> {
     remote::sync(&app).await?;
     let cfg = config::load_config();
     if !cfg.remote_control_enabled {
@@ -267,7 +288,9 @@ pub async fn start_quick_tunnel(app: std::sync::Arc<crate::app_state::AppEventSe
                 eprintln!("[lbby] cloudflared wait error: {}", e);
             }
         }
-        app_wait.emit("cloudflare-remote-update", tunnel.clone()).ok();
+        app_wait
+            .emit("cloudflare-remote-update", tunnel.clone())
+            .ok();
     });
 
     let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(35));
@@ -304,7 +327,9 @@ pub async fn start_quick_tunnel(app: std::sync::Arc<crate::app_state::AppEventSe
     }
 }
 
-pub async fn stop_quick_tunnel(app: std::sync::Arc<crate::app_state::AppEventSender>) -> Result<CloudflareTunnelState, String> {
+pub async fn stop_quick_tunnel(
+    app: std::sync::Arc<crate::app_state::AppEventSender>,
+) -> Result<CloudflareTunnelState, String> {
     let state = app.state();
     let mut tunnel = state.cloudflare_remote.lock().await;
     if let Some(pid) = tunnel.pid {
@@ -328,12 +353,17 @@ pub async fn stop_quick_tunnel(app: std::sync::Arc<crate::app_state::AppEventSen
     Ok(tunnel.clone())
 }
 
-pub async fn status(app: std::sync::Arc<crate::app_state::AppEventSender>) -> CloudflareTunnelState {
+pub async fn status(
+    app: std::sync::Arc<crate::app_state::AppEventSender>,
+) -> CloudflareTunnelState {
     app.state().cloudflare_remote.lock().await.clone()
 }
 
-fn spawn_cloudflared_reader<R>(app: std::sync::Arc<crate::app_state::AppEventSender>, stream: R, tx: mpsc::UnboundedSender<String>)
-where
+fn spawn_cloudflared_reader<R>(
+    app: std::sync::Arc<crate::app_state::AppEventSender>,
+    stream: R,
+    tx: mpsc::UnboundedSender<String>,
+) where
     R: tokio::io::AsyncRead + Send + Unpin + 'static,
 {
     tokio::spawn(async move {
@@ -368,9 +398,7 @@ fn parse_trycloudflare_url(line: &str) -> Option<String> {
     line.split_whitespace()
         .find(|part| part.starts_with("https://") && part.contains(".trycloudflare.com"))
         .map(|part| {
-            part.trim_matches(|c: char| {
-                matches!(c, ',' | '.' | ';' | ')' | '(' | '"' | '\'' | '`')
-            })
-            .to_string()
+            part.trim_matches(|c: char| matches!(c, ',' | '.' | ';' | ')' | '(' | '"' | '\'' | '`'))
+                .to_string()
         })
 }

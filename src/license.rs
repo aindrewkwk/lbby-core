@@ -18,7 +18,7 @@
 //! current machine's fingerprint (a SHA-256 hash of `machine-uid`). Unbound
 //! tokens (no `dev` claim) work everywhere — used for development and trials.
 
-use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 
 use serde::{Deserialize, Serialize};
@@ -114,7 +114,9 @@ pub struct LicenseState {
 }
 
 impl Default for Tier {
-    fn default() -> Self { Tier::Free }
+    fn default() -> Self {
+        Tier::Free
+    }
 }
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -145,7 +147,11 @@ fn license_path() -> PathBuf {
 fn read_stored_token() -> Option<String> {
     fs::read_to_string(license_path()).ok().and_then(|s| {
         let trimmed = s.trim().to_string();
-        if trimmed.is_empty() { None } else { Some(trimmed) }
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
     })
 }
 
@@ -196,7 +202,8 @@ fn write_dev_tier(tier: Option<Tier>) -> Result<(), String> {
         }
         None => {
             if dev_tier_path().exists() {
-                fs::remove_file(dev_tier_path()).map_err(|e| format!("Couldn't delete dev tier: {}", e))?;
+                fs::remove_file(dev_tier_path())
+                    .map_err(|e| format!("Couldn't delete dev tier: {}", e))?;
             }
             Ok(())
         }
@@ -323,7 +330,8 @@ struct RevokedList {
 }
 
 /// Cached revocation list — fetched on startup, refreshed hourly.
-static REVOKED_CACHE: std::sync::LazyLock<Mutex<Option<RevokedList>>> = std::sync::LazyLock::new(|| Mutex::new(None));
+static REVOKED_CACHE: std::sync::LazyLock<Mutex<Option<RevokedList>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 
 fn revoked_cache_path() -> PathBuf {
     license_dir().join(REVOKED_CACHE_FILE)
@@ -348,7 +356,9 @@ fn extract_ed25519_pubkey() -> Option<VerifyingKey> {
         .filter(|l| !l.starts_with("-----"))
         .collect::<String>();
     let der = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &b64).ok()?;
-    if der.len() < 44 { return None; }
+    if der.len() < 44 {
+        return None;
+    }
     // SPKI: [0x30, len, 0x30, len, OID..., 0x03, 0x21, 0x00, <32 bytes key>]
     let key_bytes: [u8; 32] = der[12..44].try_into().ok()?;
     VerifyingKey::from_bytes(&key_bytes).ok()
@@ -366,10 +376,11 @@ fn verify_revocation_signature(list: &RevokedList) -> bool {
         None => return false,
     };
 
-    let sig_bytes = match base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, sig_b64) {
-        Ok(b) => b,
-        Err(_) => return false,
-    };
+    let sig_bytes =
+        match base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, sig_b64) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
 
     let signature = match Signature::from_slice(&sig_bytes) {
         Ok(s) => s,
@@ -423,11 +434,15 @@ pub async fn init_revocation() {
             *guard = Some(RevokedList {
                 version: list.version,
                 generated_at: list.generated_at,
-                entries: list.entries.iter().map(|e| RevokedEntry {
-                    jwt_id: e.jwt_id.clone(),
-                    reason: e.reason.clone(),
-                    revoked_at: e.revoked_at,
-                }).collect(),
+                entries: list
+                    .entries
+                    .iter()
+                    .map(|e| RevokedEntry {
+                        jwt_id: e.jwt_id.clone(),
+                        reason: e.reason.clone(),
+                        revoked_at: e.revoked_at,
+                    })
+                    .collect(),
                 signature: list.signature.clone(),
             });
         }
@@ -621,10 +636,14 @@ pub fn deactivate() -> Result<LicenseState, String> {
 /// Returns true when running in a debug (dev) build. The frontend uses this
 /// to decide whether to show the dev-tier override controls.
 #[cfg(debug_assertions)]
-pub fn is_dev_build() -> bool { true }
+pub fn is_dev_build() -> bool {
+    true
+}
 
 #[cfg(not(debug_assertions))]
-pub fn is_dev_build() -> bool { false }
+pub fn is_dev_build() -> bool {
+    false
+}
 
 /// Sets or clears the dev-tier override. Only works in debug builds;
 /// returns an error in release.
@@ -666,8 +685,8 @@ pub fn max_profiles(tier: Tier) -> u32 {
 /// Max number of chunks the user can request in a single pre-generation run.
 pub fn max_pregen_chunks(tier: Tier) -> u32 {
     match tier {
-        Tier::Free => 441,       // small preset only
-        Tier::Novice => 4_096,   // up to "Large" preset
+        Tier::Free => 441,     // small preset only
+        Tier::Novice => 4_096, // up to "Large" preset
         Tier::Master => u32::MAX,
     }
 }

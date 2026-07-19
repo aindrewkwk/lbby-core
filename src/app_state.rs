@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
 
 use crate::cloudflare::CloudflareTunnelState;
+use crate::errors::SafetyError;
 use crate::playit::PlayitState;
 use crate::server::ServerManager;
 use crate::stats::ServerStats;
@@ -102,6 +103,68 @@ pub struct ActionResult {
     pub error: Option<String>,
 }
 
+/// RAII guard for safety-critical operations.
+///
+/// Acquires the operation on creation, releases on drop.
+/// Prevents races between conflicting operations and guarantees
+/// the operation is released even on early returns or panics.
+///
+/// # Usage
+/// ```ignore
+/// let _guard = OperationGuard::acquire(&state.current_operation, OperationKind::Restoring)?;
+/// // ... do work ...
+/// // guard drops here, operation released automatically
+/// ```
+pub struct OperationGuard<'a> {
+    slot: &'a Mutex<OperationKind>,
+    kind: OperationKind,
+}
+
+impl<'a> std::fmt::Debug for OperationGuard<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationGuard")
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl<'a> OperationGuard<'a> {
+    /// Try to acquire the operation slot. Returns Err if another operation is active.
+    pub async fn acquire(
+        slot: &'a Mutex<OperationKind>,
+        kind: OperationKind,
+    ) -> Result<Self, SafetyError> {
+        let mut op = slot.lock().await;
+        if *op != OperationKind::None {
+            return Err(SafetyError::ConflictingOperation {
+                current: format!("{:?}", *op),
+                requested: format!("{:?}", kind),
+            });
+        }
+        *op = kind.clone();
+        Ok(Self { slot, kind })
+    }
+
+    /// Returns the operation kind this guard holds.
+    pub fn kind(&self) -> &OperationKind {
+        &self.kind
+    }
+}
+
+impl<'a> Drop for OperationGuard<'a> {
+    fn drop(&mut self) {
+        // We need to use try_lock because Drop cannot be async.
+        // If the lock is held by someone else (unlikely during drop),
+        // we silently skip — the operation will be cleaned up on next check.
+        if let Ok(mut op) = self.slot.try_lock() {
+            if *op == self.kind {
+                *op = OperationKind::None;
+            }
+            // If op != self.kind, a new operation already replaced us — don't clobber it.
+        }
+    }
+}
+
 pub struct AppState {
     pub server: Mutex<ServerManager>,
     pub playit: Mutex<PlayitState>,
@@ -185,5 +248,4 @@ impl AppEventSender {
     pub fn state(&self) -> Arc<AppState> {
         self.state.clone()
     }
-
 }

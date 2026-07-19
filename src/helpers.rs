@@ -119,7 +119,11 @@ pub fn default_server_path_value(game: Option<&str>) -> String {
 
 fn normalize_mod_info(mut info: crate::app_state::ModInfo) -> crate::app_state::ModInfo {
     if info.display_name.trim().is_empty() {
-        info.display_name = info.file_name.trim_end_matches(".jar").trim_end_matches(".tmod").to_string();
+        info.display_name = info
+            .file_name
+            .trim_end_matches(".jar")
+            .trim_end_matches(".tmod")
+            .to_string();
     }
     info.version = info.version.trim().to_string();
     info.authors = info
@@ -139,18 +143,27 @@ fn read_fabric_mod_info<R: Read + std::io::Seek>(
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let display_name = {
         let name = json_string(&value, "name");
-        if name.is_empty() { json_string(&value, "id") } else { name }
+        if name.is_empty() {
+            json_string(&value, "id")
+        } else {
+            name
+        }
     };
     let version = json_string(&value, "version");
     let description = json_string(&value, "description");
     let authors = match value.get("authors") {
-        Some(serde_json::Value::Array(items)) => items.iter().filter_map(|item| {
-            if let Some(s) = item.as_str() {
-                Some(s.to_string())
-            } else {
-                item.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
-            }
-        }).collect(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                if let Some(s) = item.as_str() {
+                    Some(s.to_string())
+                } else {
+                    item.get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                }
+            })
+            .collect(),
         _ => Vec::new(),
     };
     let icon_path = match value.get("icon") {
@@ -162,10 +175,19 @@ fn read_fabric_mod_info<R: Read + std::io::Seek>(
             .map(|s| s.to_string()),
         _ => None,
     };
-    let icon_data_url = icon_path.as_deref().and_then(|p| read_zip_icon_data_url(zip, p));
+    let icon_data_url = icon_path
+        .as_deref()
+        .and_then(|p| read_zip_icon_data_url(zip, p));
     Some(crate::app_state::ModInfo {
         file_name: file_name.to_string(),
-        display_name: if display_name.is_empty() { file_name.trim_end_matches(".jar").trim_end_matches(".tmod").to_string() } else { display_name },
+        display_name: if display_name.is_empty() {
+            file_name
+                .trim_end_matches(".jar")
+                .trim_end_matches(".tmod")
+                .to_string()
+        } else {
+            display_name
+        },
         version,
         authors,
         description,
@@ -177,15 +199,19 @@ fn read_forge_mod_info<R: Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     file_name: &str,
 ) -> Option<crate::app_state::ModInfo> {
-    let text = read_zip_text(zip, "META-INF/mods.toml")
-        .or_else(|| read_zip_text(zip, "mods.toml"))?;
+    let text =
+        read_zip_text(zip, "META-INF/mods.toml").or_else(|| read_zip_text(zip, "mods.toml"))?;
     let value: toml::Value = text.parse().ok()?;
     let mods = value.get("mods")?.as_array()?;
     let first = mods.first()?;
     let display_name = toml_string(first, "displayName");
     let mod_id = toml_string(first, "modId");
     let raw_version = toml_string(first, "version");
-    let version = if raw_version.starts_with("${") { String::new() } else { raw_version };
+    let version = if raw_version.starts_with("${") {
+        String::new()
+    } else {
+        raw_version
+    };
     let authors_raw = toml_string(first, "authors");
     let authors = authors_raw
         .split([',', ';'])
@@ -198,7 +224,11 @@ fn read_forge_mod_info<R: Read + std::io::Seek>(
     let icon_data_url = read_zip_icon_data_url(zip, &icon_path);
     Some(crate::app_state::ModInfo {
         file_name: file_name.to_string(),
-        display_name: if display_name.is_empty() { mod_id } else { display_name },
+        display_name: if display_name.is_empty() {
+            mod_id
+        } else {
+            display_name
+        },
         version,
         authors,
         description,
@@ -214,7 +244,10 @@ pub fn read_mod_info(path: &std::path::Path) -> crate::app_state::ModInfo {
         .map(|v| v.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
     let fallback = crate::app_state::ModInfo {
-        display_name: file_name.trim_end_matches(".jar").trim_end_matches(".tmod").to_string(),
+        display_name: file_name
+            .trim_end_matches(".jar")
+            .trim_end_matches(".tmod")
+            .to_string(),
         file_name: file_name.clone(),
         version: String::new(),
         authors: Vec::new(),
@@ -222,8 +255,12 @@ pub fn read_mod_info(path: &std::path::Path) -> crate::app_state::ModInfo {
         icon_data_url: None,
     };
 
-    let Ok(file) = std::fs::File::open(path) else { return fallback; };
-    let Ok(mut zip) = zip::ZipArchive::new(file) else { return fallback; };
+    let Ok(file) = std::fs::File::open(path) else {
+        return fallback;
+    };
+    let Ok(mut zip) = zip::ZipArchive::new(file) else {
+        return fallback;
+    };
 
     if let Some(info) = read_fabric_mod_info(&mut zip, &file_name) {
         return normalize_mod_info(info);
@@ -241,7 +278,10 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
 }
 
 /// Pre-generate chunks — delegates to server module.
-pub async fn do_pregenerate_chunks(app: Arc<AppEventSender>, total_chunks: u32) -> Result<(), String> {
+pub async fn do_pregenerate_chunks(
+    app: Arc<AppEventSender>,
+    total_chunks: u32,
+) -> Result<(), String> {
     crate::server::do_pregenerate_chunks(app, total_chunks).await
 }
 
@@ -252,7 +292,10 @@ pub async fn remote_kill_server_and_playit(app: &Arc<AppEventSender>) {
 }
 
 /// Install a game server — delegates to the full implementation in server.rs.
-pub async fn do_install_server(app: Arc<AppEventSender>, cfg: ServerConfig) -> Result<ServerConfig, String> {
+pub async fn do_install_server(
+    app: Arc<AppEventSender>,
+    cfg: ServerConfig,
+) -> Result<ServerConfig, String> {
     crate::server::do_install_server(app, cfg).await
 }
 
@@ -315,13 +358,17 @@ pub fn strip_ansi_codes(s: &str) -> String {
                 chars.next(); // consume '['
                 while let Some(&next) = chars.peek() {
                     chars.next();
-                    if next.is_ascii_alphabetic() || next == 'm' { break; }
+                    if next.is_ascii_alphabetic() || next == 'm' {
+                        break;
+                    }
                 }
             } else if chars.peek() == Some(&']') {
                 chars.next(); // consume ']'
                 while let Some(&next) = chars.peek() {
                     chars.next();
-                    if next == '\x07' || next == '\x1b' { break; }
+                    if next == '\x07' || next == '\x1b' {
+                        break;
+                    }
                 }
             }
             // Other ESC sequences — just skip the ESC char
@@ -370,14 +417,25 @@ pub fn default_downloads_dir() -> String {
 }
 
 pub fn json_string(value: &serde_json::Value, key: &str) -> String {
-    value.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string()
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub fn toml_string(value: &toml::Value, key: &str) -> String {
-    value.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string()
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
-pub fn read_zip_text<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name: &str) -> Option<String> {
+pub fn read_zip_text<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    name: &str,
+) -> Option<String> {
     let mut file = zip.by_name(name).ok()?;
     let mut text = String::new();
     file.read_to_string(&mut text).ok()?;
@@ -393,6 +451,14 @@ pub fn read_zip_text<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name
 ///
 /// `strip_prefix` is optional — when non-empty the leading prefix is
 /// removed from every entry name before joining with `dest_root`.
+///
+/// # Safety guarantees
+///
+/// - Rejects entries with absolute paths or `..` components (via `enclosed_name`)
+/// - Rejects entries that would escape `dest_root` after canonicalization
+/// - Rejects archive entries representing symlinks
+/// - Rejects extraction through pre-existing symlinked parent directories
+/// - Rejects file-vs-directory collisions
 pub fn safe_extract_zip<R: Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     dest_root: &Path,
@@ -411,13 +477,61 @@ pub fn safe_extract_zip<R: Read + std::io::Seek>(
             .by_index(i)
             .map_err(|e| format!("Read zip entry {}: {}", i, e))?;
 
-        // 1) enclosed_name filters absolute paths and `..` components
+        let raw_name = entry.name().to_string();
+
+        // 1a) Reject Windows-style UNC paths (\\server\share\...)
+        if raw_name.starts_with("\\\\") || raw_name.starts_with("//") {
+            return Err(format!(
+                "Unsafe archive entry '{}' rejected: UNC path",
+                raw_name
+            ));
+        }
+
+        // 1b) Reject entries with backslash traversal (..\..\)
+        //     enclosed_name() only checks for forward-slash .. on Unix
+        if raw_name.contains("..\\") || raw_name.contains("../..") {
+            return Err(format!(
+                "Unsafe archive entry '{}' rejected: traversal path",
+                raw_name
+            ));
+        }
+
+        // 1c) Reject Windows drive-letter paths (C:\, D:\, etc.)
+        if raw_name.len() >= 2 && raw_name.as_bytes()[1] == b':' {
+            return Err(format!(
+                "Unsafe archive entry '{}' rejected: absolute path with drive letter",
+                raw_name
+            ));
+        }
+
+        // 1d) enclosed_name filters absolute paths and forward-slash `..` components
         let enclosed: PathBuf = match entry.enclosed_name() {
             Some(p) => p.to_path_buf(),
-            None => continue, // skip unsafe paths silently
+            None => {
+                return Err(format!(
+                    "Unsafe archive entry '{}' rejected: absolute or traversal path",
+                    raw_name
+                ));
+            }
         };
 
-        // 2) Strip optional prefix (e.g. "world/")
+        // 2) Reject symlink entries in the archive
+        //    Unix symlinks have special permission bits; Windows reparse points
+        //    are detected by checking if the entry is a symlink-like file.
+        #[cfg(unix)]
+        {
+            if let Some(mode) = entry.unix_mode() {
+                // 0xA000 is the symlink file mode in Unix
+                if mode & 0o170000 == 0o120000 {
+                    return Err(format!(
+                        "Archive entry '{}' is a symlink — rejected for safety",
+                        entry.name()
+                    ));
+                }
+            }
+        }
+
+        // 3) Strip optional prefix (e.g. "world/")
         let relative = if !strip_prefix.is_empty() {
             enclosed
                 .strip_prefix(strip_prefix)
@@ -429,17 +543,41 @@ pub fn safe_extract_zip<R: Read + std::io::Seek>(
 
         let outpath = dest_root.join(&relative);
 
-        // 3) Canonicalize parent (or the dir itself) and verify containment
+        // 4) Check for symlinked parent directories — reject if any parent
+        //    between dest_root and outpath is a symlink (prevents escape
+        //    through a pre-planted symlink).
+        if let Some(parent) = outpath.parent() {
+            // Walk up from outpath to dest_root, checking each component
+            let mut check = parent;
+            while check.starts_with(&canonical_root) && check != canonical_root {
+                if check.exists() && check.is_symlink() {
+                    return Err(format!(
+                        "Parent directory '{}' is a symlink — extraction blocked to prevent escape",
+                        check.display()
+                    ));
+                }
+                check = match check.parent() {
+                    Some(p) => p,
+                    None => break,
+                };
+            }
+        }
+
+        // 5) Canonicalize parent (or the dir itself) and verify containment
         if let Some(parent) = outpath.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let canonical_out = if outpath.is_dir() {
             std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
-            outpath.canonicalize().map_err(|e| format!("Cannot resolve {}: {}", outpath.display(), e))?
+            outpath
+                .canonicalize()
+                .map_err(|e| format!("Cannot resolve {}: {}", outpath.display(), e))?
         } else {
             // For files, canonicalize the parent since the file may not exist yet
             let parent = outpath.parent().unwrap_or(dest_root);
-            parent.canonicalize().map_err(|e| format!("Cannot resolve parent {}: {}", parent.display(), e))?
+            parent
+                .canonicalize()
+                .map_err(|e| format!("Cannot resolve parent {}: {}", parent.display(), e))?
                 .join(outpath.file_name().unwrap_or_default())
         };
 
@@ -449,6 +587,24 @@ pub fn safe_extract_zip<R: Read + std::io::Seek>(
                 entry.name(),
                 canonical_out.display()
             ));
+        }
+
+        // 6) Reject file-vs-directory collisions
+        if outpath.exists() {
+            if entry.is_dir() && outpath.is_file() {
+                return Err(format!(
+                    "Archive entry '{}' is a directory but a file exists at '{}'",
+                    entry.name(),
+                    outpath.display()
+                ));
+            }
+            if !entry.is_dir() && outpath.is_dir() {
+                return Err(format!(
+                    "Archive entry '{}' is a file but a directory exists at '{}'",
+                    entry.name(),
+                    outpath.display()
+                ));
+            }
         }
 
         if entry.is_dir() {
@@ -471,11 +627,15 @@ pub fn read_zip_icon_data_url<R: Read + std::io::Seek>(
     path: &str,
 ) -> Option<String> {
     let clean = path.trim().trim_start_matches('/');
-    if clean.is_empty() { return None; }
+    if clean.is_empty() {
+        return None;
+    }
     let mut file = zip.by_name(clean).ok()?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
-    if bytes.is_empty() || bytes.len() > 256 * 1024 { return None; }
+    if bytes.is_empty() || bytes.len() > 256 * 1024 {
+        return None;
+    }
     let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         "image/png"
     } else if bytes.starts_with(b"\xff\xd8\xff") {

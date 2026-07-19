@@ -28,10 +28,7 @@ pub fn default_debug_filename() -> String {
     format!("debug-report-{}.zip", timestamp_ddmmyyyy())
 }
 
-pub fn export_debug_report(
-    cfg: &ServerConfig,
-    dest_zip: &Path,
-) -> Result<u64, String> {
+pub fn export_debug_report(cfg: &ServerConfig, dest_zip: &Path) -> Result<u64, String> {
     if let Some(parent) = dest_zip.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -84,11 +81,7 @@ pub fn export_debug_report(
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().is_file())
                 .collect();
-            entries.sort_by_key(|e| {
-                e.metadata()
-                    .and_then(|m| m.modified())
-                    .ok()
-            });
+            entries.sort_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
             entries.reverse();
             for entry in entries.into_iter().take(5) {
                 let name = entry.file_name();
@@ -183,7 +176,9 @@ fn copy_file_into_zip<W: Write + std::io::Seek>(
 }
 
 fn build_app_info(cfg: &ServerConfig) -> String {
-    let when = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %z").to_string();
+    let when = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S %z")
+        .to_string();
     format!(
         "Lbby Debug Report\n\
          ========================\n\

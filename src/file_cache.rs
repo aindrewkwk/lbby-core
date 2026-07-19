@@ -10,11 +10,17 @@ pub struct FileCache<T: Clone> {
 
 impl<T: Clone> FileCache<T> {
     pub const fn new() -> Self {
-        Self { inner: Mutex::new(None) }
+        Self {
+            inner: Mutex::new(None),
+        }
     }
 
     /// Return cached value if file hasn't changed, else run `load` and cache it.
-    pub fn get_or_load(&self, path: &Path, load: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    pub fn get_or_load(
+        &self,
+        path: &Path,
+        load: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
         if let Ok(meta) = std::fs::metadata(path) {
             if let Ok(modified) = meta.modified() {
                 let cache = self.inner.lock().unwrap();

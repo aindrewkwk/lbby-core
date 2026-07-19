@@ -349,7 +349,10 @@ fn load_profiles_file() -> ProfilesFile {
             }
             // Corrupted — back up before overwriting
             let backup = path.with_extension("json.corrupted");
-            eprintln!("[lbby] profiles.json corrupted — backing up to {}", backup.display());
+            eprintln!(
+                "[lbby] profiles.json corrupted — backing up to {}",
+                backup.display()
+            );
             let _ = std::fs::rename(&path, &backup);
         }
         let file = default_profiles_file();
@@ -410,7 +413,9 @@ pub fn resolve_world_name(server_dir: &std::path::Path) -> String {
     };
     for line in content.lines() {
         let line = line.trim();
-        if line.starts_with('#') || line.is_empty() { continue; }
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
         if let Some((key, value)) = line.split_once('=') {
             if key.trim() == "level-name" {
                 let name = value.trim();
@@ -433,7 +438,13 @@ pub fn resolve_world_name(server_dir: &std::path::Path) -> String {
 
 /// Resolve all world-related directories for a profile.
 /// Returns (primary_world, nether_world, end_world) paths.
-pub fn resolve_world_dirs(server_dir: &std::path::Path) -> (std::path::PathBuf, Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+pub fn resolve_world_dirs(
+    server_dir: &std::path::Path,
+) -> (
+    std::path::PathBuf,
+    Option<std::path::PathBuf>,
+    Option<std::path::PathBuf>,
+) {
     let world_name = resolve_world_name(server_dir);
     let primary = server_dir.join(&world_name);
     let nether = server_dir.join(format!("{}_nether", world_name));
@@ -454,14 +465,19 @@ pub fn load_profile_config(profile_id: &str) -> Option<ServerConfig> {
 
 /// Validate that a server path does not collide with another profile's path.
 /// Returns Ok(()) if safe, Err with affected profile IDs if collision detected.
-pub fn validate_server_path_ownership(exclude_profile_id: &str, server_path: &str) -> Result<(), String> {
+pub fn validate_server_path_ownership(
+    exclude_profile_id: &str,
+    server_path: &str,
+) -> Result<(), String> {
     if server_path.is_empty() {
         return Ok(());
     }
     let file = load_profiles_file();
     let normalized = normalize_path(server_path);
     for profile in &file.profiles {
-        if profile.id == exclude_profile_id { continue; }
+        if profile.id == exclude_profile_id {
+            continue;
+        }
         let other_normalized = normalize_path(&profile.config.server_path);
         if normalized == other_normalized {
             return Err(format!(
@@ -484,7 +500,9 @@ fn normalize_path(path_str: &str) -> String {
     let mut components: Vec<String> = Vec::new();
     for component in path.components() {
         match component {
-            std::path::Component::ParentDir => { components.pop(); }
+            std::path::Component::ParentDir => {
+                components.pop();
+            }
             std::path::Component::CurDir => {}
             other => components.push(other.as_os_str().to_string_lossy().to_string()),
         }
