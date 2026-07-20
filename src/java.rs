@@ -5,7 +5,6 @@ use std::{
 
 use serde::Deserialize;
 
-
 /// Map a Minecraft version like "1.20.1" to the Java major version that should run it.
 /// Conservative — picks the highest Java the version is well-tested with.
 pub fn required_java_for_mc(mc_version: &str) -> u8 {
@@ -28,8 +27,8 @@ pub fn required_java_for_mc(mc_version: &str) -> u8 {
         17 => 17,
         18 | 19 => 17,
         20 if patch <= 4 => 17,
-        20 => 21,        // 1.20.5+
-        _ => 21,         // 1.21.x and beyond
+        20 => 21, // 1.20.5+
+        _ => 21,  // 1.21.x and beyond
     }
 }
 
@@ -143,7 +142,11 @@ pub fn java_candidates() -> Vec<PathBuf> {
             }
         }
         push_unique(&mut candidates, &mut seen, PathBuf::from("/usr/bin/java"));
-        push_unique(&mut candidates, &mut seen, PathBuf::from("/usr/local/bin/java"));
+        push_unique(
+            &mut candidates,
+            &mut seen,
+            PathBuf::from("/usr/local/bin/java"),
+        );
     }
 
     candidates
@@ -174,7 +177,9 @@ pub fn find_any_java() -> Option<(PathBuf, u8)> {
 
 /// Returns JAVA_HOME for a java binary path (the dir containing bin/java).
 pub fn java_home_from_bin(bin: &std::path::Path) -> Option<PathBuf> {
-    bin.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf())
+    bin.parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
 }
 
 /// Run `<java_bin> -version` and parse the major version number out of the
@@ -207,7 +212,12 @@ pub fn detect_java_major(bin: &std::path::Path) -> Option<u8> {
         } else {
             // pull the first token that starts with a digit
             line.split_whitespace()
-                .find(|t| t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+                .find(|t| {
+                    t.chars()
+                        .next()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                })
                 .unwrap_or("")
         };
         if candidate.is_empty() {
@@ -217,7 +227,10 @@ pub fn detect_java_major(bin: &std::path::Path) -> Option<u8> {
             candidate.split('.').nth(1).and_then(|s| s.parse().ok())
         } else {
             // "17.0.10" → 17, "26+35-2893" → 26
-            let head: String = candidate.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let head: String = candidate
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
             head.parse().ok()
         };
         if let Some(m) = major {
@@ -283,7 +296,10 @@ pub fn bundled_java_bin(major: u8) -> PathBuf {
 
 /// Download a JRE from the Adoptium API and extract it to `bundled_java_dir(major)`.
 /// Emits progress events via the Tauri app handle.
-async fn download_jre(major: u8, app: &std::sync::Arc<crate::app_state::AppEventSender>) -> Result<PathBuf, String> {
+async fn download_jre(
+    major: u8,
+    app: &std::sync::Arc<crate::app_state::AppEventSender>,
+) -> Result<PathBuf, String> {
     let os = adoptium_os();
     let arch = adoptium_arch();
     let api_url = format!(
@@ -302,7 +318,8 @@ async fn download_jre(major: u8, app: &std::sync::Arc<crate::app_state::AppEvent
         .await
         .map_err(|e| format!("Failed to parse Adoptium response: {}", e))?;
 
-    let asset = assets.first()
+    let asset = assets
+        .first()
         .ok_or_else(|| format!("No JRE {} available for {}/{}", major, os, arch))?;
     let download_url = &asset.binary.package.link;
     let file_name = &asset.binary.package.name;
@@ -315,15 +332,20 @@ async fn download_jre(major: u8, app: &std::sync::Arc<crate::app_state::AppEvent
     std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
     let temp_file = temp_dir.join(format!(".download-{}", file_name));
 
-    crate::helpers::download_to_file(app, download_url, &temp_file, &format!("Java {}", major)).await?;
+    crate::helpers::download_to_file(app, download_url, &temp_file, &format!("Java {}", major))
+        .await?;
 
     // Extract
-    app.emit("install-progress", crate::helpers::InstallProgress {
-        stage: "extract".into(),
-        label: format!("Extracting Java {}…", major),
-        current: 90,
-        total: 100,
-    }).ok();
+    app.emit(
+        "install-progress",
+        crate::helpers::InstallProgress {
+            stage: "extract".into(),
+            label: format!("Extracting Java {}…", major),
+            current: 90,
+            total: 100,
+        },
+    )
+    .ok();
 
     let dest = bundled_java_dir(major);
     // Clean up any previous partial install
@@ -346,7 +368,11 @@ async fn download_jre(major: u8, app: &std::sync::Arc<crate::app_state::AppEvent
     // Verify the binary exists
     let bin = bundled_java_bin(major);
     if !bin.exists() {
-        return Err(format!("Java {} extracted but binary not found at {}", major, bin.display()));
+        return Err(format!(
+            "Java {} extracted but binary not found at {}",
+            major,
+            bin.display()
+        ));
     }
 
     // Make executable on Unix
@@ -364,9 +390,14 @@ async fn download_jre(major: u8, app: &std::sync::Arc<crate::app_state::AppEvent
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn extract_tar_gz(archive: &PathBuf, temp_dir: &PathBuf, dest: &PathBuf, major: u8) -> Result<(), String> {
-    let file = std::fs::File::open(archive)
-        .map_err(|e| format!("Failed to open archive: {}", e))?;
+fn extract_tar_gz(
+    archive: &PathBuf,
+    temp_dir: &PathBuf,
+    dest: &PathBuf,
+    major: u8,
+) -> Result<(), String> {
+    let file =
+        std::fs::File::open(archive).map_err(|e| format!("Failed to open archive: {}", e))?;
     let gz = flate2::read::GzDecoder::new(file);
     let mut tar = tar::Archive::new(gz);
 
@@ -377,7 +408,8 @@ fn extract_tar_gz(archive: &PathBuf, temp_dir: &PathBuf, dest: &PathBuf, major: 
     }
     std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
 
-    tar.unpack(&staging).map_err(|e| format!("Failed to extract tar: {}", e))?;
+    tar.unpack(&staging)
+        .map_err(|e| format!("Failed to extract tar: {}", e))?;
 
     // Adoptium tarballs contain a single top-level dir like "jdk-17.0.19+10-jre"
     // We need to find the actual JRE root and move it to dest
@@ -392,8 +424,7 @@ fn extract_tar_gz(archive: &PathBuf, temp_dir: &PathBuf, dest: &PathBuf, major: 
             .map_err(|e| format!("Failed to move JRE: {}", e))?;
     } else {
         // Multiple entries — rename staging to dest
-        std::fs::rename(&staging, dest)
-            .map_err(|e| format!("Failed to move JRE: {}", e))?;
+        std::fs::rename(&staging, dest).map_err(|e| format!("Failed to move JRE: {}", e))?;
         return Ok(());
     }
 
@@ -403,11 +434,15 @@ fn extract_tar_gz(archive: &PathBuf, temp_dir: &PathBuf, dest: &PathBuf, major: 
 }
 
 #[cfg(target_os = "windows")]
-fn extract_zip(archive: &PathBuf, temp_dir: &PathBuf, dest: &PathBuf, major: u8) -> Result<(), String> {
-    let file = std::fs::File::open(archive)
-        .map_err(|e| format!("Failed to open archive: {}", e))?;
-    let mut zip = zip::ZipArchive::new(file)
-        .map_err(|e| format!("Failed to read zip: {}", e))?;
+fn extract_zip(
+    archive: &PathBuf,
+    temp_dir: &PathBuf,
+    dest: &PathBuf,
+    major: u8,
+) -> Result<(), String> {
+    let file =
+        std::fs::File::open(archive).map_err(|e| format!("Failed to open archive: {}", e))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("Failed to read zip: {}", e))?;
 
     let staging = temp_dir.join(format!(".staging-{}", major));
     if staging.exists() {
@@ -415,7 +450,8 @@ fn extract_zip(archive: &PathBuf, temp_dir: &PathBuf, dest: &PathBuf, major: u8)
     }
     std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
 
-    zip.extract(&staging).map_err(|e| format!("Failed to extract zip: {}", e))?;
+    zip.extract(&staging)
+        .map_err(|e| format!("Failed to extract zip: {}", e))?;
 
     // Adoptium zips contain a single top-level dir like "jdk-17.0.19+10-jre"
     let entries: Vec<_> = std::fs::read_dir(&staging)
@@ -427,8 +463,7 @@ fn extract_zip(archive: &PathBuf, temp_dir: &PathBuf, dest: &PathBuf, major: u8)
         std::fs::rename(entries[0].path(), dest)
             .map_err(|e| format!("Failed to move JRE: {}", e))?;
     } else {
-        std::fs::rename(&staging, dest)
-            .map_err(|e| format!("Failed to move JRE: {}", e))?;
+        std::fs::rename(&staging, dest).map_err(|e| format!("Failed to move JRE: {}", e))?;
         return Ok(());
     }
 
@@ -439,7 +474,10 @@ fn extract_zip(archive: &PathBuf, temp_dir: &PathBuf, dest: &PathBuf, major: u8)
 /// Ensure a bundled JRE for the given major version is available.
 /// First checks if one already exists (system or bundled). If not, downloads
 /// from Adoptium. Returns the path to the java binary.
-pub async fn ensure_java(major: u8, app: &std::sync::Arc<crate::app_state::AppEventSender>) -> Result<PathBuf, String> {
+pub async fn ensure_java(
+    major: u8,
+    app: &std::sync::Arc<crate::app_state::AppEventSender>,
+) -> Result<PathBuf, String> {
     // 1. Check if we already have a matching Java (system or bundled)
     if let Some(path) = find_java_with_version(major) {
         return Ok(path);

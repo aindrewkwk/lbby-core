@@ -119,7 +119,11 @@ pub fn default_server_path_value(game: Option<&str>) -> String {
 
 fn normalize_mod_info(mut info: crate::app_state::ModInfo) -> crate::app_state::ModInfo {
     if info.display_name.trim().is_empty() {
-        info.display_name = info.file_name.trim_end_matches(".jar").trim_end_matches(".tmod").to_string();
+        info.display_name = info
+            .file_name
+            .trim_end_matches(".jar")
+            .trim_end_matches(".tmod")
+            .to_string();
     }
     info.version = info.version.trim().to_string();
     info.authors = info
@@ -139,18 +143,27 @@ fn read_fabric_mod_info<R: Read + std::io::Seek>(
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let display_name = {
         let name = json_string(&value, "name");
-        if name.is_empty() { json_string(&value, "id") } else { name }
+        if name.is_empty() {
+            json_string(&value, "id")
+        } else {
+            name
+        }
     };
     let version = json_string(&value, "version");
     let description = json_string(&value, "description");
     let authors = match value.get("authors") {
-        Some(serde_json::Value::Array(items)) => items.iter().filter_map(|item| {
-            if let Some(s) = item.as_str() {
-                Some(s.to_string())
-            } else {
-                item.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
-            }
-        }).collect(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                if let Some(s) = item.as_str() {
+                    Some(s.to_string())
+                } else {
+                    item.get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                }
+            })
+            .collect(),
         _ => Vec::new(),
     };
     let icon_path = match value.get("icon") {
@@ -162,10 +175,19 @@ fn read_fabric_mod_info<R: Read + std::io::Seek>(
             .map(|s| s.to_string()),
         _ => None,
     };
-    let icon_data_url = icon_path.as_deref().and_then(|p| read_zip_icon_data_url(zip, p));
+    let icon_data_url = icon_path
+        .as_deref()
+        .and_then(|p| read_zip_icon_data_url(zip, p));
     Some(crate::app_state::ModInfo {
         file_name: file_name.to_string(),
-        display_name: if display_name.is_empty() { file_name.trim_end_matches(".jar").trim_end_matches(".tmod").to_string() } else { display_name },
+        display_name: if display_name.is_empty() {
+            file_name
+                .trim_end_matches(".jar")
+                .trim_end_matches(".tmod")
+                .to_string()
+        } else {
+            display_name
+        },
         version,
         authors,
         description,
@@ -177,15 +199,19 @@ fn read_forge_mod_info<R: Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     file_name: &str,
 ) -> Option<crate::app_state::ModInfo> {
-    let text = read_zip_text(zip, "META-INF/mods.toml")
-        .or_else(|| read_zip_text(zip, "mods.toml"))?;
+    let text =
+        read_zip_text(zip, "META-INF/mods.toml").or_else(|| read_zip_text(zip, "mods.toml"))?;
     let value: toml::Value = text.parse().ok()?;
     let mods = value.get("mods")?.as_array()?;
     let first = mods.first()?;
     let display_name = toml_string(first, "displayName");
     let mod_id = toml_string(first, "modId");
     let raw_version = toml_string(first, "version");
-    let version = if raw_version.starts_with("${") { String::new() } else { raw_version };
+    let version = if raw_version.starts_with("${") {
+        String::new()
+    } else {
+        raw_version
+    };
     let authors_raw = toml_string(first, "authors");
     let authors = authors_raw
         .split([',', ';'])
@@ -198,7 +224,11 @@ fn read_forge_mod_info<R: Read + std::io::Seek>(
     let icon_data_url = read_zip_icon_data_url(zip, &icon_path);
     Some(crate::app_state::ModInfo {
         file_name: file_name.to_string(),
-        display_name: if display_name.is_empty() { mod_id } else { display_name },
+        display_name: if display_name.is_empty() {
+            mod_id
+        } else {
+            display_name
+        },
         version,
         authors,
         description,
@@ -214,7 +244,10 @@ pub fn read_mod_info(path: &std::path::Path) -> crate::app_state::ModInfo {
         .map(|v| v.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
     let fallback = crate::app_state::ModInfo {
-        display_name: file_name.trim_end_matches(".jar").trim_end_matches(".tmod").to_string(),
+        display_name: file_name
+            .trim_end_matches(".jar")
+            .trim_end_matches(".tmod")
+            .to_string(),
         file_name: file_name.clone(),
         version: String::new(),
         authors: Vec::new(),
@@ -222,8 +255,12 @@ pub fn read_mod_info(path: &std::path::Path) -> crate::app_state::ModInfo {
         icon_data_url: None,
     };
 
-    let Ok(file) = std::fs::File::open(path) else { return fallback; };
-    let Ok(mut zip) = zip::ZipArchive::new(file) else { return fallback; };
+    let Ok(file) = std::fs::File::open(path) else {
+        return fallback;
+    };
+    let Ok(mut zip) = zip::ZipArchive::new(file) else {
+        return fallback;
+    };
 
     if let Some(info) = read_fabric_mod_info(&mut zip, &file_name) {
         return normalize_mod_info(info);
@@ -241,7 +278,10 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
 }
 
 /// Pre-generate chunks — delegates to server module.
-pub async fn do_pregenerate_chunks(app: Arc<AppEventSender>, total_chunks: u32) -> Result<(), String> {
+pub async fn do_pregenerate_chunks(
+    app: Arc<AppEventSender>,
+    total_chunks: u32,
+) -> Result<(), String> {
     crate::server::do_pregenerate_chunks(app, total_chunks).await
 }
 
@@ -252,7 +292,10 @@ pub async fn remote_kill_server_and_playit(app: &Arc<AppEventSender>) {
 }
 
 /// Install a game server — delegates to the full implementation in server.rs.
-pub async fn do_install_server(app: Arc<AppEventSender>, cfg: ServerConfig) -> Result<ServerConfig, String> {
+pub async fn do_install_server(
+    app: Arc<AppEventSender>,
+    cfg: ServerConfig,
+) -> Result<ServerConfig, String> {
     crate::server::do_install_server(app, cfg).await
 }
 
@@ -315,13 +358,17 @@ pub fn strip_ansi_codes(s: &str) -> String {
                 chars.next(); // consume '['
                 while let Some(&next) = chars.peek() {
                     chars.next();
-                    if next.is_ascii_alphabetic() || next == 'm' { break; }
+                    if next.is_ascii_alphabetic() || next == 'm' {
+                        break;
+                    }
                 }
             } else if chars.peek() == Some(&']') {
                 chars.next(); // consume ']'
                 while let Some(&next) = chars.peek() {
                     chars.next();
-                    if next == '\x07' || next == '\x1b' { break; }
+                    if next == '\x07' || next == '\x1b' {
+                        break;
+                    }
                 }
             }
             // Other ESC sequences — just skip the ESC char
@@ -370,14 +417,25 @@ pub fn default_downloads_dir() -> String {
 }
 
 pub fn json_string(value: &serde_json::Value, key: &str) -> String {
-    value.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string()
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub fn toml_string(value: &toml::Value, key: &str) -> String {
-    value.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string()
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
-pub fn read_zip_text<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name: &str) -> Option<String> {
+pub fn read_zip_text<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    name: &str,
+) -> Option<String> {
     let mut file = zip.by_name(name).ok()?;
     let mut text = String::new();
     file.read_to_string(&mut text).ok()?;
@@ -435,11 +493,15 @@ pub fn safe_extract_zip<R: Read + std::io::Seek>(
         }
         let canonical_out = if outpath.is_dir() {
             std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
-            outpath.canonicalize().map_err(|e| format!("Cannot resolve {}: {}", outpath.display(), e))?
+            outpath
+                .canonicalize()
+                .map_err(|e| format!("Cannot resolve {}: {}", outpath.display(), e))?
         } else {
             // For files, canonicalize the parent since the file may not exist yet
             let parent = outpath.parent().unwrap_or(dest_root);
-            parent.canonicalize().map_err(|e| format!("Cannot resolve parent {}: {}", parent.display(), e))?
+            parent
+                .canonicalize()
+                .map_err(|e| format!("Cannot resolve parent {}: {}", parent.display(), e))?
                 .join(outpath.file_name().unwrap_or_default())
         };
 
@@ -471,11 +533,15 @@ pub fn read_zip_icon_data_url<R: Read + std::io::Seek>(
     path: &str,
 ) -> Option<String> {
     let clean = path.trim().trim_start_matches('/');
-    if clean.is_empty() { return None; }
+    if clean.is_empty() {
+        return None;
+    }
     let mut file = zip.by_name(clean).ok()?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
-    if bytes.is_empty() || bytes.len() > 256 * 1024 { return None; }
+    if bytes.is_empty() || bytes.len() > 256 * 1024 {
+        return None;
+    }
     let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         "image/png"
     } else if bytes.starts_with(b"\xff\xd8\xff") {

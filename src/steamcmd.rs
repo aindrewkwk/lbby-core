@@ -6,7 +6,6 @@
 
 use std::path::{Path, PathBuf};
 
-
 /// Steam App IDs
 pub const TERRARIA_APP_ID: &str = "105600";
 /// tModLoader game App ID (workshop mods live under the game, not the dedicated server).
@@ -32,7 +31,7 @@ pub fn find_steamcmd() -> Option<PathBuf> {
     })
     .arg(binary)
     .output()
-       {
+    {
         if output.status.success() {
             let path_str = String::from_utf8_lossy(&output.stdout);
             let path = path_str.trim().lines().next().unwrap_or("").trim();
@@ -107,7 +106,9 @@ pub fn lbby_steamcmd_dir() -> PathBuf {
 /// On Windows: downloads `steamcmd.zip` and extracts it.
 /// On Linux: downloads the tarball and extracts it.
 /// On macOS: downloads the macOS version and extracts it.
-pub async fn install_steamcmd(app: &std::sync::Arc<crate::app_state::AppEventSender>) -> Result<PathBuf, String> {
+pub async fn install_steamcmd(
+    app: &std::sync::Arc<crate::app_state::AppEventSender>,
+) -> Result<PathBuf, String> {
     let install_dir = lbby_steamcmd_dir();
 
     let (url, binary_name) = if cfg!(target_os = "windows") {
@@ -132,10 +133,13 @@ pub async fn install_steamcmd(app: &std::sync::Arc<crate::app_state::AppEventSen
         return Ok(binary_path);
     }
 
-    app.emit("install-progress", serde_json::json!({
-        "stage": "Downloading SteamCMD",
-        "progress": 0.1,
-    }))
+    app.emit(
+        "install-progress",
+        serde_json::json!({
+            "stage": "Downloading SteamCMD",
+            "progress": 0.1,
+        }),
+    )
     .ok();
 
     let client = reqwest::Client::new();
@@ -146,7 +150,10 @@ pub async fn install_steamcmd(app: &std::sync::Arc<crate::app_state::AppEventSen
         .map_err(|e| format!("Failed to download SteamCMD: {}", e))?;
 
     if !resp.status().is_success() {
-        return Err(format!("SteamCMD download failed with HTTP {}", resp.status()));
+        return Err(format!(
+            "SteamCMD download failed with HTTP {}",
+            resp.status()
+        ));
     }
 
     let bytes = resp
@@ -167,10 +174,13 @@ pub async fn install_steamcmd(app: &std::sync::Arc<crate::app_state::AppEventSen
         .await
         .map_err(|e| format!("Failed to write SteamCMD archive: {}", e))?;
 
-    app.emit("install-progress", serde_json::json!({
-        "stage": "Extracting SteamCMD",
-        "progress": 0.5,
-    }))
+    app.emit(
+        "install-progress",
+        serde_json::json!({
+            "stage": "Extracting SteamCMD",
+            "progress": 0.5,
+        }),
+    )
     .ok();
 
     // Extract
@@ -184,7 +194,12 @@ pub async fn install_steamcmd(app: &std::sync::Arc<crate::app_state::AppEventSen
     } else {
         // Use tar
         let status = tokio::process::Command::new("tar")
-            .args(["-xzf", archive_path.to_str().unwrap_or(""), "-C", install_dir.to_str().unwrap_or("")])
+            .args([
+                "-xzf",
+                archive_path.to_str().unwrap_or(""),
+                "-C",
+                install_dir.to_str().unwrap_or(""),
+            ])
             .status()
             .await
             .map_err(|e| format!("Failed to extract SteamCMD: {}", e))?;
@@ -230,10 +245,13 @@ pub async fn install_steamcmd(app: &std::sync::Arc<crate::app_state::AppEventSen
         let _ = std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755));
     }
 
-    app.emit("install-progress", serde_json::json!({
-        "stage": "SteamCMD installed",
-        "progress": 1.0,
-    }))
+    app.emit(
+        "install-progress",
+        serde_json::json!({
+            "stage": "SteamCMD installed",
+            "progress": 1.0,
+        }),
+    )
     .ok();
 
     Ok(binary_path)
@@ -283,10 +301,13 @@ pub async fn download_server(
         .await
         .map_err(|e| e.to_string())?;
 
-    app.emit("install-progress", serde_json::json!({
-        "stage": format!("Downloading server (App {})", app_id),
-        "progress": 0.1,
-    }))
+    app.emit(
+        "install-progress",
+        serde_json::json!({
+            "stage": format!("Downloading server (App {})", app_id),
+            "progress": 0.1,
+        }),
+    )
     .ok();
 
     let install_str = install_dir.to_string_lossy().to_string();
@@ -311,10 +332,13 @@ pub async fn download_server(
         }
     }
 
-    app.emit("install-progress", serde_json::json!({
-        "stage": "Server download complete",
-        "progress": 1.0,
-    }))
+    app.emit(
+        "install-progress",
+        serde_json::json!({
+            "stage": "Server download complete",
+            "progress": 1.0,
+        }),
+    )
     .ok();
 
     Ok(())
@@ -340,11 +364,14 @@ pub async fn download_workshop_item(
         .await
         .map_err(|e| e.to_string())?;
 
-    app.emit("mod-task-progress", serde_json::json!({
-        "stage": "Downloading from Workshop",
-        "message": format!("Downloading Workshop item {}", workshop_id),
-        "progress": 0.1,
-    }))
+    app.emit(
+        "mod-task-progress",
+        serde_json::json!({
+            "stage": "Downloading from Workshop",
+            "message": format!("Downloading Workshop item {}", workshop_id),
+            "progress": 0.1,
+        }),
+    )
     .ok();
 
     let args = vec![
@@ -379,11 +406,14 @@ pub async fn download_workshop_item(
         ));
     }
 
-    app.emit("mod-task-progress", serde_json::json!({
-        "stage": "Workshop download complete",
-        "message": format!("Downloaded Workshop item {}", workshop_id),
-        "progress": 1.0,
-    }))
+    app.emit(
+        "mod-task-progress",
+        serde_json::json!({
+            "stage": "Workshop download complete",
+            "message": format!("Downloaded Workshop item {}", workshop_id),
+            "progress": 1.0,
+        }),
+    )
     .ok();
 
     Ok(item_dir)

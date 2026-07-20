@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 /// Truncate a string to at most `max` characters (safe for UTF-8).
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { return s; }
+    if s.len() <= max {
+        return s;
+    }
     match s.char_indices().nth(max) {
         Some((idx, _)) => &s[..idx],
         None => s,
@@ -32,10 +34,13 @@ pub fn secret_file_path() -> PathBuf {
         // The playit.gg agent may store its config in several locations
         // depending on the version. Check all known locations.
         let candidates: Vec<PathBuf> = [
-            dirs::config_dir().map(|p| p.join("playit_gg").join("playit.toml")),       // AppData\Roaming
-            dirs::data_local_dir().map(|p| p.join("playit_gg").join("playit.toml")),    // AppData\Local
-            dirs::home_dir().map(|p| p.join(".playit_gg").join("playit.toml")),          // ~\.playit_gg
-        ].into_iter().flatten().collect();
+            dirs::config_dir().map(|p| p.join("playit_gg").join("playit.toml")), // AppData\Roaming
+            dirs::data_local_dir().map(|p| p.join("playit_gg").join("playit.toml")), // AppData\Local
+            dirs::home_dir().map(|p| p.join(".playit_gg").join("playit.toml")),      // ~\.playit_gg
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
 
         for candidate in &candidates {
             if candidate.exists() {
@@ -63,13 +68,13 @@ pub fn all_secret_file_paths() -> Vec<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         if let Some(dir) = dirs::config_dir() {
-            paths.push(dir.join("playit_gg").join("playit.toml"));       // AppData\Roaming
+            paths.push(dir.join("playit_gg").join("playit.toml")); // AppData\Roaming
         }
         if let Some(dir) = dirs::data_local_dir() {
-            paths.push(dir.join("playit_gg").join("playit.toml"));       // AppData\Local
+            paths.push(dir.join("playit_gg").join("playit.toml")); // AppData\Local
         }
         if let Some(dir) = dirs::home_dir() {
-            paths.push(dir.join(".playit_gg").join("playit.toml"));      // ~\.playit_gg
+            paths.push(dir.join(".playit_gg").join("playit.toml")); // ~\.playit_gg
         }
     }
     paths
@@ -87,7 +92,9 @@ pub fn read_secret() -> Option<String> {
             if let Some(rest) = l.strip_prefix("secret_key") {
                 let after_eq = rest.split_once('=')?.1.trim();
                 let key = after_eq.trim_matches(|c| c == '"' || c == '\'').to_string();
-                if !key.is_empty() { return Some(key); }
+                if !key.is_empty() {
+                    return Some(key);
+                }
             }
         }
     }
@@ -101,7 +108,8 @@ struct ApiResponse {
 }
 
 fn tunnel_address_from_value(tunnel: &serde_json::Value) -> Option<String> {
-    let domain = tunnel.get("custom_domain")
+    let domain = tunnel
+        .get("custom_domain")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .or_else(|| tunnel.get("assigned_domain").and_then(|v| v.as_str()))
@@ -114,8 +122,13 @@ fn tunnel_address_from_value(tunnel: &serde_json::Value) -> Option<String> {
         return Some(domain.to_string());
     }
 
-    let port = tunnel.get("port")
-        .and_then(|v| v.get("from").or_else(|| v.get("public")).or_else(|| v.get("port")))
+    let port = tunnel
+        .get("port")
+        .and_then(|v| {
+            v.get("from")
+                .or_else(|| v.get("public"))
+                .or_else(|| v.get("port"))
+        })
         .and_then(|v| v.as_u64())
         .or_else(|| tunnel.get("from").and_then(|v| v.as_u64()))
         .or_else(|| tunnel.get("public_port").and_then(|v| v.as_u64()))
@@ -147,10 +160,7 @@ pub async fn query_tunnel_address_for_game(game: TunnelGame) -> Result<String, S
             .map(|p| format!("{} (exists: {})", p.display(), p.exists()))
             .collect::<Vec<_>>()
             .join("; ");
-        format!(
-            "No secret key found. Checked playit.toml paths: {}",
-            paths
-        )
+        format!("No secret key found. Checked playit.toml paths: {}", paths)
     })?;
 
     let client = reqwest::Client::builder()
@@ -169,20 +179,43 @@ pub async fn query_tunnel_address_for_game(game: TunnelGame) -> Result<String, S
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("API returned HTTP {}: {}", status, truncate(&body, 200)));
+        return Err(format!(
+            "API returned HTTP {}: {}",
+            status,
+            truncate(&body, 200)
+        ));
     }
 
-    let parsed: ApiResponse = serde_json::from_str(&body)
-        .map_err(|e| format!("Failed to parse API response: {} (body: {})", e, truncate(&body, 200)))?;
+    let parsed: ApiResponse = serde_json::from_str(&body).map_err(|e| {
+        format!(
+            "Failed to parse API response: {} (body: {})",
+            e,
+            truncate(&body, 200)
+        )
+    })?;
 
     if parsed.status != "success" {
         let data_str = parsed.data.to_string();
-        return Err(format!("API status not success: {} (data: {})", parsed.status, truncate(&data_str, 200)));
+        return Err(format!(
+            "API status not success: {} (data: {})",
+            parsed.status,
+            truncate(&data_str, 200)
+        ));
     }
 
-    let tunnels = parsed.data.get("tunnels")
+    let tunnels = parsed
+        .data
+        .get("tunnels")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| format!("No 'tunnels' array in response. Data keys: {:?}", parsed.data.as_object().map(|o| o.keys().collect::<Vec<_>>())))?;
+        .ok_or_else(|| {
+            format!(
+                "No 'tunnels' array in response. Data keys: {:?}",
+                parsed
+                    .data
+                    .as_object()
+                    .map(|o| o.keys().collect::<Vec<_>>())
+            )
+        })?;
 
     if tunnels.is_empty() {
         return Err("API returned empty tunnels array — no tunnels configured yet".to_string());
@@ -192,9 +225,9 @@ pub async fn query_tunnel_address_for_game(game: TunnelGame) -> Result<String, S
     let preferred = match game {
         TunnelGame::Minecraft => {
             // Prefer minecraft-java tunnel type, fallback to first
-            tunnels.iter().find(|t| {
-                t.get("tunnel_type").and_then(|v| v.as_str()) == Some("minecraft-java")
-            })
+            tunnels
+                .iter()
+                .find(|t| t.get("tunnel_type").and_then(|v| v.as_str()) == Some("minecraft-java"))
         }
         TunnelGame::Terraria => {
             // Look for tunnels targeting local port 7777 (Terraria default)
@@ -205,7 +238,8 @@ pub async fn query_tunnel_address_for_game(game: TunnelGame) -> Result<String, S
                     return true;
                 }
                 // Check if local port is 7777
-                let local_port = t.get("port")
+                let local_port = t
+                    .get("port")
                     .and_then(|v| v.get("local").or_else(|| v.get("to")))
                     .and_then(|v| v.as_u64())
                     .or_else(|| t.get("local_port").and_then(|v| v.as_u64()));
@@ -241,10 +275,13 @@ pub async fn query_tunnel_address() -> Result<String, String> {
 
 /// Check if a Terraria tunnel exists in the playit.gg configuration.
 pub async fn has_terraria_tunnel() -> bool {
-    let Some(secret) = read_secret() else { return false };
+    let Some(secret) = read_secret() else {
+        return false;
+    };
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
-        .build() {
+        .build()
+    {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -254,17 +291,27 @@ pub async fn has_terraria_tunnel() -> bool {
         .header("Content-Type", "application/json")
         .body("{}")
         .send()
-        .await else { return false };
-    let Ok(body) = resp.text().await else { return false };
-    let Ok(parsed) = serde_json::from_str::<ApiResponse>(&body) else { return false };
-    let Some(tunnels) = parsed.data.get("tunnels").and_then(|v| v.as_array()) else { return false };
+        .await
+    else {
+        return false;
+    };
+    let Ok(body) = resp.text().await else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_str::<ApiResponse>(&body) else {
+        return false;
+    };
+    let Some(tunnels) = parsed.data.get("tunnels").and_then(|v| v.as_array()) else {
+        return false;
+    };
 
     tunnels.iter().any(|t| {
         let tunnel_type = t.get("tunnel_type").and_then(|v| v.as_str()).unwrap_or("");
         if tunnel_type.contains("terraria") {
             return true;
         }
-        let local_port = t.get("port")
+        let local_port = t
+            .get("port")
             .and_then(|v| v.get("local").or_else(|| v.get("to")))
             .and_then(|v| v.as_u64())
             .or_else(|| t.get("local_port").and_then(|v| v.as_u64()));
@@ -282,7 +329,12 @@ pub struct PlayitState {
 
 impl PlayitState {
     pub fn new() -> Self {
-        Self { running: false, address: None, claim_url: None, pid: None }
+        Self {
+            running: false,
+            address: None,
+            claim_url: None,
+            pid: None,
+        }
     }
 }
 
@@ -303,7 +355,9 @@ pub async fn stop(app: std::sync::Arc<crate::app_state::AppEventSender>) -> Resu
 
     if let Some(pid) = pl.pid {
         #[cfg(unix)]
-        unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
         #[cfg(windows)]
         {
             let mut cmd = tokio::process::Command::new("taskkill");
@@ -363,9 +417,7 @@ pub fn is_supported_agent_cli(path: &PathBuf) -> bool {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    help.contains(" claim")
-        && help.contains("--secret_path")
-        && help.contains("--stdout")
+    help.contains(" claim") && help.contains("--secret_path") && help.contains("--stdout")
 }
 
 /// Try to find an existing playit install on PATH or common locations.
@@ -375,13 +427,22 @@ pub fn find_existing_playit() -> Option<PathBuf> {
 
     // Try `which <name>` for each
     for name in &names {
-        let mut cmd = std::process::Command::new(if cfg!(target_os = "windows") { "where" } else { "which" });
+        let mut cmd = std::process::Command::new(if cfg!(target_os = "windows") {
+            "where"
+        } else {
+            "which"
+        });
         cmd.arg(name);
         crate::helpers::hide_std_child_window(&mut cmd);
         if let Ok(out) = cmd.output() {
             if out.status.success() {
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                v.extend(stdout.lines().map(|l| PathBuf::from(l.trim())).filter(|p| !p.as_os_str().is_empty()));
+                v.extend(
+                    stdout
+                        .lines()
+                        .map(|l| PathBuf::from(l.trim()))
+                        .filter(|p| !p.as_os_str().is_empty()),
+                );
             }
         }
     }
@@ -397,16 +458,27 @@ pub fn find_existing_playit() -> Option<PathBuf> {
     for name in &names {
         v.push(PathBuf::from("/opt/homebrew/bin").join(name));
         v.push(PathBuf::from("/usr/local/bin").join(name));
-        v.push(PathBuf::from(format!("/Applications/playit.app/Contents/MacOS/{}", name)));
+        v.push(PathBuf::from(format!(
+            "/Applications/playit.app/Contents/MacOS/{}",
+            name
+        )));
     }
 
     #[cfg(target_os = "windows")]
     for name in &names {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            v.push(PathBuf::from(&local).join("playit").join(format!("{}.exe", name)));
+            v.push(
+                PathBuf::from(&local)
+                    .join("playit")
+                    .join(format!("{}.exe", name)),
+            );
         }
         if let Ok(pf) = std::env::var("ProgramFiles") {
-            v.push(PathBuf::from(&pf).join("playit").join(format!("{}.exe", name)));
+            v.push(
+                PathBuf::from(&pf)
+                    .join("playit")
+                    .join(format!("{}.exe", name)),
+            );
         }
     }
 
@@ -426,7 +498,9 @@ pub fn playit_download_url() -> Option<&'static str> {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     return Some("https://github.com/playit-cloud/playit-agent/releases/download/v0.17.1/playit-linux-aarch64");
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    return Some("https://github.com/playit-cloud/playit-agent/releases/download/v0.17.1/playit-linux-amd64");
+    return Some(
+        "https://github.com/playit-cloud/playit-agent/releases/download/v0.17.1/playit-linux-amd64",
+    );
     #[cfg(target_os = "windows")]
     return Some("https://github.com/playit-cloud/playit-agent/releases/download/v0.17.1/playit-windows-x86_64-signed.exe");
     #[cfg(target_os = "macos")]
@@ -441,9 +515,8 @@ pub fn playit_download_url() -> Option<&'static str> {
 /// If the API doesn't support tunnel creation, returns a message telling the user
 /// to create it manually.
 pub async fn create_terraria_tunnel() -> Result<String, String> {
-    let secret = read_secret().ok_or_else(|| {
-        "No playit.gg secret key found. Start playit.gg first.".to_string()
-    })?;
+    let secret = read_secret()
+        .ok_or_else(|| "No playit.gg secret key found. Start playit.gg first.".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -503,11 +576,14 @@ pub async fn create_terraria_tunnel() -> Result<String, String> {
 /// Used as fallback on macOS where there's no prebuilt binary.
 pub async fn cargo_install_playit() -> Result<PathBuf, String> {
     // Verify cargo is available
-    let mut cargo_check_cmd = tokio::process::Command::new(if cfg!(target_os = "windows") { "where" } else { "which" });
+    let mut cargo_check_cmd = tokio::process::Command::new(if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    });
     cargo_check_cmd.arg("cargo");
     crate::helpers::hide_child_window(&mut cargo_check_cmd);
-    let cargo_check = cargo_check_cmd.output().await
-        .map_err(|e| e.to_string())?;
+    let cargo_check = cargo_check_cmd.output().await.map_err(|e| e.to_string())?;
     if !cargo_check.status.success() {
         return Err(
             "Rust/Cargo not found. Install from https://rustup.rs/ first, or download playit manually from https://playit.gg/download"
@@ -517,23 +593,32 @@ pub async fn cargo_install_playit() -> Result<PathBuf, String> {
 
     let mut cargo_cmd = tokio::process::Command::new("cargo");
     cargo_cmd.args([
-            "install",
-            "--git", "https://github.com/playit-cloud/playit-agent.git",
-            "--locked",
-            "playit-cli",
-        ]);
+        "install",
+        "--git",
+        "https://github.com/playit-cloud/playit-agent.git",
+        "--locked",
+        "playit-cli",
+    ]);
     crate::helpers::hide_child_window(&mut cargo_cmd);
-    let out = cargo_cmd.output().await
+    let out = cargo_cmd
+        .output()
+        .await
         .map_err(|e| format!("cargo install failed to launch: {}", e))?;
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let last = stderr.lines().filter(|l| !l.trim().is_empty()).rev().take(3).collect::<Vec<_>>();
+        let last = stderr
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>();
         let mut tail = last;
         tail.reverse();
         return Err(format!("cargo install failed:\n{}", tail.join("\n")));
     }
 
-    find_existing_playit()
-        .ok_or_else(|| "playit-cli built but binary not found at ~/.cargo/bin/playit-cli".to_string())
+    find_existing_playit().ok_or_else(|| {
+        "playit-cli built but binary not found at ~/.cargo/bin/playit-cli".to_string()
+    })
 }

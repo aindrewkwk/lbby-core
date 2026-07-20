@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ── Shared types ─────────────────────────────────────────────────────────────
 
@@ -94,21 +94,35 @@ pub async fn fetch_mc_versions() -> Result<Vec<McVersion>, String> {
     let client = reqwest::Client::new();
     let manifest: VersionManifest = client
         .get("https://launchermeta.mojang.com/mc/game/version_manifest_v2.json")
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
 
-    Ok(manifest.versions.into_iter()
+    Ok(manifest
+        .versions
+        .into_iter()
         .filter(|v| v.version_type == "release")
         .take(40)
-        .map(|v| McVersion { id: v.id, release_time: v.release_time })
+        .map(|v| McVersion {
+            id: v.id,
+            release_time: v.release_time,
+        })
         .collect())
 }
 
 pub async fn fetch_paper_versions() -> Result<Vec<String>, String> {
     let client = reqwest::Client::new();
-    let proj: PaperProject = client.get("https://api.papermc.io/v2/projects/paper")
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+    let proj: PaperProject = client
+        .get("https://api.papermc.io/v2/projects/paper")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
     let mut versions = proj.versions;
     versions.reverse();
     Ok(versions.into_iter().take(40).collect())
@@ -117,9 +131,16 @@ pub async fn fetch_paper_versions() -> Result<Vec<String>, String> {
 pub async fn fetch_paper_builds(mc_version: String) -> Result<Vec<LoaderVersion>, String> {
     let client = reqwest::Client::new();
     let v: PaperVersion = client
-        .get(format!("https://api.papermc.io/v2/projects/paper/versions/{}", mc_version))
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+        .get(format!(
+            "https://api.papermc.io/v2/projects/paper/versions/{}",
+            mc_version
+        ))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
     let latest = v.builds.last().copied().unwrap_or(0);
     Ok(vec![LoaderVersion {
         version: latest.to_string(),
@@ -132,8 +153,12 @@ pub async fn fetch_forge_versions(mc_version: String) -> Result<Vec<LoaderVersio
     let promos: ForgePromotions = client
         .get("https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json")
         .header("User-Agent", "MCHost/0.1")
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
 
     let mut versions = vec![];
     if let Some(v) = promos.promos.get(&format!("{}-recommended", mc_version)) {
@@ -156,9 +181,16 @@ pub async fn fetch_forge_versions(mc_version: String) -> Result<Vec<LoaderVersio
 pub async fn fetch_fabric_versions(mc_version: String) -> Result<Vec<LoaderVersion>, String> {
     let client = reqwest::Client::new();
     let loaders: Vec<FabricLoader> = client
-        .get(format!("https://meta.fabricmc.net/v2/versions/loader/{}", mc_version))
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+        .get(format!(
+            "https://meta.fabricmc.net/v2/versions/loader/{}",
+            mc_version
+        ))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
     let mut out = vec![];
     if let Some(latest) = loaders.first() {
         out.push(LoaderVersion {
@@ -174,13 +206,20 @@ pub async fn fetch_neoforge_versions(mc_version: String) -> Result<Vec<LoaderVer
     let client = reqwest::Client::new();
     let v: NeoForgeVersions = client
         .get("https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge")
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
 
     let mc_prefix = mc_version.strip_prefix("1.").unwrap_or(&mc_version);
-    let matches: Vec<String> = v.versions.iter()
+    let matches: Vec<String> = v
+        .versions
+        .iter()
         .filter(|x| x.starts_with(&format!("{}.", mc_prefix)))
-        .cloned().collect();
+        .cloned()
+        .collect();
 
     let mut out = vec![];
     if let Some(latest) = matches.last() {
@@ -196,9 +235,14 @@ pub async fn fetch_neoforge_versions(mc_version: String) -> Result<Vec<LoaderVer
 
 pub async fn fetch_folia_versions() -> Result<Vec<String>, String> {
     let client = reqwest::Client::new();
-    let proj: PaperProject = client.get("https://api.papermc.io/v2/projects/folia")
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+    let proj: PaperProject = client
+        .get("https://api.papermc.io/v2/projects/folia")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
     let mut versions = proj.versions;
     versions.reverse();
     Ok(versions.into_iter().take(40).collect())
@@ -207,9 +251,16 @@ pub async fn fetch_folia_versions() -> Result<Vec<String>, String> {
 pub async fn fetch_folia_builds(mc_version: String) -> Result<Vec<LoaderVersion>, String> {
     let client = reqwest::Client::new();
     let v: PaperVersion = client
-        .get(format!("https://api.papermc.io/v2/projects/folia/versions/{}", mc_version))
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+        .get(format!(
+            "https://api.papermc.io/v2/projects/folia/versions/{}",
+            mc_version
+        ))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
     let latest = v.builds.last().copied().unwrap_or(0);
     Ok(vec![LoaderVersion {
         version: latest.to_string(),
@@ -221,9 +272,14 @@ pub async fn fetch_folia_builds(mc_version: String) -> Result<Vec<LoaderVersion>
 
 pub async fn fetch_purpur_versions() -> Result<Vec<String>, String> {
     let client = reqwest::Client::new();
-    let v: PurpurVersions = client.get("https://api.purpurmc.org/v2/purpur")
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+    let v: PurpurVersions = client
+        .get("https://api.purpurmc.org/v2/purpur")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
     let mut versions = v.versions;
     versions.reverse();
     Ok(versions.into_iter().take(40).collect())
@@ -233,8 +289,12 @@ pub async fn fetch_purpur_builds(mc_version: String) -> Result<Vec<LoaderVersion
     let client = reqwest::Client::new();
     let v: PurpurBuilds = client
         .get(format!("https://api.purpurmc.org/v2/purpur/{}", mc_version))
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(vec![LoaderVersion {
         version: v.builds.latest.clone(),
         label: format!("{} (latest)", v.builds.latest),
@@ -243,16 +303,26 @@ pub async fn fetch_purpur_builds(mc_version: String) -> Result<Vec<LoaderVersion
 
 // ── Sponge versions ──────────────────────────────────────────────────────────
 
-pub async fn fetch_sponge_vanilla_versions(mc_version: String) -> Result<Vec<LoaderVersion>, String> {
+pub async fn fetch_sponge_vanilla_versions(
+    mc_version: String,
+) -> Result<Vec<LoaderVersion>, String> {
     let client = reqwest::Client::new();
     let url = format!(
         "https://dl-api.spongepowered.org/v2/groups/org.spongepowered/artifacts/spongevanilla/versions?tags=minecraft:{}&limit=5",
         mc_version
     );
-    let v: SpongeArtifactVersions = client.get(&url)
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
-    let mut out: Vec<LoaderVersion> = v.artifacts.into_keys().map(|ver| LoaderVersion {
+    let v: SpongeArtifactVersions = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut out: Vec<LoaderVersion> = v
+        .artifacts
+        .into_keys()
+        .map(|ver| LoaderVersion {
             version: ver.clone(),
             label: ver,
         })
@@ -267,10 +337,17 @@ pub async fn fetch_sponge_forge_versions(mc_version: String) -> Result<Vec<Loade
         "https://dl-api.spongepowered.org/v2/groups/org.spongepowered/artifacts/spongeforge/versions?tags=minecraft:{}&limit=5",
         mc_version
     );
-    let v: SpongeArtifactVersions = client.get(&url)
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
-    let mut out: Vec<LoaderVersion> = v.artifacts.into_iter()
+    let v: SpongeArtifactVersions = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut out: Vec<LoaderVersion> = v
+        .artifacts
+        .into_iter()
         .map(|(ver, info)| {
             let forge_ver = info.tag_values.get("forge").cloned().unwrap_or_default();
             LoaderVersion {

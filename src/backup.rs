@@ -115,8 +115,8 @@ fn walk_and_zip<W: Write + std::io::Seek>(
     app: &std::sync::Arc<crate::app_state::AppEventSender>,
 ) -> Result<(), String> {
     let abs = base.join(rel);
-    for entry in std::fs::read_dir(&abs)
-        .map_err(|e| format!("read_dir {}: {}", abs.display(), e))?
+    for entry in
+        std::fs::read_dir(&abs).map_err(|e| format!("read_dir {}: {}", abs.display(), e))?
     {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
@@ -210,7 +210,10 @@ pub fn restore_server_backup(
     server_path: &Path,
 ) -> Result<u64, String> {
     if !zip_path.exists() {
-        return Err(format!("Backup file does not exist: {}", zip_path.display()));
+        return Err(format!(
+            "Backup file does not exist: {}",
+            zip_path.display()
+        ));
     }
 
     let ts = chrono::Local::now().format("%Y%m%d%H%M%S");
@@ -274,8 +277,7 @@ fn extract_zip_to_dir(
     dest_dir: &Path,
 ) -> Result<u64, String> {
     let file = File::open(zip_path).map_err(|e| format!("Cannot open zip: {}", e))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| format!("Invalid zip: {}", e))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip: {}", e))?;
 
     let mut count: u64 = 0;
     let mut bytes: u64 = 0;
@@ -308,7 +310,9 @@ fn extract_zip_to_dir(
                 let n = entry
                     .read(&mut buf)
                     .map_err(|e| format!("read entry: {}", e))?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 out.write_all(&buf[..n])
                     .map_err(|e| format!("write {}: {}", outpath.display(), e))?;
                 bytes += n as u64;
@@ -332,7 +336,11 @@ fn extract_zip_to_dir(
 
     app.emit(
         "restore-progress",
-        BackupProgress { files: count, bytes, current: "done".to_string() },
+        BackupProgress {
+            files: count,
+            bytes,
+            current: "done".to_string(),
+        },
     )
     .ok();
 

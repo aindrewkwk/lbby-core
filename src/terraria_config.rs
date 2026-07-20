@@ -55,7 +55,8 @@ pub fn generate_config(
 
 /// Parse a `serverconfig.txt` into a key-value map.
 pub fn parse_config(path: &Path) -> Result<HashMap<String, String>, String> {
-    let content = std::fs::read_to_string(path).map_err(|e| format!("Failed to read config: {}", e))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read config: {}", e))?;
     let mut map = HashMap::new();
     for line in content.lines() {
         let line = line.trim();
@@ -71,10 +72,7 @@ pub fn parse_config(path: &Path) -> Result<HashMap<String, String>, String> {
 
 /// Write a config map back to `serverconfig.txt`.
 pub fn write_config(path: &Path, config: &HashMap<String, String>) -> Result<(), String> {
-    let mut lines: Vec<String> = config
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect();
+    let mut lines: Vec<String> = config.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
     lines.sort();
     lines.push(String::new()); // trailing newline
     std::fs::write(path, lines.join("\n")).map_err(|e| format!("Failed to write config: {}", e))
@@ -118,7 +116,8 @@ pub fn update_config_keys(path: &Path, updates: &HashMap<String, String>) -> Res
     }
 
     output_lines.push(String::new()); // trailing newline
-    std::fs::write(path, output_lines.join("\n")).map_err(|e| format!("Failed to write config: {}", e))
+    std::fs::write(path, output_lines.join("\n"))
+        .map_err(|e| format!("Failed to write config: {}", e))
 }
 
 /// Information about a Terraria world file.
@@ -137,7 +136,10 @@ pub fn list_worlds(server_dir: &Path) -> Result<Vec<WorldInfo>, String> {
         return Ok(Vec::new());
     }
     let mut worlds = Vec::new();
-    for entry in std::fs::read_dir(&worlds_dir).map_err(|e| e.to_string())?.flatten() {
+    for entry in std::fs::read_dir(&worlds_dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
         let path = entry.path();
         if path.extension().is_some_and(|x| x == "wld") {
             let meta = entry.metadata().map_err(|e| e.to_string())?;

@@ -50,7 +50,11 @@ impl StatsPoller {
     /// Sample CPU/RAM/disk-I/O for the process tree rooted at `root_pid`,
     /// plus disk-space usage for the volume containing `server_path`.
     /// Returns (cpu%, ram_mb, disk_read_kb_s, disk_write_kb_s, disk_used_mb, disk_total_mb).
-    pub fn sample(&mut self, root_pid: u32, server_path: &Path) -> Option<(f32, u64, f32, f32, u64, u64)> {
+    pub fn sample(
+        &mut self,
+        root_pid: u32,
+        server_path: &Path,
+    ) -> Option<(f32, u64, f32, f32, u64, u64)> {
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
@@ -148,10 +152,15 @@ impl StatsPoller {
                 found_any = true;
             }
         }
-        if !found_any { return None; }
+        if !found_any {
+            return None;
+        }
 
         let now = std::time::Instant::now();
-        let elapsed = now.duration_since(self.last_sample).as_secs_f32().max(0.001);
+        let elapsed = now
+            .duration_since(self.last_sample)
+            .as_secs_f32()
+            .max(0.001);
         let read_delta = total_disk_read.saturating_sub(self.last_disk_read);
         let write_delta = total_disk_written.saturating_sub(self.last_disk_write);
         let read_kb_s = (read_delta as f32 / 1024.0) / elapsed;
@@ -208,7 +217,12 @@ pub fn count_mods(dir: &Path) -> u32 {
             entries
                 .flatten()
                 .filter(|e| {
-                    let ext = e.path().extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
+                    let ext = e
+                        .path()
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
                     (ext == "jar" || ext == "tmod")
                         && e.path().file_stem().is_some_and(|n| {
                             let name = n.to_string_lossy().to_ascii_lowercase();

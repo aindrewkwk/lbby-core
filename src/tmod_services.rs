@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-
 /// Information about an installed .tmod file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TModInfo {
@@ -38,9 +37,10 @@ pub fn read_enabled_json(server_dir: &Path) -> Result<Vec<String>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("Failed to read enabled.json: {}", e))?;
-    let mods: Vec<String> = serde_json::from_str(&content)
-        .map_err(|e| format!("Invalid enabled.json: {}", e))?;
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read enabled.json: {}", e))?;
+    let mods: Vec<String> =
+        serde_json::from_str(&content).map_err(|e| format!("Invalid enabled.json: {}", e))?;
     Ok(mods)
 }
 
@@ -60,7 +60,8 @@ pub fn read_install_txt(server_dir: &Path) -> Result<Vec<String>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("Failed to read install.txt: {}", e))?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read install.txt: {}", e))?;
     Ok(content
         .lines()
         .map(|l| l.trim().to_string())
@@ -85,12 +86,13 @@ pub fn list_installed_mods(server_dir: &Path) -> Result<Vec<TModInfo>, String> {
         return Ok(Vec::new());
     }
 
-    let enabled: HashSet<String> = read_enabled_json(server_dir)?
-        .into_iter()
-        .collect();
+    let enabled: HashSet<String> = read_enabled_json(server_dir)?.into_iter().collect();
 
     let mut mods = Vec::new();
-    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
+    for entry in std::fs::read_dir(&dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
         let path = entry.path();
         if !path.extension().is_some_and(|x| x == "tmod") {
             continue;
@@ -99,7 +101,11 @@ pub fn list_installed_mods(server_dir: &Path) -> Result<Vec<TModInfo>, String> {
         mods.push(info);
     }
 
-    mods.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+    mods.sort_by(|a, b| {
+        a.display_name
+            .to_lowercase()
+            .cmp(&b.display_name.to_lowercase())
+    });
     Ok(mods)
 }
 
@@ -128,7 +134,12 @@ fn read_tmod_info(path: &Path, enabled: &HashSet<String>) -> TModInfo {
         Some(meta) => meta,
         None => {
             // Fall back to filename-based info
-            (internal_name.clone(), "unknown".into(), String::new(), String::new())
+            (
+                internal_name.clone(),
+                "unknown".into(),
+                String::new(),
+                String::new(),
+            )
         }
     };
 
@@ -194,7 +205,11 @@ fn read_tmod_metadata(path: &Path) -> Option<(String, String, String, String)> {
 }
 
 /// Toggle a mod on or off by updating `enabled.json`.
-pub fn toggle_mod(server_dir: &Path, mod_name: &str, enable: bool) -> Result<Vec<TModInfo>, String> {
+pub fn toggle_mod(
+    server_dir: &Path,
+    mod_name: &str,
+    enable: bool,
+) -> Result<Vec<TModInfo>, String> {
     let mut enabled = read_enabled_json(server_dir)?;
     if enable {
         if !enabled.contains(&mod_name.to_string()) {
@@ -316,7 +331,10 @@ fn copy_tmod_recursive(source: &Path, dest: &Path, copied: &mut bool) -> Result<
     if !source.exists() {
         return Ok(());
     }
-    for entry in std::fs::read_dir(source).map_err(|e| e.to_string())?.flatten() {
+    for entry in std::fs::read_dir(source)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
         let path = entry.path();
         if path.is_dir() {
             copy_tmod_recursive(&path, dest, copied)?;
@@ -363,23 +381,29 @@ pub async fn import_modpack(
 
         let workshop_ids = read_install_txt(server_dir)?;
         if !workshop_ids.is_empty() {
-            app.emit("mod-task-progress", serde_json::json!({
-                "stage": "Downloading Workshop mods",
-                "message": format!("{} mods to download", workshop_ids.len()),
-                "current": 0,
-                "total": workshop_ids.len(),
-                "progress": 0.0,
-            }))
+            app.emit(
+                "mod-task-progress",
+                serde_json::json!({
+                    "stage": "Downloading Workshop mods",
+                    "message": format!("{} mods to download", workshop_ids.len()),
+                    "current": 0,
+                    "total": workshop_ids.len(),
+                    "progress": 0.0,
+                }),
+            )
             .ok();
 
             for (idx, id) in workshop_ids.iter().enumerate() {
-                app.emit("mod-task-progress", serde_json::json!({
-                    "stage": "Downloading Workshop mods",
-                    "message": format!("Downloading mod {} / {}", idx + 1, workshop_ids.len()),
-                    "current": idx + 1,
-                    "total": workshop_ids.len(),
-                    "progress": (idx as f32 + 1.0) / workshop_ids.len() as f32,
-                }))
+                app.emit(
+                    "mod-task-progress",
+                    serde_json::json!({
+                        "stage": "Downloading Workshop mods",
+                        "message": format!("Downloading mod {} / {}", idx + 1, workshop_ids.len()),
+                        "current": idx + 1,
+                        "total": workshop_ids.len(),
+                        "progress": (idx as f32 + 1.0) / workshop_ids.len() as f32,
+                    }),
+                )
                 .ok();
 
                 install_workshop_mod(app, id, server_dir).await?;
@@ -413,7 +437,10 @@ pub fn export_modpack(server_dir: &Path, output_dir: &Path) -> Result<(), String
     // Copy all .tmod files
     let mods = mods_dir(server_dir);
     if mods.exists() {
-        for entry in std::fs::read_dir(&mods).map_err(|e| e.to_string())?.flatten() {
+        for entry in std::fs::read_dir(&mods)
+            .map_err(|e| e.to_string())?
+            .flatten()
+        {
             let path = entry.path();
             if path.extension().is_some_and(|x| x == "tmod") {
                 let file_name = match path.file_name() {

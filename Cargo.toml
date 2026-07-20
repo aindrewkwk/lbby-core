@@ -4,6 +4,10 @@ version = "0.2.7"
 edition = "2021"
 description = "Shared core library for Lbby agent and app — server management, mods, tunnels, backups"
 
+[features]
+default = ["sqlite"]
+sqlite = ["rusqlite"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -26,7 +30,7 @@ jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"]
 machine-uid = "0.5"
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 if-addrs = "0.13"
-rusqlite = { version = "0.40.0", features = ["bundled"] }
+rusqlite = { version = "0.40.0", features = ["bundled"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -10,7 +10,7 @@ use tokio::process::ChildStdin;
 
 use crate::app_state::AppEventSender;
 use crate::config::{ServerConfig, ServerType};
-use crate::helpers::{InstallProgress, check_port_available, download_to_file, hide_child_window};
+use crate::helpers::{check_port_available, download_to_file, hide_child_window, InstallProgress};
 use crate::stats::ServerStats;
 
 const RESTART_WINDOW_SECS: u64 = 300;
@@ -64,22 +64,24 @@ impl ServerManager {
 /// Thin wrapper that calls `do_start_server` and resets status to Stopped
 /// if the start fails while still in the Starting state.
 /// Returns a boxed future to allow recursive calls (auto-restart).
-pub fn start_server(app: Arc<AppEventSender>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+pub fn start_server(
+    app: Arc<AppEventSender>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
     Box::pin(async move {
-    let result = do_start_server(app.clone()).await;
-    if result.is_err() {
-        // If we set the status to Starting but the start failed, reset to
-        // Stopped so the UI doesn't get stuck on "Starting" forever.
-        let state = app.state();
-        let mut srv = state.server.lock().await;
-        if srv.status == ServerStatus::Starting {
-            srv.status = ServerStatus::Stopped;
-            srv.stdin = None;
-            srv.pid = None;
-            app.emit("server-status", ServerStatus::Stopped).ok();
+        let result = do_start_server(app.clone()).await;
+        if result.is_err() {
+            // If we set the status to Starting but the start failed, reset to
+            // Stopped so the UI doesn't get stuck on "Starting" forever.
+            let state = app.state();
+            let mut srv = state.server.lock().await;
+            if srv.status == ServerStatus::Starting {
+                srv.status = ServerStatus::Stopped;
+                srv.stdin = None;
+                srv.pid = None;
+                app.emit("server-status", ServerStatus::Stopped).ok();
+            }
         }
-    }
-    result
+        result
     })
 }
 
@@ -126,8 +128,13 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
     let port: u16 = cfg.default_port();
     check_port_available(port)?;
 
-    std::fs::create_dir_all(&server_dir)
-        .map_err(|e| format!("Failed to create server directory {}: {}", server_dir.display(), e))?;
+    std::fs::create_dir_all(&server_dir).map_err(|e| {
+        format!(
+            "Failed to create server directory {}: {}",
+            server_dir.display(),
+            e
+        )
+    })?;
     let ram = cfg.ram_mb;
     if matches!(cfg.server_type, ServerType::Forge | ServerType::NeoForge) {
         upsert_managed_jvm_args(&server_dir, &cfg)?;
@@ -170,14 +177,17 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
         Some(p) => (p, Some(required_major)),
         None => {
             let s = app.state();
-            s.push_console_line(
-                format!("[lbby] Java {} not found — downloading from Adoptium\u{2026}", required_major),
-            );
+            s.push_console_line(format!(
+                "[lbby] Java {} not found — downloading from Adoptium\u{2026}",
+                required_major
+            ));
             match crate::java::ensure_java(required_major, &app).await {
                 Ok(path) => (path, Some(required_major)),
                 Err(e) => {
                     eprintln!("[lbby] Java download failed: {}", e);
-                    let fallback = if !cfg.java_path.is_empty() && std::path::Path::new(&cfg.java_path).exists() {
+                    let fallback = if !cfg.java_path.is_empty()
+                        && std::path::Path::new(&cfg.java_path).exists()
+                    {
                         PathBuf::from(&cfg.java_path)
                     } else if cfg!(target_os = "windows") {
                         PathBuf::from("java.exe")
@@ -216,9 +226,11 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
                 return Err(format!(
                     "Java {} is too new for Minecraft {} ({}). This server type needs Java {} — \
                      newer JVMs cause the server to hang silently.\n{}",
-                    m, cfg.minecraft_version,
+                    m,
+                    cfg.minecraft_version,
                     cfg.loader_version.as_deref().unwrap_or("loader"),
-                    required_major, install_hint
+                    required_major,
+                    install_hint
                 ));
             }
             let s = app.state();
@@ -293,10 +305,14 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
     cmd.env_remove("DYLD_FORCE_FLAT_NAMESPACE");
 
     cmd.current_dir(&server_dir)
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     hide_child_window(&mut cmd);
 
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to start server: {}", e))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start server: {}", e))?;
     let stdin = child.stdin.take().ok_or("No stdin")?;
     let stdout = child.stdout.take().ok_or("No stdout")?;
     let stderr = child.stderr.take().ok_or("No stderr")?;
@@ -362,21 +378,45 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
             }
             // Extract IP from "logged in" lines (separate from "joined the game")
             if let Some((login_name, ip)) = parse_player_login_ip(&line) {
-                let _ = crate::player_stats::record_player_ip(app3.clone(), login_name.clone(), ip.clone()).await;
-                app3.emit("player-ip-update", serde_json::json!({ "name": login_name, "ip": ip })).ok();
+                #[cfg(feature = "sqlite")]
+                {
+                    let _ = crate::player_stats::record_player_ip(
+                        app3.clone(),
+                        login_name.clone(),
+                        ip.clone(),
+                    )
+                    .await;
+                }
+                app3.emit(
+                    "player-ip-update",
+                    serde_json::json!({ "name": login_name, "ip": ip }),
+                )
+                .ok();
             }
             if let Some((name, is_join)) = parse_player_event(&line) {
                 let s = app3.state();
                 let mut players = s.online_players.lock().await;
-                if is_join { players.insert(name.clone()); }
-                else       { players.remove(&name); }
+                if is_join {
+                    players.insert(name.clone());
+                } else {
+                    players.remove(&name);
+                }
                 let list: Vec<String> = players.iter().cloned().collect();
                 let count = players.len() as u32;
                 drop(players);
 
                 if is_join {
                     s.record_player_join(name.clone());
-                    app3.emit("recent-players-update", s.recent_players.lock().await.iter().cloned().collect::<Vec<_>>()).ok();
+                    app3.emit(
+                        "recent-players-update",
+                        s.recent_players
+                            .lock()
+                            .await
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    )
+                    .ok();
                 }
 
                 let mut st = s.stats.lock().await;
@@ -394,7 +434,12 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
         let s = app3.state();
         let (was_unexpected, captured_profile_id, captured_server_dir, captured_generation) = {
             let srv = s.server.lock().await;
-            (!srv.stop_requested, srv.profile_id.clone(), srv.server_dir.clone(), srv.restart_generation)
+            (
+                !srv.stop_requested,
+                srv.profile_id.clone(),
+                srv.server_dir.clone(),
+                srv.restart_generation,
+            )
         };
         {
             let mut srv = s.server.lock().await;
@@ -429,7 +474,11 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
             let allow = {
                 let mut hist = s.recent_auto_restarts.lock().await;
                 while let Some(&front) = hist.front() {
-                    if now.duration_since(front) > window { hist.pop_front(); } else { break; }
+                    if now.duration_since(front) > window {
+                        hist.pop_front();
+                    } else {
+                        break;
+                    }
                 }
                 if hist.len() >= MAX_RESTARTS_IN_WINDOW {
                     false
@@ -458,7 +507,9 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
             {
                 let current_gen = s.server.lock().await.restart_generation;
                 if current_gen != captured_generation {
-                    s.push_console_line("[lbby] Auto-restart skipped — server was started manually.".to_string());
+                    s.push_console_line(
+                        "[lbby] Auto-restart skipped — server was started manually.".to_string(),
+                    );
                     return;
                 }
             }
@@ -496,8 +547,13 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
             let s = app_stats.state();
             let server_pid = {
                 let srv = s.server.lock().await;
-                if srv.status == ServerStatus::Stopped { break; }
-                match srv.pid { Some(p) => p, None => continue }
+                if srv.status == ServerStatus::Stopped {
+                    break;
+                }
+                match srv.pid {
+                    Some(p) => p,
+                    None => continue,
+                }
             };
             if let Some((cpu, ram_mb, disk_r, disk_w, disk_used, disk_total)) =
                 poller.sample(server_pid, &server_dir_for_stats)
@@ -512,7 +568,8 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
                 st.uptime_seconds = started_at.elapsed().as_secs();
                 st.loader_label = loader_label.clone();
                 if tick.is_multiple_of(5) {
-                    st.mods_count = crate::stats::count_mods(&server_dir_for_stats.join(&mods_folder));
+                    st.mods_count =
+                        crate::stats::count_mods(&server_dir_for_stats.join(&mods_folder));
                     let world_dir = if cfg.is_terraria() {
                         server_dir_for_stats.join("Worlds")
                     } else {
@@ -535,11 +592,16 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
 
     // ── TPS query loop ─────────────────────────────────────────────────────
     let tps_cmd: Option<&'static str> = match cfg.server_type {
-        ServerType::Paper | ServerType::Bukkit | ServerType::Spigot
-        | ServerType::Folia | ServerType::Purpur => Some("tps\n"),
+        ServerType::Paper
+        | ServerType::Bukkit
+        | ServerType::Spigot
+        | ServerType::Folia
+        | ServerType::Purpur => Some("tps\n"),
         ServerType::Forge | ServerType::NeoForge => Some("forge tps\n"),
-        ServerType::Vanilla | ServerType::Fabric
-        | ServerType::SpongeVanilla | ServerType::SpongeForge => Some("time query gametime\n"),
+        ServerType::Vanilla
+        | ServerType::Fabric
+        | ServerType::SpongeVanilla
+        | ServerType::SpongeForge => Some("time query gametime\n"),
         ServerType::Terraria | ServerType::TModLoader => None,
     };
     if let Some(cmd_bytes) = tps_cmd {
@@ -550,10 +612,14 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
                 let s = app_tps.state();
                 {
                     let mut srv = s.server.lock().await;
-                    if srv.status == ServerStatus::Stopped { break; }
+                    if srv.status == ServerStatus::Stopped {
+                        break;
+                    }
                     if srv.status == ServerStatus::Running {
                         if let Some(stdin) = &mut srv.stdin {
-                            let _ = tokio::io::AsyncWriteExt::write_all(stdin, cmd_bytes.as_bytes()).await;
+                            let _ =
+                                tokio::io::AsyncWriteExt::write_all(stdin, cmd_bytes.as_bytes())
+                                    .await;
                         }
                     }
                 }
@@ -606,7 +672,10 @@ pub async fn restart_server(app: Arc<crate::app_state::AppEventSender>) -> Resul
 }
 
 /// Send a command string to the running server's stdin.
-pub async fn send_command(app: Arc<crate::app_state::AppEventSender>, cmd: &str) -> Result<(), String> {
+pub async fn send_command(
+    app: Arc<crate::app_state::AppEventSender>,
+    cmd: &str,
+) -> Result<(), String> {
     let state = app.state();
     let mut srv = state.server.lock().await;
     if let Some(stdin) = &mut srv.stdin {
@@ -627,7 +696,10 @@ pub async fn send_command(app: Arc<crate::app_state::AppEventSender>, cmd: &str)
 /// Send `stop` to the server, wait up to `grace_secs` for a clean exit, and
 /// force-kill the entire process tree if it is still alive. Also clears stale
 /// `world/session.lock` so the next start won't hit a lock error.
-async fn graceful_or_force_stop_server(app: &Arc<crate::app_state::AppEventSender>, grace_secs: u64) {
+async fn graceful_or_force_stop_server(
+    app: &Arc<crate::app_state::AppEventSender>,
+    grace_secs: u64,
+) {
     let state = app.state();
 
     // Phase 1: request graceful stop (if running)
@@ -719,7 +791,10 @@ async fn graceful_or_force_stop_server(app: &Arc<crate::app_state::AppEventSende
 /// Checks for the server binary and (on Windows) companion DLLs that the
 /// binary needs to load. Returns Ok(()) if everything looks good, or a
 /// descriptive error if something is missing.
-pub fn validate_terraria_deps(server_dir: &Path, server_type: &crate::config::ServerType) -> Result<(), String> {
+pub fn validate_terraria_deps(
+    server_dir: &Path,
+    server_type: &crate::config::ServerType,
+) -> Result<(), String> {
     match server_type {
         crate::config::ServerType::TModLoader => {
             let tmod_dll = server_dir.join("tModLoader.dll");
@@ -738,7 +813,10 @@ pub fn validate_terraria_deps(server_dir: &Path, server_type: &crate::config::Se
             };
             if !dotnet_exe.exists() {
                 // Will fall back to system dotnet — just warn, don't fail
-                eprintln!("[lbby] Warning: bundled dotnet not found at {}, will try system dotnet", dotnet_exe.display());
+                eprintln!(
+                    "[lbby] Warning: bundled dotnet not found at {}, will try system dotnet",
+                    dotnet_exe.display()
+                );
             }
         }
         crate::config::ServerType::Terraria => {
@@ -767,10 +845,15 @@ pub fn validate_terraria_deps(server_dir: &Path, server_type: &crate::config::Se
                     // Check if there are any .dll files at all (SteamCMD copy may use different names)
                     let has_any_dll = std::fs::read_dir(parent)
                         .ok()
-                        .and_then(|mut entries| entries.find_map(|e| {
-                            e.ok().filter(|e| e.path().extension().map_or(false, |ext| ext == "dll"))
-                                .map(|_| true)
-                        }))
+                        .and_then(|mut entries| {
+                            entries.find_map(|e| {
+                                e.ok()
+                                    .filter(|e| {
+                                        e.path().extension().map_or(false, |ext| ext == "dll")
+                                    })
+                                    .map(|_| true)
+                            })
+                        })
                         .unwrap_or(false);
                     if !has_any_dll {
                         return Err(format!(
@@ -851,9 +934,17 @@ pub fn optimized_jvm_flags() -> &'static [&'static str] {
 }
 
 /// Manages JVM args in user_jvm_args.txt, replacing only the managed block.
-pub fn upsert_managed_jvm_args(server_dir: &Path, cfg: &crate::config::ServerConfig) -> Result<(), String> {
-    std::fs::create_dir_all(server_dir)
-        .map_err(|e| format!("Failed to create server directory {}: {}", server_dir.display(), e))?;
+pub fn upsert_managed_jvm_args(
+    server_dir: &Path,
+    cfg: &crate::config::ServerConfig,
+) -> Result<(), String> {
+    std::fs::create_dir_all(server_dir).map_err(|e| {
+        format!(
+            "Failed to create server directory {}: {}",
+            server_dir.display(),
+            e
+        )
+    })?;
     let path = server_dir.join("user_jvm_args.txt");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let start = "# Lbby managed JVM flags - start";
@@ -895,8 +986,7 @@ pub fn upsert_managed_jvm_args(server_dir: &Path, cfg: &crate::config::ServerCon
     }
     output.push('\n');
 
-    std::fs::write(&path, output)
-        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+    std::fs::write(&path, output).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
 }
 
 /// Check whether a string is a valid Minecraft player name (2-16 alphanumeric/underscore chars).
@@ -912,22 +1002,30 @@ pub fn parse_player_event(line: &str) -> Option<(String, bool)> {
     let body = line.rsplit("]:").next()?.trim();
     if let Some(name) = body.strip_suffix(" joined the game") {
         let n = name.trim();
-        if is_valid_player_name(n) { return Some((n.to_string(), true)); }
+        if is_valid_player_name(n) {
+            return Some((n.to_string(), true));
+        }
     }
     if let Some(name) = body.strip_suffix(" left the game") {
         let n = name.trim();
-        if is_valid_player_name(n) { return Some((n.to_string(), false)); }
+        if is_valid_player_name(n) {
+            return Some((n.to_string(), false));
+        }
     }
     if let Some(rest) = body.strip_suffix(": Disconnected") {
         if let Some(name) = rest.strip_suffix(" lost connection") {
             let n = name.trim();
-            if is_valid_player_name(n) { return Some((n.to_string(), false)); }
+            if is_valid_player_name(n) {
+                return Some((n.to_string(), false));
+            }
         }
     }
     // Generic "<name> lost connection: <reason>"
     if let Some(idx) = body.find(" lost connection:") {
         let n = body[..idx].trim();
-        if is_valid_player_name(n) { return Some((n.to_string(), false)); }
+        if is_valid_player_name(n) {
+            return Some((n.to_string(), false));
+        }
     }
     None
 }
@@ -973,20 +1071,28 @@ pub fn parse_terraria_player_event(line: &str) -> Option<(String, bool)> {
     // Join: "<name> has joined." or "<name> has joined"
     if let Some(rest) = trimmed.strip_suffix(" has joined.") {
         let n = rest.trim();
-        if is_valid_player_name(n) { return Some((n.to_string(), true)); }
+        if is_valid_player_name(n) {
+            return Some((n.to_string(), true));
+        }
     }
     if let Some(rest) = trimmed.strip_suffix(" has joined") {
         let n = rest.trim();
-        if is_valid_player_name(n) { return Some((n.to_string(), true)); }
+        if is_valid_player_name(n) {
+            return Some((n.to_string(), true));
+        }
     }
     // Leave: "<name> has left." or "<name> has left"
     if let Some(rest) = trimmed.strip_suffix(" has left.") {
         let n = rest.trim();
-        if is_valid_player_name(n) { return Some((n.to_string(), false)); }
+        if is_valid_player_name(n) {
+            return Some((n.to_string(), false));
+        }
     }
     if let Some(rest) = trimmed.strip_suffix(" has left") {
         let n = rest.trim();
-        if is_valid_player_name(n) { return Some((n.to_string(), false)); }
+        if is_valid_player_name(n) {
+            return Some((n.to_string(), false));
+        }
     }
     None
 }
@@ -995,7 +1101,10 @@ pub fn parse_terraria_player_event(line: &str) -> Option<(String, bool)> {
 /// vanilla-Terraria-fallback-to-TModLoader paths.  Creates the Worlds
 /// directory, decides between `-world` (existing) and `-autocreate` (new),
 /// and writes the key/value pairs via `update_config_keys`.
-pub fn write_terraria_serverconfig(cfg: &crate::config::ServerConfig, server_dir: &std::path::Path) {
+pub fn write_terraria_serverconfig(
+    cfg: &crate::config::ServerConfig,
+    server_dir: &std::path::Path,
+) {
     let worlds_dir = server_dir.join("Worlds");
     let config_path = server_dir.join("serverconfig.txt");
     let _ = std::fs::create_dir_all(&worlds_dir);
@@ -1004,7 +1113,10 @@ pub fn write_terraria_serverconfig(cfg: &crate::config::ServerConfig, server_dir
     updates.insert("maxplayers".to_string(), cfg.max_players.to_string());
     updates.insert("motd".to_string(), cfg.server_name.clone());
     updates.insert("worldname".to_string(), cfg.server_name.clone());
-    updates.insert("difficulty".to_string(), cfg.terraria_difficulty.to_string());
+    updates.insert(
+        "difficulty".to_string(),
+        cfg.terraria_difficulty.to_string(),
+    );
     updates.insert("secure".to_string(), "0".to_string());
     updates.insert("npcstream".to_string(), "4".to_string());
     updates.insert("language".to_string(), "en-US".to_string());
@@ -1030,9 +1142,15 @@ pub fn write_terraria_serverconfig(cfg: &crate::config::ServerConfig, server_dir
     // Use discover_world_file to find existing worlds (exact name match first,
     // then any .wld file, then fall back to autocreate).
     if let Some(world_file) = discover_world_file(server_dir, &cfg.server_name) {
-        updates.insert("world".to_string(), world_file.to_string_lossy().to_string());
+        updates.insert(
+            "world".to_string(),
+            world_file.to_string_lossy().to_string(),
+        );
     } else {
-        updates.insert("autocreate".to_string(), cfg.terraria_world_size.to_string());
+        updates.insert(
+            "autocreate".to_string(),
+            cfg.terraria_world_size.to_string(),
+        );
     }
     if let Err(e) = crate::terraria_config::update_config_keys(&config_path, &updates) {
         eprintln!("[lbby] Warning: failed to update serverconfig.txt: {}", e);
@@ -1099,9 +1217,16 @@ pub fn find_terraria_binary(dir: &Path) -> Option<PathBuf> {
     }
 
     // Recursive search as last resort
-    for entry in walkdir::WalkDir::new(dir).max_depth(3).into_iter().flatten() {
+    for entry in walkdir::WalkDir::new(dir)
+        .max_depth(3)
+        .into_iter()
+        .flatten()
+    {
         let name = entry.file_name().to_string_lossy();
-        if name == "TerrariaServer" || name == "TerrariaServer.exe" || name.starts_with("TerrariaServer.bin") {
+        if name == "TerrariaServer"
+            || name == "TerrariaServer.exe"
+            || name.starts_with("TerrariaServer.bin")
+        {
             return Some(entry.path().to_path_buf());
         }
     }
@@ -1129,25 +1254,37 @@ pub fn parse_tps_line(line: &str) -> Option<f32> {
         let tok = after.split_whitespace().next()?;
         let cleaned = tok.trim_end_matches('.');
         let v: f32 = cleaned.parse().ok()?;
-        if v > 0.0 && v <= 25.0 { return Some(v); }
+        if v > 0.0 && v <= 25.0 {
+            return Some(v);
+        }
     }
     if line.contains("TPS from last") {
         // Strip Minecraft color codes ({color} + 1 char) and the "*" marker
         let after = line.split(':').nth(1)?;
-        let cleaned: String = after.chars().filter(|c| !matches!(c, '\u{a7}' | '*')).collect();
+        let cleaned: String = after
+            .chars()
+            .filter(|c| !matches!(c, '\u{a7}' | '*'))
+            .collect();
         // Walk and grab the first plausible TPS value (1-25)
         let mut buf = String::new();
         for c in cleaned.chars() {
-            if c.is_ascii_digit() || c == '.' { buf.push(c); }
-            else if !buf.is_empty() {
+            if c.is_ascii_digit() || c == '.' {
+                buf.push(c);
+            } else if !buf.is_empty() {
                 if let Ok(v) = buf.parse::<f32>() {
-                    if v > 0.0 && v <= 25.0 { return Some(v); }
+                    if v > 0.0 && v <= 25.0 {
+                        return Some(v);
+                    }
                 }
                 buf.clear();
             }
         }
         if !buf.is_empty() {
-            if let Ok(v) = buf.parse::<f32>() { if v > 0.0 && v <= 25.0 { return Some(v); } }
+            if let Ok(v) = buf.parse::<f32>() {
+                if v > 0.0 && v <= 25.0 {
+                    return Some(v);
+                }
+            }
         }
     }
     None
@@ -1236,7 +1373,9 @@ pub fn get_server_properties() -> Result<HashMap<String, String>, String> {
         let mut map = HashMap::new();
         for line in content.lines() {
             let line = line.trim();
-            if line.starts_with('#') || line.is_empty() { continue; }
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
             if let Some((k, v)) = line.split_once('=') {
                 map.insert(k.trim().to_string(), v.trim().to_string());
             }
@@ -1284,7 +1423,10 @@ pub fn validate_server_icon_png(bytes: &[u8]) -> Result<(), String> {
     let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
     let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
     if width != 64 || height != 64 {
-        return Err(format!("Server icon must be exactly 64x64 pixels, got {}x{}", width, height));
+        return Err(format!(
+            "Server icon must be exactly 64x64 pixels, got {}x{}",
+            width, height
+        ));
     }
     Ok(())
 }
@@ -1295,7 +1437,10 @@ pub fn validate_server_icon_png(bytes: &[u8]) -> Result<(), String> {
 pub async fn regenerate_world() -> Result<(), String> {
     let cfg = crate::config::load_config();
     if cfg.is_terraria() {
-        return Err("World regeneration is not supported for Terraria. Delete the .wld file manually.".to_string());
+        return Err(
+            "World regeneration is not supported for Terraria. Delete the .wld file manually."
+                .to_string(),
+        );
     }
     let server_dir = std::path::PathBuf::from(&cfg.server_path);
     let world_name = crate::config::resolve_world_name(&server_dir);
@@ -1304,7 +1449,10 @@ pub async fn regenerate_world() -> Result<(), String> {
         return Ok(());
     }
     // Backup the old world before deleting
-    let backup_name = format!("world-backup-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+    let backup_name = format!(
+        "world-backup-{}",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
     let backup_dir = server_dir.join(&backup_name);
     tokio::fs::rename(&world_dir, &backup_dir)
         .await
@@ -1316,8 +1464,11 @@ pub async fn regenerate_world() -> Result<(), String> {
 /// (plugins for Bukkit-family, Mods for Terraria, mods for everything else).
 pub fn extras_folder(cfg: &crate::config::ServerConfig) -> &'static str {
     match cfg.server_type {
-        crate::config::ServerType::Paper | crate::config::ServerType::Bukkit | crate::config::ServerType::Spigot
-        | crate::config::ServerType::Folia | crate::config::ServerType::Purpur => "plugins",
+        crate::config::ServerType::Paper
+        | crate::config::ServerType::Bukkit
+        | crate::config::ServerType::Spigot
+        | crate::config::ServerType::Folia
+        | crate::config::ServerType::Purpur => "plugins",
         crate::config::ServerType::Terraria | crate::config::ServerType::TModLoader => "Mods",
         _ => "mods",
     }
@@ -1331,7 +1482,10 @@ pub async fn kill_unix_process_tree(root_pid: u32) {
         let mut all = vec![root];
         let mut frontier = vec![root];
         while let Some(p) = frontier.pop() {
-            if let Ok(out) = std::process::Command::new("pgrep").args(["-P", &p.to_string()]).output() {
+            if let Ok(out) = std::process::Command::new("pgrep")
+                .args(["-P", &p.to_string()])
+                .output()
+            {
                 if out.status.success() {
                     for line in String::from_utf8_lossy(&out.stdout).lines() {
                         if let Ok(child) = line.trim().parse::<u32>() {
@@ -1343,8 +1497,12 @@ pub async fn kill_unix_process_tree(root_pid: u32) {
                                 .output();
                             if let Ok(chk_out) = check {
                                 let ppid = String::from_utf8_lossy(&chk_out.stdout)
-                                    .trim().parse::<u32>().unwrap_or(0);
-                                if ppid != p { continue; }
+                                    .trim()
+                                    .parse::<u32>()
+                                    .unwrap_or(0);
+                                if ppid != p {
+                                    continue;
+                                }
                             }
                             all.push(child);
                             frontier.push(child);
@@ -1358,12 +1516,16 @@ pub async fn kill_unix_process_tree(root_pid: u32) {
     let pids = collect_descendants(root_pid);
     // SIGTERM (15) the whole tree
     for pid in &pids {
-        unsafe { libc::kill(*pid as i32, libc::SIGTERM); }
+        unsafe {
+            libc::kill(*pid as i32, libc::SIGTERM);
+        }
     }
     tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
     // SIGKILL (9) any survivors
     for pid in &pids {
-        unsafe { libc::kill(*pid as i32, libc::SIGKILL); }
+        unsafe {
+            libc::kill(*pid as i32, libc::SIGKILL);
+        }
     }
 }
 
@@ -1416,12 +1578,16 @@ struct PaperApp {
 
 /// Emit a simple progress event (not download-related).
 fn emit_progress(app: &Arc<AppEventSender>, message: &str, progress: f32) {
-    app.emit("install-progress", InstallProgress {
-        stage: "install".to_string(),
-        label: message.to_string(),
-        current: (progress * 100.0) as u32,
-        total: 100,
-    }).ok();
+    app.emit(
+        "install-progress",
+        InstallProgress {
+            stage: "install".to_string(),
+            label: message.to_string(),
+            current: (progress * 100.0) as u32,
+            total: 100,
+        },
+    )
+    .ok();
 }
 
 /// Find any system Java binary — used as a fallback when auto-download fails.
@@ -1448,9 +1614,14 @@ async fn check_java() -> Result<String, String> {
 /// Validates config, creates the server directory, dispatches to the
 /// type-specific installer, writes common files (eula.txt, server.properties),
 /// and marks setup as complete.
-pub async fn do_install_server(app: Arc<AppEventSender>, mut cfg: ServerConfig) -> Result<ServerConfig, String> {
+pub async fn do_install_server(
+    app: Arc<AppEventSender>,
+    mut cfg: ServerConfig,
+) -> Result<ServerConfig, String> {
     let server_dir = PathBuf::from(&cfg.server_path);
-    tokio::fs::create_dir_all(&server_dir).await.map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(&server_dir)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Terraria servers don't need Java — skip Java detection/download
     if cfg.server_type.needs_java() && cfg.java_path.is_empty() {
@@ -1536,7 +1707,8 @@ pub async fn do_install_server(app: Arc<AppEventSender>, mut cfg: ServerConfig) 
     // Common files — game-aware
     if cfg.is_minecraft() {
         // Minecraft: eula.txt + server.properties
-        tokio::fs::write(server_dir.join("eula.txt"), "eula=true\n").await
+        tokio::fs::write(server_dir.join("eula.txt"), "eula=true\n")
+            .await
             .map_err(|e| e.to_string())?;
         let (view_distance, simulation_distance) = match cfg.performance_preset.as_str() {
             "low_cpu" => (6, 4),
@@ -1550,7 +1722,8 @@ pub async fn do_install_server(app: Arc<AppEventSender>, mut cfg: ServerConfig) 
             let props_path = server_dir.join("server.properties");
             if props_path.exists() {
                 if let Ok(existing) = std::fs::read_to_string(&props_path) {
-                    existing.lines()
+                    existing
+                        .lines()
                         .find(|l| l.starts_with("server-port="))
                         .and_then(|l| l.split('=').nth(1))
                         .and_then(|v| v.trim().parse::<u16>().ok())
@@ -1572,38 +1745,51 @@ pub async fn do_install_server(app: Arc<AppEventSender>, mut cfg: ServerConfig) 
             props.push_str(&format!("level-seed={}\n", cfg.minecraft_seed.trim()));
         }
         tokio::fs::write(server_dir.join("server.properties"), props)
-            .await.map_err(|e| e.to_string())?;
+            .await
+            .map_err(|e| e.to_string())?;
     } else if cfg.is_terraria() {
         // Terraria: serverconfig.txt + Worlds directory
         let worlds_dir = server_dir.join("Worlds");
-        tokio::fs::create_dir_all(&worlds_dir).await.map_err(|e| e.to_string())?;
+        tokio::fs::create_dir_all(&worlds_dir)
+            .await
+            .map_err(|e| e.to_string())?;
         let _world_path = worlds_dir.join(format!("{}.wld", cfg.server_name));
         let config_text = crate::terraria_config::generate_config(
             cfg.max_players,
             &cfg.server_name,
-            "",  // no world path yet — use autocreate
+            "", // no world path yet — use autocreate
             cfg.terraria_difficulty,
             cfg.terraria_world_size,
         );
-        tokio::fs::write(
-            server_dir.join("serverconfig.txt"),
-            config_text,
-        ).await.map_err(|e| e.to_string())?;
+        tokio::fs::write(server_dir.join("serverconfig.txt"), config_text)
+            .await
+            .map_err(|e| e.to_string())?;
     }
 
     // Always create mods/plugins folder (game-aware)
     if cfg.is_minecraft() {
         let extras_dir = match cfg.server_type {
-            ServerType::Forge | ServerType::Fabric | ServerType::NeoForge
-            | ServerType::SpongeVanilla | ServerType::SpongeForge | ServerType::Vanilla => "mods",
-            ServerType::Paper | ServerType::Bukkit | ServerType::Spigot
-            | ServerType::Folia | ServerType::Purpur => "plugins",
+            ServerType::Forge
+            | ServerType::Fabric
+            | ServerType::NeoForge
+            | ServerType::SpongeVanilla
+            | ServerType::SpongeForge
+            | ServerType::Vanilla => "mods",
+            ServerType::Paper
+            | ServerType::Bukkit
+            | ServerType::Spigot
+            | ServerType::Folia
+            | ServerType::Purpur => "plugins",
             _ => "mods",
         };
-        tokio::fs::create_dir_all(server_dir.join(extras_dir)).await.ok();
+        tokio::fs::create_dir_all(server_dir.join(extras_dir))
+            .await
+            .ok();
     } else if cfg.is_terraria() {
         // tModLoader uses a Mods directory
-        tokio::fs::create_dir_all(server_dir.join("Mods")).await.ok();
+        tokio::fs::create_dir_all(server_dir.join("Mods"))
+            .await
+            .ok();
     }
 
     // Validate that the server binary/jar exists before marking setup complete
@@ -1612,7 +1798,9 @@ pub async fn do_install_server(app: Arc<AppEventSender>, mut cfg: ServerConfig) 
         if !jar_path.exists() {
             return Err("Installation completed but server.jar was not found. The installer may have failed.".to_string());
         }
-        let meta = tokio::fs::metadata(&jar_path).await.map_err(|e| e.to_string())?;
+        let meta = tokio::fs::metadata(&jar_path)
+            .await
+            .map_err(|e| e.to_string())?;
         if meta.len() < 1024 {
             return Err("server.jar appears to be corrupted (too small). Try again.".to_string());
         }
@@ -1648,33 +1836,66 @@ pub async fn do_install_server(app: Arc<AppEventSender>, mut cfg: ServerConfig) 
 
 // ── Type-specific installers ─────────────────────────────────────────────────
 
-async fn install_vanilla(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+async fn install_vanilla(
+    app: &Arc<AppEventSender>,
+    cfg: &ServerConfig,
+    server_dir: &Path,
+) -> Result<(), String> {
     emit_progress(app, "Fetching version info\u{2026}", 0.05);
     let client = reqwest::Client::new();
     let manifest: VersionManifest = client
         .get("https://launchermeta.mojang.com/mc/game/version_manifest_v2.json")
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
-    let url = manifest.versions.iter()
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let url = manifest
+        .versions
+        .iter()
         .find(|v| v.id == cfg.minecraft_version)
         .map(|v| v.url.clone())
         .ok_or_else(|| format!("Version {} not found", cfg.minecraft_version))?;
-    let data: VersionData = client.get(&url).send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+    let data: VersionData = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
     let server_url = data.downloads.server.ok_or("No server download")?.url;
     emit_progress(app, "Downloading Minecraft server\u{2026}", 0.15);
-    download_to_file(app, &server_url, &server_dir.join("server.jar"), "server.jar").await
+    download_to_file(
+        app,
+        &server_url,
+        &server_dir.join("server.jar"),
+        "server.jar",
+    )
+    .await
 }
 
-async fn install_paper(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+async fn install_paper(
+    app: &Arc<AppEventSender>,
+    cfg: &ServerConfig,
+    server_dir: &Path,
+) -> Result<(), String> {
     let build = cfg.loader_version.as_deref().ok_or("No build selected")?;
     let mc = &cfg.minecraft_version;
     emit_progress(app, "Fetching Paper build info\u{2026}", 0.1);
     let client = reqwest::Client::new();
     let info: PaperBuild = client
-        .get(format!("https://api.papermc.io/v2/projects/paper/versions/{}/builds/{}", mc, build))
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+        .get(format!(
+            "https://api.papermc.io/v2/projects/paper/versions/{}/builds/{}",
+            mc, build
+        ))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
     let url = format!(
         "https://api.papermc.io/v2/projects/paper/versions/{}/builds/{}/downloads/{}",
         mc, build, info.downloads.application.name
@@ -1683,7 +1904,11 @@ async fn install_paper(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir
     download_to_file(app, &url, &server_dir.join("server.jar"), "Paper").await
 }
 
-async fn install_forge(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+async fn install_forge(
+    app: &Arc<AppEventSender>,
+    cfg: &ServerConfig,
+    server_dir: &Path,
+) -> Result<(), String> {
     let lv = cfg.loader_version.as_deref().ok_or("No Forge version")?;
     let url = format!(
         "https://maven.minecraftforge.net/net/minecraftforge/forge/{mc}-{fv}/forge-{mc}-{fv}-installer.jar",
@@ -1692,32 +1917,53 @@ async fn install_forge(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir
     let installer = server_dir.join("forge-installer.jar");
     emit_progress(app, "Downloading Forge installer\u{2026}", 0.2);
     download_to_file(app, &url, &installer, "Forge installer").await?;
-    emit_progress(app, "Running Forge installer (may take a minute)\u{2026}", 0.6);
+    emit_progress(
+        app,
+        "Running Forge installer (may take a minute)\u{2026}",
+        0.6,
+    );
     let mut cmd = tokio::process::Command::new(&cfg.java_path);
     cmd.args(["-jar", "forge-installer.jar", "--installServer"])
         .current_dir(server_dir);
     hide_child_window(&mut cmd);
-    let out = cmd.output().await
+    let out = cmd
+        .output()
+        .await
         .map_err(|e| format!("Failed to run Forge installer: {}", e))?;
     if !out.status.success() {
-        return Err(format!("Forge installer failed: {}", String::from_utf8_lossy(&out.stderr)));
+        return Err(format!(
+            "Forge installer failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     tokio::fs::remove_file(&installer).await.ok();
     Ok(())
 }
 
-async fn install_fabric(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
-    let loader = cfg.loader_version.as_deref().ok_or("No Fabric loader version")?;
+async fn install_fabric(
+    app: &Arc<AppEventSender>,
+    cfg: &ServerConfig,
+    server_dir: &Path,
+) -> Result<(), String> {
+    let loader = cfg
+        .loader_version
+        .as_deref()
+        .ok_or("No Fabric loader version")?;
     // Direct server-launcher download endpoint
     let url = format!(
         "https://meta.fabricmc.net/v2/versions/loader/{mc}/{loader}/1.0.1/server/jar",
-        mc = cfg.minecraft_version, loader = loader
+        mc = cfg.minecraft_version,
+        loader = loader
     );
     emit_progress(app, "Downloading Fabric server\u{2026}", 0.2);
     download_to_file(app, &url, &server_dir.join("server.jar"), "Fabric server").await
 }
 
-async fn install_neoforge(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+async fn install_neoforge(
+    app: &Arc<AppEventSender>,
+    cfg: &ServerConfig,
+    server_dir: &Path,
+) -> Result<(), String> {
     let lv = cfg.loader_version.as_deref().ok_or("No NeoForge version")?;
     let url = format!(
         "https://maven.neoforged.net/releases/net/neoforged/neoforge/{v}/neoforge-{v}-installer.jar",
@@ -1731,24 +1977,43 @@ async fn install_neoforge(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_
     cmd.args(["-jar", "neoforge-installer.jar", "--installServer"])
         .current_dir(server_dir);
     hide_child_window(&mut cmd);
-    let out = cmd.output().await
+    let out = cmd
+        .output()
+        .await
         .map_err(|e| format!("Failed to run NeoForge installer: {}", e))?;
     if !out.status.success() {
-        return Err(format!("NeoForge installer failed: {}", String::from_utf8_lossy(&out.stderr)));
+        return Err(format!(
+            "NeoForge installer failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     tokio::fs::remove_file(&installer).await.ok();
     Ok(())
 }
 
-async fn install_folia(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
-    let build = cfg.loader_version.as_deref().ok_or("No Folia build selected")?;
+async fn install_folia(
+    app: &Arc<AppEventSender>,
+    cfg: &ServerConfig,
+    server_dir: &Path,
+) -> Result<(), String> {
+    let build = cfg
+        .loader_version
+        .as_deref()
+        .ok_or("No Folia build selected")?;
     let mc = &cfg.minecraft_version;
     emit_progress(app, "Fetching Folia build info\u{2026}", 0.1);
     let client = reqwest::Client::new();
     let info: PaperBuild = client
-        .get(format!("https://api.papermc.io/v2/projects/folia/versions/{}/builds/{}", mc, build))
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+        .get(format!(
+            "https://api.papermc.io/v2/projects/folia/versions/{}/builds/{}",
+            mc, build
+        ))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
     let url = format!(
         "https://api.papermc.io/v2/projects/folia/versions/{}/builds/{}/downloads/{}",
         mc, build, info.downloads.application.name
@@ -1757,8 +2022,15 @@ async fn install_folia(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir
     download_to_file(app, &url, &server_dir.join("server.jar"), "Folia").await
 }
 
-async fn install_purpur(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
-    let build = cfg.loader_version.as_deref().ok_or("No Purpur build selected")?;
+async fn install_purpur(
+    app: &Arc<AppEventSender>,
+    cfg: &ServerConfig,
+    server_dir: &Path,
+) -> Result<(), String> {
+    let build = cfg
+        .loader_version
+        .as_deref()
+        .ok_or("No Purpur build selected")?;
     let mc = &cfg.minecraft_version;
     let url = format!(
         "https://api.purpurmc.org/v2/purpur/{}/{}/download",
@@ -1777,16 +2049,23 @@ async fn install_buildtools(
     let mc = &cfg.minecraft_version;
 
     // Verify Git is available before attempting BuildTools
-    let git_check = tokio::process::Command::new(if cfg!(target_os = "windows") { "where" } else { "which" })
-        .arg("git")
-        .output().await;
+    let git_check = tokio::process::Command::new(if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    })
+    .arg("git")
+    .output()
+    .await;
     if !matches!(git_check.as_ref().map(|o| o.status.success()), Ok(true)) {
         return Err("BuildTools requires Git. Please install Git from https://git-scm.com/downloads and restart the app.".to_string());
     }
 
     // Run BuildTools in a temporary directory to keep the server dir clean
     let build_dir = std::env::temp_dir().join(format!("lbby-buildtools-{}", mc));
-    tokio::fs::create_dir_all(&build_dir).await.map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(&build_dir)
+        .await
+        .map_err(|e| e.to_string())?;
     let buildtools_jar = build_dir.join("BuildTools.jar");
 
     // Download BuildTools.jar
@@ -1795,12 +2074,22 @@ async fn install_buildtools(
     download_to_file(app, bt_url, &buildtools_jar, "BuildTools.jar").await?;
 
     // Run BuildTools
-    let label = if product == "spigot" { "Spigot" } else { "CraftBukkit" };
-    emit_progress(app, &format!("Compiling {} (this may take a few minutes)\u{2026}", label), 0.3);
+    let label = if product == "spigot" {
+        "Spigot"
+    } else {
+        "CraftBukkit"
+    };
+    emit_progress(
+        app,
+        &format!("Compiling {} (this may take a few minutes)\u{2026}", label),
+        0.3,
+    );
 
     let mut cmd = tokio::process::Command::new(&cfg.java_path);
-    cmd.arg("-jar").arg("BuildTools.jar")
-        .arg("--rev").arg(mc)
+    cmd.arg("-jar")
+        .arg("BuildTools.jar")
+        .arg("--rev")
+        .arg(mc)
         .current_dir(&build_dir);
     if product == "craftbukkit" {
         cmd.arg("--compile").arg("craftbukkit");
@@ -1808,9 +2097,13 @@ async fn install_buildtools(
     hide_child_window(&mut cmd);
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(600), // 10 minutes
-        cmd.output()
-    ).await
-    .map_err(|_| "BuildTools timed out after 10 minutes. Check your internet connection and try again.".to_string())?
+        cmd.output(),
+    )
+    .await
+    .map_err(|_| {
+        "BuildTools timed out after 10 minutes. Check your internet connection and try again."
+            .to_string()
+    })?
     .map_err(|e| format!("Failed to run BuildTools: {}", e))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1821,12 +2114,20 @@ async fn install_buildtools(
     }
 
     // Find the resulting server JAR in the temp dir and copy it to server_dir
-    let prefix = if product == "spigot" { "spigot-" } else { "craftbukkit-" };
+    let prefix = if product == "spigot" {
+        "spigot-"
+    } else {
+        "craftbukkit-"
+    };
     let mut found = false;
-    for entry in std::fs::read_dir(&build_dir).map_err(|e| e.to_string())?.flatten() {
+    for entry in std::fs::read_dir(&build_dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with(prefix) && name.ends_with(".jar") && !name.contains("original") {
-            tokio::fs::copy(entry.path(), server_dir.join("server.jar")).await
+            tokio::fs::copy(entry.path(), server_dir.join("server.jar"))
+                .await
                 .map_err(|e| e.to_string())?;
             found = true;
             break;
@@ -1834,7 +2135,10 @@ async fn install_buildtools(
     }
     if !found {
         tokio::fs::remove_dir_all(&build_dir).await.ok();
-        return Err(format!("BuildTools completed but no {}server.jar was found.", prefix));
+        return Err(format!(
+            "BuildTools completed but no {}server.jar was found.",
+            prefix
+        ));
     }
 
     // Clean up the temporary build directory
@@ -1842,20 +2146,39 @@ async fn install_buildtools(
     Ok(())
 }
 
-async fn install_sponge_vanilla(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
-    let version_tag = cfg.loader_version.as_deref()
+async fn install_sponge_vanilla(
+    app: &Arc<AppEventSender>,
+    cfg: &ServerConfig,
+    server_dir: &Path,
+) -> Result<(), String> {
+    let version_tag = cfg
+        .loader_version
+        .as_deref()
         .ok_or("No SpongeVanilla version selected")?;
     let url = format!(
         "https://dl-api.spongepowered.org/v2/groups/org.spongepowered/artifacts/spongevanilla/versions/{}/assets/installer/download",
         version_tag
     );
     emit_progress(app, "Downloading SpongeVanilla server\u{2026}", 0.2);
-    download_to_file(app, &url, &server_dir.join("server.jar"), "SpongeVanilla server").await
+    download_to_file(
+        app,
+        &url,
+        &server_dir.join("server.jar"),
+        "SpongeVanilla server",
+    )
+    .await
 }
 
-async fn install_sponge_forge(app: &Arc<AppEventSender>, cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+async fn install_sponge_forge(
+    app: &Arc<AppEventSender>,
+    cfg: &ServerConfig,
+    server_dir: &Path,
+) -> Result<(), String> {
     let mc = &cfg.minecraft_version;
-    let sponge_ver = cfg.loader_version.as_deref().ok_or("No SpongeForge version selected")?;
+    let sponge_ver = cfg
+        .loader_version
+        .as_deref()
+        .ok_or("No SpongeForge version selected")?;
 
     // Fetch the Sponge API to find the specific Forge version for this Sponge version
     let client = reqwest::Client::new();
@@ -1863,18 +2186,24 @@ async fn install_sponge_forge(app: &Arc<AppEventSender>, cfg: &ServerConfig, ser
         "https://dl-api.spongepowered.org/v2/groups/org.spongepowered/artifacts/spongeforge/versions?tags=minecraft:{}&limit=50",
         mc
     );
-    let resp = client.get(&api_url).send().await.map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&api_url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
 
     // Find the matching Sponge version and extract its Forge version
-    let artifacts = data.get("artifacts")
+    let artifacts = data
+        .get("artifacts")
         .and_then(|v| v.as_object())
         .ok_or("Failed to parse Sponge versions")?;
 
     let mut forge_version = None;
     for (ver, info) in artifacts {
         if ver == sponge_ver {
-            forge_version = info.get("tagValues")
+            forge_version = info
+                .get("tagValues")
                 .and_then(|tv| tv.get("forge"))
                 .and_then(|f| f.as_str())
                 .map(|s| s.to_string());
@@ -1882,8 +2211,10 @@ async fn install_sponge_forge(app: &Arc<AppEventSender>, cfg: &ServerConfig, ser
         }
     }
 
-    let forge_ver = forge_version
-        .ok_or(format!("Could not find Forge version for SpongeForge {}", sponge_ver))?;
+    let forge_ver = forge_version.ok_or(format!(
+        "Could not find Forge version for SpongeForge {}",
+        sponge_ver
+    ))?;
 
     // Install the specific Forge version required by this SpongeForge build
     let mut forge_cfg = cfg.clone();
@@ -1891,14 +2222,18 @@ async fn install_sponge_forge(app: &Arc<AppEventSender>, cfg: &ServerConfig, ser
     install_forge(app, &forge_cfg, server_dir).await?;
 
     // Then download SpongeForge JAR into mods/
-    let version_tag = cfg.loader_version.as_deref()
+    let version_tag = cfg
+        .loader_version
+        .as_deref()
         .ok_or("No SpongeForge version selected")?;
     let url = format!(
         "https://dl-api.spongepowered.org/v2/groups/org.spongepowered/artifacts/spongeforge/versions/{}/assets/installer/download",
         version_tag
     );
     let mods_dir = server_dir.join("mods");
-    tokio::fs::create_dir_all(&mods_dir).await.map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(&mods_dir)
+        .await
+        .map_err(|e| e.to_string())?;
     emit_progress(app, "Downloading SpongeForge\u{2026}", 0.8);
     download_to_file(app, &url, &mods_dir.join("spongeforge.jar"), "SpongeForge").await?;
     Ok(())
@@ -1906,30 +2241,43 @@ async fn install_sponge_forge(app: &Arc<AppEventSender>, cfg: &ServerConfig, ser
 
 // ── Terraria / tModLoader install ─────────────────────────────────────────────
 
-async fn install_terraria(app: &Arc<AppEventSender>, _cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
-
+async fn install_terraria(
+    app: &Arc<AppEventSender>,
+    _cfg: &ServerConfig,
+    server_dir: &Path,
+) -> Result<(), String> {
     emit_progress(app, "Setting up Terraria server\u{2026}", 0.1);
 
     // 0. Check if tModLoader is already installed (it includes Terraria server functionality)
-    let mut tmodloader_paths = vec![
-        dirs::home_dir().unwrap_or_default().join("terraria-server"),
-    ];
+    let mut tmodloader_paths = vec![dirs::home_dir().unwrap_or_default().join("terraria-server")];
     if cfg!(target_os = "windows") {
         if let Ok(pf) = std::env::var("ProgramFiles(x86)") {
             tmodloader_paths.push(PathBuf::from(pf).join("Steam/steamapps/common/tModLoader"));
         }
     } else {
-        tmodloader_paths.push(dirs::home_dir().unwrap_or_default().join(".steam/steam/steamapps/common/tModLoader"));
+        tmodloader_paths.push(
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".steam/steam/steamapps/common/tModLoader"),
+        );
     }
     for tmod_path in &tmodloader_paths {
-        if tmod_path.join("start-tModLoaderServer.sh").exists() || tmod_path.join("start-tModLoaderServer.bat").exists() {
+        if tmod_path.join("start-tModLoaderServer.sh").exists()
+            || tmod_path.join("start-tModLoaderServer.bat").exists()
+        {
             // Skip if source and destination are the same directory
             if tmod_path.canonicalize().ok() == server_dir.canonicalize().ok() {
-                emit_progress(app, "Server directory is already a tModLoader installation", 1.0);
+                emit_progress(
+                    app,
+                    "Server directory is already a tModLoader installation",
+                    1.0,
+                );
                 return Ok(());
             }
             emit_progress(app, "Found tModLoader installation, linking\u{2026}", 0.3);
-            tokio::fs::create_dir_all(server_dir).await.map_err(|e| e.to_string())?;
+            tokio::fs::create_dir_all(server_dir)
+                .await
+                .map_err(|e| e.to_string())?;
             let src = tmod_path.to_string_lossy().to_string();
             let dst = server_dir.to_string_lossy().to_string();
             #[cfg(unix)]
@@ -1953,7 +2301,11 @@ async fn install_terraria(app: &Arc<AppEventSender>, _cfg: &ServerConfig, server
                     }
                     for entry in std::fs::read_dir(tmod_path).into_iter().flatten().flatten() {
                         let name = entry.file_name().to_string_lossy().to_string();
-                        if name.ends_with(".dll") || name.ends_with(".config") || name.ends_with(".xml") || name.ends_with(".bat") {
+                        if name.ends_with(".dll")
+                            || name.ends_with(".config")
+                            || name.ends_with(".xml")
+                            || name.ends_with(".bat")
+                        {
                             let dest_file = server_dir.join(&name);
                             if !dest_file.exists() {
                                 let _ = std::fs::copy(entry.path(), dest_file);
@@ -1977,18 +2329,25 @@ async fn install_terraria(app: &Arc<AppEventSender>, _cfg: &ServerConfig, server
 
     // 1. Check if the server is bundled with an existing Terraria installation
     let terraria_dir = if cfg!(target_os = "macos") {
-        dirs::home_dir().unwrap_or_default().join("Library/Application Support/Steam/steamapps/common/Terraria")
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join("Library/Application Support/Steam/steamapps/common/Terraria")
     } else if cfg!(target_os = "windows") {
-        let prog_files = std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| "C:\\Program Files (x86)".to_string());
+        let prog_files = std::env::var("ProgramFiles(x86)")
+            .unwrap_or_else(|_| "C:\\Program Files (x86)".to_string());
         PathBuf::from(prog_files).join("Steam/steamapps/common/Terraria")
     } else {
-        dirs::home_dir().unwrap_or_default().join(".steam/steam/steamapps/common/Terraria")
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".steam/steam/steamapps/common/Terraria")
     };
 
     if terraria_dir.exists() {
         if let Some(found) = find_terraria_binary(&terraria_dir) {
             emit_progress(app, "Found bundled Terraria server, copying\u{2026}", 0.3);
-            tokio::fs::create_dir_all(server_dir).await.map_err(|e| e.to_string())?;
+            tokio::fs::create_dir_all(server_dir)
+                .await
+                .map_err(|e| e.to_string())?;
 
             #[cfg(target_os = "windows")]
             {
@@ -2003,7 +2362,10 @@ async fn install_terraria(app: &Arc<AppEventSender>, _cfg: &ServerConfig, server
                         let _ = tokio::fs::copy(&found, &dest).await;
                         for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
                             let name = entry.file_name().to_string_lossy().to_string();
-                            if name.ends_with(".dll") || name.ends_with(".config") || name.ends_with(".xml") {
+                            if name.ends_with(".dll")
+                                || name.ends_with(".config")
+                                || name.ends_with(".xml")
+                            {
                                 let dest_file = server_dir.join(&name);
                                 if !dest_file.exists() {
                                     let _ = std::fs::copy(entry.path(), dest_file);
@@ -2017,11 +2379,16 @@ async fn install_terraria(app: &Arc<AppEventSender>, _cfg: &ServerConfig, server
             #[cfg(unix)]
             {
                 let dest = terraria_server_binary(server_dir);
-                tokio::fs::copy(&found, &dest).await.map_err(|e| format!("Failed to copy server: {}", e))?;
+                tokio::fs::copy(&found, &dest)
+                    .await
+                    .map_err(|e| format!("Failed to copy server: {}", e))?;
                 if let Some(parent) = found.parent() {
                     for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
                         let name = entry.file_name().to_string_lossy().to_string();
-                        if name.ends_with(".dll") || name.ends_with(".config") || name.ends_with(".xml") {
+                        if name.ends_with(".dll")
+                            || name.ends_with(".config")
+                            || name.ends_with(".xml")
+                        {
                             let dest_file = server_dir.join(&name);
                             if !dest_file.exists() {
                                 let _ = std::fs::copy(entry.path(), dest_file);
@@ -2046,20 +2413,29 @@ async fn install_terraria(app: &Arc<AppEventSender>, _cfg: &ServerConfig, server
             crate::steamcmd::TERRARIA_APP_ID,
             server_dir,
             "anonymous",
-        ).await {
+        )
+        .await
+        {
             Ok(()) => {
                 let binary = terraria_server_binary(server_dir);
                 if binary.exists() {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755));
+                        let _ = std::fs::set_permissions(
+                            &binary,
+                            std::fs::Permissions::from_mode(0o755),
+                        );
                     }
                     emit_progress(app, "Terraria server installed", 1.0);
                     return Ok(());
                 }
                 // Check if binary is in a subdirectory (SteamCMD sometimes nests)
-                for entry in walkdir::WalkDir::new(server_dir).max_depth(3).into_iter().flatten() {
+                for entry in walkdir::WalkDir::new(server_dir)
+                    .max_depth(3)
+                    .into_iter()
+                    .flatten()
+                {
                     let name = entry.file_name().to_string_lossy();
                     if name == "TerrariaServer" || name == "TerrariaServer.exe" {
                         let dest = terraria_server_binary(server_dir);
@@ -2067,7 +2443,10 @@ async fn install_terraria(app: &Arc<AppEventSender>, _cfg: &ServerConfig, server
                         #[cfg(unix)]
                         {
                             use std::os::unix::fs::PermissionsExt;
-                            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+                            let _ = std::fs::set_permissions(
+                                &dest,
+                                std::fs::Permissions::from_mode(0o755),
+                            );
                         }
                         emit_progress(app, "Terraria server installed", 1.0);
                         return Ok(());
@@ -2097,7 +2476,11 @@ async fn install_terraria(app: &Arc<AppEventSender>, _cfg: &ServerConfig, server
     )
 }
 
-async fn install_tmodloader(app: &Arc<AppEventSender>, _cfg: &ServerConfig, server_dir: &Path) -> Result<(), String> {
+async fn install_tmodloader(
+    app: &Arc<AppEventSender>,
+    _cfg: &ServerConfig,
+    server_dir: &Path,
+) -> Result<(), String> {
     emit_progress(app, "Fetching tModLoader release info\u{2026}", 0.05);
 
     // Get the latest release from GitHub
@@ -2136,7 +2519,11 @@ async fn install_tmodloader(app: &Arc<AppEventSender>, _cfg: &ServerConfig, serv
     let download_url = assets
         .iter()
         .find(|a| a["name"].as_str() == Some(asset_name))
-        .or_else(|| assets.iter().find(|a| a["name"].as_str() == Some("tModLoader.zip")))
+        .or_else(|| {
+            assets
+                .iter()
+                .find(|a| a["name"].as_str() == Some("tModLoader.zip"))
+        })
         .and_then(|a| a["browser_download_url"].as_str())
         .ok_or(format!("Could not find download URL for {}", asset_name))?;
 
@@ -2162,7 +2549,14 @@ async fn install_tmodloader(app: &Arc<AppEventSender>, _cfg: &ServerConfig, serv
         downloaded += chunk.len() as u64;
         if total > 0 {
             let progress = 0.1 + (downloaded as f64 / total as f64) * 0.7;
-            emit_progress(app, &format!("Downloading tModLoader\u{2026} {:.0}%", downloaded as f64 / total as f64 * 100.0), progress as f32);
+            emit_progress(
+                app,
+                &format!(
+                    "Downloading tModLoader\u{2026} {:.0}%",
+                    downloaded as f64 / total as f64 * 100.0
+                ),
+                progress as f32,
+            );
         }
     }
 
@@ -2191,21 +2585,29 @@ async fn install_tmodloader(app: &Arc<AppEventSender>, _cfg: &ServerConfig, serv
     };
     if !start_script.exists() {
         // Try looking in a subdirectory
-        let alt = server_dir.join("tModLoader").join(if cfg!(target_os = "windows") {
-            "start-tModLoaderServer.bat"
-        } else {
-            "start-tModLoaderServer.sh"
-        });
+        let alt = server_dir
+            .join("tModLoader")
+            .join(if cfg!(target_os = "windows") {
+                "start-tModLoaderServer.bat"
+            } else {
+                "start-tModLoaderServer.sh"
+            });
         if alt.exists() {
             // Move contents up
             let src = server_dir.join("tModLoader");
-            for entry in std::fs::read_dir(&src).map_err(|e| e.to_string())?.flatten() {
+            for entry in std::fs::read_dir(&src)
+                .map_err(|e| e.to_string())?
+                .flatten()
+            {
                 let dest = server_dir.join(entry.file_name());
                 let _ = std::fs::rename(entry.path(), dest);
             }
             let _ = std::fs::remove_dir(src);
         } else {
-            return Err("tModLoader start script not found after extraction. The download may have failed.".to_string());
+            return Err(
+                "tModLoader start script not found after extraction. The download may have failed."
+                    .to_string(),
+            );
         }
     }
 
@@ -2221,7 +2623,9 @@ async fn install_tmodloader(app: &Arc<AppEventSender>, _cfg: &ServerConfig, serv
 
     // Create Mods directory and empty enabled.json
     let mods = crate::tmod_services::mods_dir(server_dir);
-    tokio::fs::create_dir_all(&mods).await.map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(&mods)
+        .await
+        .map_err(|e| e.to_string())?;
     if !crate::tmod_services::enabled_json_path(server_dir).exists() {
         crate::tmod_services::write_enabled_json(server_dir, &[])?;
     }
@@ -2232,11 +2636,17 @@ async fn install_tmodloader(app: &Arc<AppEventSender>, _cfg: &ServerConfig, serv
 
 // ── Pregenerate chunks ───────────────────────────────────────────────────────
 
-pub async fn pregenerate_chunks(app: Arc<crate::app_state::AppEventSender>, total_chunks: u32) -> Result<(), String> {
+pub async fn pregenerate_chunks(
+    app: Arc<crate::app_state::AppEventSender>,
+    total_chunks: u32,
+) -> Result<(), String> {
     do_pregenerate_chunks(app, total_chunks).await
 }
 
-pub async fn do_pregenerate_chunks(app: Arc<crate::app_state::AppEventSender>, total_chunks: u32) -> Result<(), String> {
+pub async fn do_pregenerate_chunks(
+    app: Arc<crate::app_state::AppEventSender>,
+    total_chunks: u32,
+) -> Result<(), String> {
     let lic = crate::license::current();
     let cap = crate::license::max_pregen_chunks(lic.tier);
     if total_chunks > cap {
@@ -2262,9 +2672,16 @@ pub async fn do_pregenerate_chunks(app: Arc<crate::app_state::AppEventSender>, t
             return Err("A pre-generation task is already running".to_string());
         }
         let mut side = (total_chunks as f64).sqrt().ceil() as u32;
-        if side.is_multiple_of(2) { side += 1; }
+        if side.is_multiple_of(2) {
+            side += 1;
+        }
         let total = side * side;
-        *pg = crate::app_state::PregenState { running: true, total, completed: 0, cancel_requested: false };
+        *pg = crate::app_state::PregenState {
+            running: true,
+            total,
+            completed: 0,
+            cancel_requested: false,
+        };
         app.emit("pregen-update", pg.clone()).ok();
     }
 
@@ -2277,7 +2694,8 @@ pub async fn do_pregenerate_chunks(app: Arc<crate::app_state::AppEventSender>, t
             let mut srv = s.server.lock().await;
             if srv.status == ServerStatus::Running {
                 if let Some(stdin) = &mut srv.stdin {
-                    let _ = tokio::io::AsyncWriteExt::write_all(stdin, b"forceload remove all\n").await;
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(stdin, b"forceload remove all\n").await;
                 }
             }
         }
@@ -2299,7 +2717,10 @@ pub async fn do_pregenerate_chunks(app: Arc<crate::app_state::AppEventSender>, t
     Ok(())
 }
 
-async fn run_pregen(app: &Arc<crate::app_state::AppEventSender>, _requested_total: u32) -> Result<u32, String> {
+async fn run_pregen(
+    app: &Arc<crate::app_state::AppEventSender>,
+    _requested_total: u32,
+) -> Result<u32, String> {
     let s = app.state();
     let total = { s.pregen.lock().await.total };
     let side_len = (total as f64).sqrt() as u32;
@@ -2322,7 +2743,9 @@ async fn run_pregen(app: &Arc<crate::app_state::AppEventSender>, _requested_tota
         while x <= half {
             {
                 let pg = s.pregen.lock().await;
-                if pg.cancel_requested { return Err("cancelled".to_string()); }
+                if pg.cancel_requested {
+                    return Err("cancelled".to_string());
+                }
             }
             {
                 let srv = s.server.lock().await;
@@ -2336,14 +2759,17 @@ async fn run_pregen(app: &Arc<crate::app_state::AppEventSender>, _requested_tota
             {
                 let mut srv = s.server.lock().await;
                 if let Some(stdin) = &mut srv.stdin {
-                    tokio::io::AsyncWriteExt::write_all(stdin, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
+                    tokio::io::AsyncWriteExt::write_all(stdin, cmd.as_bytes())
+                        .await
+                        .map_err(|e| e.to_string())?;
                 }
             }
 
             let batch_chunks = ((x_end - x + 1) as u32) * ((z_end - z + 1) as u32);
             tokio::time::sleep(std::time::Duration::from_millis(
                 (batch_chunks as u64 * 30).max(700),
-            )).await;
+            ))
+            .await;
 
             completed += batch_chunks;
             {
@@ -2355,7 +2781,8 @@ async fn run_pregen(app: &Arc<crate::app_state::AppEventSender>, _requested_tota
             if completed.is_multiple_of(1024) {
                 let mut srv = s.server.lock().await;
                 if let Some(stdin) = &mut srv.stdin {
-                    let _ = tokio::io::AsyncWriteExt::write_all(stdin, b"forceload remove all\n").await;
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(stdin, b"forceload remove all\n").await;
                 }
             }
 
@@ -2375,6 +2802,8 @@ pub async fn cancel_pregenerate(state: &crate::app_state::AppState) -> Result<()
     Ok(())
 }
 
-pub async fn get_pregen_state(state: &crate::app_state::AppState) -> Result<crate::app_state::PregenState, String> {
+pub async fn get_pregen_state(
+    state: &crate::app_state::AppState,
+) -> Result<crate::app_state::PregenState, String> {
     Ok(state.pregen.lock().await.clone())
 }

@@ -185,5 +185,4 @@ impl AppEventSender {
     pub fn state(&self) -> Arc<AppState> {
         self.state.clone()
     }
-
 }
