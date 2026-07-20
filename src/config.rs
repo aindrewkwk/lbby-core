@@ -594,6 +594,10 @@ pub fn create_profile(
         cfg.auto_restart = true;
         cfg.optimized_jvm_flags = true;
         cfg.performance_preset = default_performance_preset();
+    } else {
+        // Duplicated profiles need a fresh install — force setup wizard to
+        // run so install_forge downloads new jars instead of reusing old ones.
+        cfg.setup_complete = false;
     }
     let clean_name = name.trim();
     let id = uuid::Uuid::new_v4().simple().to_string();
