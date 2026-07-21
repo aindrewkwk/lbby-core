@@ -207,6 +207,33 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
             e
         )
     })?;
+    if matches!(
+        cfg.server_type,
+        ServerType::Forge | ServerType::NeoForge | ServerType::Fabric | ServerType::SpongeForge
+    ) {
+        match crate::mod_side::quarantine_client_only_mods(&server_dir).await {
+            Ok(moved) if !moved.is_empty() => {
+                let message = format!(
+                    "[lbby] Quarantined {} client-only mod(s): {}",
+                    moved.len(),
+                    moved.join(", ")
+                );
+                let state = app.state();
+                state.push_console_line(message.clone());
+                app.emit("mc-line", &message).ok();
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let message = format!(
+                    "[lbby] Warning: could not finish client-only mod scan: {}",
+                    error
+                );
+                let state = app.state();
+                state.push_console_line(message.clone());
+                app.emit("mc-line", &message).ok();
+            }
+        }
+    }
     let ram = cfg.ram_mb;
     if matches!(cfg.server_type, ServerType::Forge | ServerType::NeoForge) {
         upsert_managed_jvm_args(&server_dir, &cfg)?;

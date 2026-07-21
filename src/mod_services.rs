@@ -997,6 +997,16 @@ pub async fn install_modrinth_modpack(
         1,
     );
     safe_extract_prefix(&mut zip, "overrides", &root)?;
+    let quarantined = crate::mod_side::quarantine_client_only_mods(&root).await?;
+    if !quarantined.is_empty() {
+        emit_mod_progress(
+            &app,
+            "Filtering client-only mods",
+            &format!("Quarantined {} client-only mod(s)", quarantined.len()),
+            quarantined.len() as u32,
+            quarantined.len() as u32,
+        );
+    }
     ensure_server_properties(&root, &cfg.server_name)?;
 
     // Auto-enable require-resource-pack if the modpack included resource packs
@@ -1169,6 +1179,16 @@ pub async fn install_curseforge_modpack(
             1,
         );
         safe_extract_prefix(&mut zip, overrides, &root)?;
+    }
+    let quarantined = crate::mod_side::quarantine_client_only_mods(&root).await?;
+    if !quarantined.is_empty() {
+        emit_mod_progress(
+            &app,
+            "Filtering client-only mods",
+            &format!("Quarantined {} client-only mod(s)", quarantined.len()),
+            quarantined.len() as u32,
+            quarantined.len() as u32,
+        );
     }
     ensure_server_properties(&root, &cfg.server_name)?;
 
