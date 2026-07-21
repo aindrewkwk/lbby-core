@@ -5,12 +5,15 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
 
 use crate::app_state::AppEventSender;
 use crate::config::{ServerConfig, ServerType};
+use crate::forge::{detect_modloader_launch, ModLoaderKind, ModLoaderLaunch};
 use crate::helpers::{check_port_available, download_to_file, hide_child_window, InstallProgress};
+use crate::minecraft_properties::merge_server_properties;
 use crate::stats::ServerStats;
 
 const RESTART_WINDOW_SECS: u64 = 300;
@@ -130,10 +133,7 @@ pub fn start_server(
             let state = app.state();
             let srv = state.server.lock().await;
             if !srv.status.can_start() {
-                return Err(format!(
-                    "Cannot start: server is {}",
-                    srv.status.label()
-                ));
+                return Err(format!("Cannot start: server is {}", srv.status.label()));
             }
         }
         let result = do_start_server(app.clone()).await;
@@ -142,7 +142,11 @@ pub fn start_server(
             // Stopped so the UI doesn't get stuck on "Starting" forever.
             let state = app.state();
             let mut srv = state.server.lock().await;
-            if srv.status == ServerStatus::Starting || srv.status == ServerStatus::DownloadingJava || srv.status == ServerStatus::DownloadingJar || srv.status == ServerStatus::Preparing {
+            if srv.status == ServerStatus::Starting
+                || srv.status == ServerStatus::DownloadingJava
+                || srv.status == ServerStatus::DownloadingJar
+                || srv.status == ServerStatus::Preparing
+            {
                 srv.set_status(ServerStatus::Error, Some(result.clone().unwrap_err()));
                 srv.stdin = None;
                 srv.pid = None;
@@ -327,29 +331,61 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
 
     let mut cmd = match cfg.server_type {
         ServerType::Forge | ServerType::NeoForge => {
-            #[cfg(target_os = "windows")]
-            let mut c = {
-                let mut c = tokio::process::Command::new("cmd");
-                c.args(["/c", "run.bat", "nogui"]);
-                c
+            let (kind, version_key) = if cfg.server_type == ServerType::Forge {
+                (
+                    ModLoaderKind::Forge,
+                    format!(
+                        "{}-{}",
+                        cfg.minecraft_version,
+                        cfg.loader_version.as_deref().ok_or("No Forge version")?
+                    ),
+                )
+            } else {
+                (
+                    ModLoaderKind::NeoForge,
+                    cfg.loader_version
+                        .as_deref()
+                        .ok_or("No NeoForge version")?
+                        .to_string(),
+                )
             };
-            #[cfg(not(target_os = "windows"))]
-            let mut c = {
-                let mut c = tokio::process::Command::new("/bin/bash");
-                c.args(["-c", "./run.sh nogui"]);
-                c
-            };
-            if let Some(jh) = &java_home {
-                c.env("JAVA_HOME", jh);
-                let bin_dir = jh.join("bin");
-                let sep = if cfg!(windows) { ";" } else { ":" };
-                let new_path = match std::env::var("PATH") {
-                    Ok(p) => format!("{}{}{}", bin_dir.display(), sep, p),
-                    Err(_) => bin_dir.display().to_string(),
-                };
-                c.env("PATH", new_path);
+            match detect_modloader_launch(&server_dir, kind, &version_key)? {
+                ModLoaderLaunch::Script(_) => {
+                    #[cfg(target_os = "windows")]
+                    let mut c = {
+                        let mut c = tokio::process::Command::new("cmd");
+                        c.args(["/c", "run.bat", "nogui"]);
+                        c
+                    };
+                    #[cfg(not(target_os = "windows"))]
+                    let mut c = {
+                        let mut c = tokio::process::Command::new("/bin/bash");
+                        c.args(["-c", "./run.sh nogui"]);
+                        c
+                    };
+                    if let Some(jh) = &java_home {
+                        c.env("JAVA_HOME", jh);
+                        let bin_dir = jh.join("bin");
+                        let sep = if cfg!(windows) { ";" } else { ":" };
+                        let new_path = match std::env::var("PATH") {
+                            Ok(p) => format!("{}{}{}", bin_dir.display(), sep, p),
+                            Err(_) => bin_dir.display().to_string(),
+                        };
+                        c.env("PATH", new_path);
+                    }
+                    c
+                }
+                ModLoaderLaunch::LegacyJar(jar) => {
+                    let mut c = tokio::process::Command::new(&java_bin);
+                    c.arg(format!("-Xmx{}M", ram));
+                    c.arg(format!("-Xms{}M", (ram / 2).max(512)));
+                    if cfg.optimized_jvm_flags {
+                        c.args(optimized_jvm_flags());
+                    }
+                    c.args(["-jar", &jar.to_string_lossy(), "nogui"]);
+                    c
+                }
             }
-            c
         }
         _ => {
             let mut c = tokio::process::Command::new(&java_bin);
@@ -1791,35 +1827,22 @@ pub async fn do_install_server(
             "max_performance" => (10, 8),
             _ => (8, 6),
         };
-        // Preserve existing server-port if server.properties already exists
-        // (user may have changed it via Settings > Server Properties).
-        let port = {
-            let props_path = server_dir.join("server.properties");
-            if props_path.exists() {
-                if let Ok(existing) = std::fs::read_to_string(&props_path) {
-                    existing
-                        .lines()
-                        .find(|l| l.starts_with("server-port="))
-                        .and_then(|l| l.split('=').nth(1))
-                        .and_then(|v| v.trim().parse::<u16>().ok())
-                        .unwrap_or(cfg.default_port())
-                } else {
-                    cfg.default_port()
-                }
-            } else {
-                cfg.default_port()
-            }
-        };
-        // Build server.properties content
-        let mut props = format!(
-            "online-mode=false\nmax-players={}\nmotd={}\nserver-port={}\nview-distance={}\nsimulation-distance={}\n",
-            cfg.max_players, cfg.server_name, port, view_distance, simulation_distance
+        let properties_path = server_dir.join("server.properties");
+        let existing = tokio::fs::read_to_string(&properties_path).await.ok();
+        let mut props = merge_server_properties(
+            existing.as_deref(),
+            cfg.max_players,
+            &cfg.server_name,
+            cfg.default_port(),
+            view_distance,
+            simulation_distance,
         );
-        // Add seed if configured
-        if !cfg.minecraft_seed.trim().is_empty() {
+        if !cfg.minecraft_seed.trim().is_empty()
+            && !props.lines().any(|line| line.starts_with("level-seed="))
+        {
             props.push_str(&format!("level-seed={}\n", cfg.minecraft_seed.trim()));
         }
-        tokio::fs::write(server_dir.join("server.properties"), props)
+        tokio::fs::write(properties_path, props)
             .await
             .map_err(|e| e.to_string())?;
     } else if cfg.is_terraria() {
@@ -1870,14 +1893,35 @@ pub async fn do_install_server(
     // Validate that the server binary/jar exists before marking setup complete
     if cfg.is_minecraft() {
         let jar_path = server_dir.join("server.jar");
-        if !jar_path.exists() {
-            return Err("Installation completed but server.jar was not found. The installer may have failed.".to_string());
-        }
-        let meta = tokio::fs::metadata(&jar_path)
-            .await
-            .map_err(|e| e.to_string())?;
-        if meta.len() < 1024 {
-            return Err("server.jar appears to be corrupted (too small). Try again.".to_string());
+        match cfg.server_type {
+            ServerType::Forge => {
+                let version = format!(
+                    "{}-{}",
+                    cfg.minecraft_version,
+                    cfg.loader_version.as_deref().ok_or("No Forge version")?
+                );
+                detect_modloader_launch(&server_dir, ModLoaderKind::Forge, &version)?;
+            }
+            ServerType::NeoForge => {
+                detect_modloader_launch(
+                    &server_dir,
+                    ModLoaderKind::NeoForge,
+                    cfg.loader_version.as_deref().ok_or("No NeoForge version")?,
+                )?;
+            }
+            _ => {
+                if !jar_path.exists() {
+                    return Err("Installation completed but server.jar was not found. The installer may have failed.".to_string());
+                }
+                let meta = tokio::fs::metadata(&jar_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if meta.len() < 1024 {
+                    return Err(
+                        "server.jar appears to be corrupted (too small). Try again.".to_string()
+                    );
+                }
+            }
         }
     } else if cfg.is_terraria() {
         if cfg.server_type == ServerType::TModLoader {
@@ -1979,6 +2023,162 @@ async fn install_paper(
     download_to_file(app, &url, &server_dir.join("server.jar"), "Paper").await
 }
 
+async fn valid_installer_jar(path: &Path) -> bool {
+    let Ok(metadata) = tokio::fs::metadata(path).await else {
+        return false;
+    };
+    if metadata.len() < 1024 {
+        return false;
+    }
+    tokio::fs::read(path)
+        .await
+        .is_ok_and(|bytes| bytes.starts_with(b"PK\x03\x04"))
+}
+
+async fn cached_modloader_installer(
+    app: &Arc<AppEventSender>,
+    url: &str,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("lbby/installers");
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    let digest = format!("{:x}", Sha256::digest(url.as_bytes()));
+    let cached = cache_dir.join(format!("{digest}.jar"));
+    if valid_installer_jar(&cached).await {
+        return Ok(cached);
+    }
+
+    let part = cache_dir.join(format!("{digest}.{}.part", uuid::Uuid::new_v4()));
+    if let Err(error) = download_to_file(app, url, &part, label).await {
+        tokio::fs::remove_file(&part).await.ok();
+        return Err(error);
+    }
+    if !valid_installer_jar(&part).await {
+        tokio::fs::remove_file(&part).await.ok();
+        return Err(format!("Downloaded {label} is not a valid JAR archive"));
+    }
+    match tokio::fs::rename(&part, &cached).await {
+        Ok(()) => Ok(cached),
+        Err(_) if valid_installer_jar(&cached).await => {
+            tokio::fs::remove_file(&part).await.ok();
+            Ok(cached)
+        }
+        Err(error) => {
+            tokio::fs::remove_file(&part).await.ok();
+            Err(format!("Failed to publish installer cache: {error}"))
+        }
+    }
+}
+
+fn commit_modloader_runtime(staging: &Path, server_dir: &Path) -> Result<(), String> {
+    let rollback =
+        server_dir.with_file_name(format!(".lbby-runtime-rollback-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&rollback).map_err(|e| e.to_string())?;
+    let mut installed = Vec::new();
+    let mut backed_up = Vec::new();
+    let result = (|| -> Result<(), String> {
+        for entry in std::fs::read_dir(staging).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name();
+            let text = name.to_string_lossy();
+            if text.ends_with("-installer.jar") || text.ends_with("-installer.jar.log") {
+                continue;
+            }
+            let target = server_dir.join(&name);
+            if text == "user_jvm_args.txt" && target.exists() {
+                continue;
+            }
+            if target.exists() {
+                std::fs::rename(&target, rollback.join(&name))
+                    .map_err(|e| format!("Failed to preserve {}: {e}", target.display()))?;
+                backed_up.push(name.clone());
+            }
+            std::fs::rename(entry.path(), &target)
+                .map_err(|e| format!("Failed to install {}: {e}", target.display()))?;
+            installed.push(name);
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for name in installed.iter().rev() {
+            let path = server_dir.join(name);
+            if path.is_dir() {
+                std::fs::remove_dir_all(path).ok();
+            } else {
+                std::fs::remove_file(path).ok();
+            }
+        }
+        for name in backed_up.iter().rev() {
+            std::fs::rename(rollback.join(name), server_dir.join(name)).ok();
+        }
+        std::fs::remove_dir_all(&rollback).ok();
+        return Err(format!("{error}; the previous runtime was restored"));
+    }
+    std::fs::remove_dir_all(&rollback).ok();
+    Ok(())
+}
+
+pub(crate) async fn install_modloader_transactional(
+    app: &Arc<AppEventSender>,
+    java_path: &Path,
+    server_dir: &Path,
+    kind: ModLoaderKind,
+    version_key: &str,
+    url: &str,
+) -> Result<(), String> {
+    let label = match kind {
+        ModLoaderKind::Forge => "Forge installer",
+        ModLoaderKind::NeoForge => "NeoForge installer",
+    };
+    emit_progress(app, &format!("Downloading {label}…"), 0.2);
+    let cached = cached_modloader_installer(app, url, label).await?;
+    let staging = server_dir.with_file_name(format!(
+        ".lbby-{}-install-{}",
+        kind.prefix(),
+        uuid::Uuid::new_v4()
+    ));
+    tokio::fs::create_dir_all(&staging)
+        .await
+        .map_err(|e| e.to_string())?;
+    let installer_name = format!("{}-installer.jar", kind.prefix());
+    if let Err(error) = tokio::fs::copy(cached, staging.join(&installer_name)).await {
+        tokio::fs::remove_dir_all(&staging).await.ok();
+        return Err(format!("Failed to stage {label}: {error}"));
+    }
+    emit_progress(app, &format!("Running {label}…"), 0.6);
+    let mut cmd = tokio::process::Command::new(java_path);
+    cmd.args(["-jar", &installer_name, "--installServer"])
+        .current_dir(&staging);
+    hide_child_window(&mut cmd);
+    let output = match cmd.output().await {
+        Ok(output) => output,
+        Err(error) => {
+            tokio::fs::remove_dir_all(&staging).await.ok();
+            return Err(format!("Failed to run {label}: {error}"));
+        }
+    };
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr);
+        tokio::fs::remove_dir_all(&staging).await.ok();
+        return Err(format!("{label} failed: {details}"));
+    }
+    if let Err(error) = detect_modloader_launch(&staging, kind, version_key) {
+        tokio::fs::remove_dir_all(&staging).await.ok();
+        return Err(error);
+    }
+    if let Err(error) = commit_modloader_runtime(&staging, server_dir) {
+        tokio::fs::remove_dir_all(&staging).await.ok();
+        return Err(error);
+    }
+    tokio::fs::remove_dir_all(&staging).await.ok();
+    detect_modloader_launch(server_dir, kind, version_key)?;
+    Ok(())
+}
+
 async fn install_forge(
     app: &Arc<AppEventSender>,
     cfg: &ServerConfig,
@@ -1989,30 +2189,16 @@ async fn install_forge(
         "https://maven.minecraftforge.net/net/minecraftforge/forge/{mc}-{fv}/forge-{mc}-{fv}-installer.jar",
         mc = cfg.minecraft_version, fv = lv
     );
-    let installer = server_dir.join("forge-installer.jar");
-    emit_progress(app, "Downloading Forge installer\u{2026}", 0.2);
-    download_to_file(app, &url, &installer, "Forge installer").await?;
-    emit_progress(
+    let version_key = format!("{}-{}", cfg.minecraft_version, lv);
+    install_modloader_transactional(
         app,
-        "Running Forge installer (may take a minute)\u{2026}",
-        0.6,
-    );
-    let mut cmd = tokio::process::Command::new(&cfg.java_path);
-    cmd.args(["-jar", "forge-installer.jar", "--installServer"])
-        .current_dir(server_dir);
-    hide_child_window(&mut cmd);
-    let out = cmd
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run Forge installer: {}", e))?;
-    if !out.status.success() {
-        return Err(format!(
-            "Forge installer failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    tokio::fs::remove_file(&installer).await.ok();
-    Ok(())
+        Path::new(&cfg.java_path),
+        server_dir,
+        ModLoaderKind::Forge,
+        &version_key,
+        &url,
+    )
+    .await
 }
 
 async fn install_fabric(
@@ -2044,26 +2230,15 @@ async fn install_neoforge(
         "https://maven.neoforged.net/releases/net/neoforged/neoforge/{v}/neoforge-{v}-installer.jar",
         v = lv
     );
-    let installer = server_dir.join("neoforge-installer.jar");
-    emit_progress(app, "Downloading NeoForge installer\u{2026}", 0.2);
-    download_to_file(app, &url, &installer, "NeoForge installer").await?;
-    emit_progress(app, "Running NeoForge installer\u{2026}", 0.6);
-    let mut cmd = tokio::process::Command::new(&cfg.java_path);
-    cmd.args(["-jar", "neoforge-installer.jar", "--installServer"])
-        .current_dir(server_dir);
-    hide_child_window(&mut cmd);
-    let out = cmd
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run NeoForge installer: {}", e))?;
-    if !out.status.success() {
-        return Err(format!(
-            "NeoForge installer failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    tokio::fs::remove_file(&installer).await.ok();
-    Ok(())
+    install_modloader_transactional(
+        app,
+        Path::new(&cfg.java_path),
+        server_dir,
+        ModLoaderKind::NeoForge,
+        lv,
+        &url,
+    )
+    .await
 }
 
 async fn install_folia(
@@ -2881,4 +3056,43 @@ pub async fn get_pregen_state(
     state: &crate::app_state::AppState,
 ) -> Result<crate::app_state::PregenState, String> {
     Ok(state.pregen.lock().await.clone())
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+
+    #[test]
+    fn staged_runtimes_remain_isolated_for_same_loader_version() {
+        let root =
+            std::env::temp_dir().join(format!("lbby-profile-isolation-{}", uuid::Uuid::new_v4()));
+        let profile_a = root.join("profiles/a/server");
+        let profile_b = root.join("profiles/b/server");
+        let stage_a = root.join("stage-a");
+        let stage_b = root.join("stage-b");
+        for dir in [&profile_a, &profile_b, &stage_a, &stage_b] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(profile_a.join("world-a.marker"), "a").unwrap();
+        std::fs::write(profile_b.join("world-b.marker"), "b").unwrap();
+        std::fs::write(stage_a.join("run.sh"), "profile-a").unwrap();
+        std::fs::write(stage_b.join("run.sh"), "profile-b").unwrap();
+
+        commit_modloader_runtime(&stage_a, &profile_a).unwrap();
+        commit_modloader_runtime(&stage_b, &profile_b).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(profile_a.join("run.sh")).unwrap(),
+            "profile-a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(profile_b.join("run.sh")).unwrap(),
+            "profile-b"
+        );
+        assert!(profile_a.join("world-a.marker").exists());
+        assert!(profile_b.join("world-b.marker").exists());
+        assert!(!profile_a.join("world-b.marker").exists());
+        assert!(!profile_b.join("world-a.marker").exists());
+        std::fs::remove_dir_all(root).ok();
+    }
 }

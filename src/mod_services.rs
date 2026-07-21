@@ -1200,7 +1200,7 @@ fn ensure_server_properties(root: &Path, server_name: &str) -> Result<(), String
         props.push_str(&format!("\nmotd={}\n", server_name));
     }
     if !props.lines().any(|l| l.starts_with("online-mode=")) {
-        props.push_str("online-mode=false\n");
+        props.push_str("online-mode=true\n");
     }
     std::fs::write(&path, props).map_err(|e| e.to_string())
 }

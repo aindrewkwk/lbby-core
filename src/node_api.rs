@@ -24,7 +24,7 @@ use crate::app_state::{AppEventSender, AppState};
 pub struct MinecraftSpec {
     /// Minecraft version, e.g. "1.21.4"
     pub minecraft_version: String,
-    /// Server distribution: "paper", "vanilla", "forge", "fabric", "folia", "purpur"
+    /// Server distribution: "paper", "vanilla", "forge", "neoforge", or "folia"
     pub distribution: String,
     /// Loader/build version (Paper build number, Forge version, etc.)
     /// If None, uses latest.
@@ -134,11 +134,11 @@ fn noop_event_sender() -> Arc<AppEventSender> {
 
 /// Prepare a Minecraft server instance:
 /// 1. Ensure Java is available (find or download)
-/// 2. Download the server jar for the specified distribution
+/// 2. Download/install the runtime for the specified distribution
 /// 3. Write eula.txt and server.properties
 /// 4. Return the prepared instance metadata
 ///
-/// This is idempotent — if the server jar already exists, it won't re-download.
+/// This is idempotent — valid existing runtime files are reused.
 pub async fn prepare_minecraft(
     spec: &MinecraftSpec,
     instance_dir: &Path,
@@ -159,9 +159,24 @@ pub async fn prepare_minecraft(
 
     let java_major = crate::java::detect_java_major(&java_bin).unwrap_or(required_major);
 
-    // Download server jar if not present
+    // Prepare the distribution runtime. Modern Forge/NeoForge installations are
+    // script-based and intentionally do not create a root server.jar.
     let server_jar = instance_dir.join("server.jar");
-    if !server_jar.exists()
+    if let Some((kind, version_key, installer_url)) = modloader_details(spec)? {
+        if crate::forge::detect_modloader_launch(instance_dir, kind, &version_key).is_err() {
+            crate::server::install_modloader_transactional(
+                &app,
+                &java_bin,
+                instance_dir,
+                kind,
+                &version_key,
+                &installer_url,
+            )
+            .await
+            .map_err(NodeApiError::DownloadFailed)?;
+        }
+        upsert_node_jvm_args(instance_dir, spec)?;
+    } else if !server_jar.exists()
         || tokio::fs::metadata(&server_jar)
             .await
             .map(|m| m.len())
@@ -174,12 +189,18 @@ pub async fn prepare_minecraft(
     // Write eula.txt
     tokio::fs::write(instance_dir.join("eula.txt"), "eula=true\n").await?;
 
-    // Write server.properties
-    let props = format!(
-        "online-mode=false\nmax-players={}\nmotd={}\nserver-port={}\nview-distance=8\nsimulation-distance=6\n",
-        spec.max_players, spec.server_name, spec.game_port
+    // Preserve user-managed values and default new servers to authenticated mode.
+    let properties_path = instance_dir.join("server.properties");
+    let existing = tokio::fs::read_to_string(&properties_path).await.ok();
+    let props = crate::minecraft_properties::merge_server_properties(
+        existing.as_deref(),
+        spec.max_players,
+        &spec.server_name,
+        spec.game_port,
+        8,
+        6,
     );
-    tokio::fs::write(instance_dir.join("server.properties"), props).await?;
+    tokio::fs::write(properties_path, props).await?;
 
     // Create plugins or mods directory based on distribution
     let extras_dir = match spec.distribution.as_str() {
@@ -214,16 +235,37 @@ pub async fn start_minecraft(
 ) -> Result<tokio::process::Child, NodeApiError> {
     use tokio::process::Command;
 
-    let mut cmd = Command::new(&prepared.java_bin);
-    cmd.arg(format!("-Xmx{}M", spec.ram_mb));
-    cmd.arg(format!("-Xms{}M", (spec.ram_mb / 2).max(512)));
-
-    // Add optimized JVM flags for Minecraft
-    if spec.ram_mb >= 1024 {
-        cmd.args(crate::server::optimized_jvm_flags());
-    }
-
-    cmd.args(["-jar", "server.jar", "nogui"]);
+    let mut cmd = if let Some((kind, version_key, _)) = modloader_details(spec)? {
+        match crate::forge::detect_modloader_launch(&prepared.instance_dir, kind, &version_key)
+            .map_err(NodeApiError::ProcessError)?
+        {
+            crate::forge::ModLoaderLaunch::Script(_) => {
+                #[cfg(target_os = "windows")]
+                {
+                    let mut command = Command::new("cmd");
+                    command.args(["/C", "run.bat", "nogui"]);
+                    command
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let mut command = Command::new("sh");
+                    command.args(["run.sh", "nogui"]);
+                    command
+                }
+            }
+            crate::forge::ModLoaderLaunch::LegacyJar(path) => {
+                let mut command = Command::new(&prepared.java_bin);
+                add_node_jvm_args(&mut command, spec);
+                command.args(["-jar", path.to_string_lossy().as_ref(), "nogui"]);
+                command
+            }
+        }
+    } else {
+        let mut command = Command::new(&prepared.java_bin);
+        add_node_jvm_args(&mut command, spec);
+        command.args(["-jar", "server.jar", "nogui"]);
+        command
+    };
     cmd.current_dir(&prepared.instance_dir);
 
     // Piped I/O for console interaction
@@ -246,6 +288,91 @@ pub async fn start_minecraft(
 
     let child = cmd.spawn().map_err(NodeApiError::Io)?;
     Ok(child)
+}
+
+fn modloader_details(
+    spec: &MinecraftSpec,
+) -> Result<Option<(crate::forge::ModLoaderKind, String, String)>, NodeApiError> {
+    let loader = match spec.distribution.as_str() {
+        "forge" | "neoforge" => spec.loader_version.as_deref().ok_or_else(|| {
+            NodeApiError::MissingField(format!(
+                "loader_version is required for {}",
+                spec.distribution
+            ))
+        })?,
+        _ => return Ok(None),
+    };
+    if spec.distribution == "forge" {
+        let version_key = if loader.starts_with(&format!("{}-", spec.minecraft_version)) {
+            loader.to_string()
+        } else {
+            format!("{}-{loader}", spec.minecraft_version)
+        };
+        let url = format!(
+            "https://maven.minecraftforge.net/net/minecraftforge/forge/{0}/forge-{0}-installer.jar",
+            version_key
+        );
+        Ok(Some((crate::forge::ModLoaderKind::Forge, version_key, url)))
+    } else {
+        let url = format!(
+            "https://maven.neoforged.net/releases/net/neoforged/neoforge/{0}/neoforge-{0}-installer.jar",
+            loader
+        );
+        Ok(Some((
+            crate::forge::ModLoaderKind::NeoForge,
+            loader.to_string(),
+            url,
+        )))
+    }
+}
+
+fn add_node_jvm_args(command: &mut tokio::process::Command, spec: &MinecraftSpec) {
+    command.arg(format!("-Xmx{}M", spec.ram_mb));
+    command.arg(format!("-Xms{}M", (spec.ram_mb / 2).max(512)));
+    if spec.ram_mb >= 1024 {
+        command.args(crate::server::optimized_jvm_flags());
+    }
+}
+
+fn upsert_node_jvm_args(instance_dir: &Path, spec: &MinecraftSpec) -> Result<(), NodeApiError> {
+    let path = instance_dir.join("user_jvm_args.txt");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let start = "# Lbby managed JVM flags - start";
+    let end = "# Lbby managed JVM flags - end";
+    let mut kept = Vec::new();
+    let mut skipping = false;
+    for line in existing.lines() {
+        if line.trim() == start {
+            skipping = true;
+        } else if line.trim() == end {
+            skipping = false;
+        } else if !skipping {
+            kept.push(line);
+        }
+    }
+    let mut managed = vec![
+        start.to_string(),
+        format!("-Xmx{}M", spec.ram_mb),
+        format!("-Xms{}M", (spec.ram_mb / 2).max(512)),
+    ];
+    if spec.ram_mb >= 1024 {
+        managed.extend(
+            crate::server::optimized_jvm_flags()
+                .iter()
+                .map(|value| value.to_string()),
+        );
+    }
+    managed.push(end.to_string());
+    while kept.last().is_some_and(|line| line.trim().is_empty()) {
+        kept.pop();
+    }
+    let mut output = managed.join("\n");
+    if !kept.is_empty() {
+        output.push_str("\n\n");
+        output.push_str(&kept.join("\n"));
+    }
+    output.push('\n');
+    std::fs::write(path, output).map_err(NodeApiError::Io)
 }
 
 /// Send a graceful stop command ("stop") to a Minecraft server's stdin.
@@ -499,7 +626,7 @@ async fn download_server_jar(
         }
         other => {
             return Err(NodeApiError::UnsupportedDistribution(
-                format!("Distribution '{}' not yet supported via node_api. Supported: paper, folia, vanilla", other)
+                format!("Distribution '{}' not yet supported via node_api. Supported: paper, folia, vanilla, forge, neoforge", other)
             ));
         }
     }
@@ -521,4 +648,51 @@ async fn download_server_jar(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forge_details_normalize_loader_version() {
+        let spec = MinecraftSpec {
+            minecraft_version: "1.20.1".into(),
+            distribution: "forge".into(),
+            loader_version: Some("47.4.10".into()),
+            ..MinecraftSpec::default()
+        };
+        let (_, version, url) = modloader_details(&spec).unwrap().unwrap();
+        assert_eq!(version, "1.20.1-47.4.10");
+        assert!(url.ends_with("forge-1.20.1-47.4.10-installer.jar"));
+    }
+
+    #[test]
+    fn modloader_requires_explicit_loader_version() {
+        let spec = MinecraftSpec {
+            distribution: "neoforge".into(),
+            loader_version: None,
+            ..MinecraftSpec::default()
+        };
+        assert!(matches!(
+            modloader_details(&spec),
+            Err(NodeApiError::MissingField(_))
+        ));
+    }
+
+    #[test]
+    fn node_jvm_args_preserve_user_lines() {
+        let dir = std::env::temp_dir().join(format!("lbby-node-jvm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("user_jvm_args.txt"), "-Duser.setting=true\n").unwrap();
+        let spec = MinecraftSpec {
+            ram_mb: 3072,
+            ..MinecraftSpec::default()
+        };
+        upsert_node_jvm_args(&dir, &spec).unwrap();
+        let contents = std::fs::read_to_string(dir.join("user_jvm_args.txt")).unwrap();
+        assert!(contents.contains("-Xmx3072M"));
+        assert!(contents.contains("-Duser.setting=true"));
+        std::fs::remove_dir_all(dir).ok();
+    }
 }
