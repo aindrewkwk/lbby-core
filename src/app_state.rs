@@ -38,6 +38,37 @@ impl Default for OperationKind {
     }
 }
 
+/// RAII guard for safety-critical operations. Acquisition fails immediately
+/// when another operation owns the coordinator; dropping the guard always
+/// resets the state, including early-return and error paths.
+pub struct OperationGuard<'a> {
+    guard: tokio::sync::MutexGuard<'a, OperationKind>,
+}
+
+impl<'a> OperationGuard<'a> {
+    pub async fn acquire(
+        operation: &'a Mutex<OperationKind>,
+        kind: OperationKind,
+    ) -> Result<Self, String> {
+        let mut guard = operation
+            .try_lock()
+            .map_err(|_| "Another operation is already in progress".to_string())?;
+        if *guard != OperationKind::None {
+            return Err(format!(
+                "Another operation is already in progress: {guard:?}"
+            ));
+        }
+        *guard = kind;
+        Ok(Self { guard })
+    }
+}
+
+impl Drop for OperationGuard<'_> {
+    fn drop(&mut self) {
+        *self.guard = OperationKind::None;
+    }
+}
+
 #[derive(Default, Clone, Serialize)]
 pub struct PregenState {
     pub running: bool,
@@ -184,5 +215,29 @@ impl AppEventSender {
 
     pub fn state(&self) -> Arc<AppState> {
         self.state.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn operation_guard_rejects_overlap_and_resets_on_drop() {
+        let operation = Mutex::new(OperationKind::None);
+        let guard = OperationGuard::acquire(&operation, OperationKind::Starting)
+            .await
+            .unwrap();
+        assert!(
+            OperationGuard::acquire(&operation, OperationKind::BackingUp)
+                .await
+                .is_err()
+        );
+        drop(guard);
+        assert!(
+            OperationGuard::acquire(&operation, OperationKind::BackingUp)
+                .await
+                .is_ok()
+        );
     }
 }

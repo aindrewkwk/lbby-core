@@ -269,6 +269,17 @@ pub fn restore_server_backup(
     Ok(count)
 }
 
+/// Compatibility entry point used by desktop clients. The primary restore
+/// implementation is already transactional; keep the explicit name so older
+/// and modularized callers share the same safe behavior.
+pub fn restore_server_backup_transactional(
+    app: &std::sync::Arc<crate::app_state::AppEventSender>,
+    zip_path: &Path,
+    server_path: &Path,
+) -> Result<u64, String> {
+    restore_server_backup(app, zip_path, server_path)
+}
+
 /// Extract a ZIP archive into the given directory. Returns the file count.
 /// Safety: rejects entries with absolute paths or `..` components (zip-slip).
 fn extract_zip_to_dir(
