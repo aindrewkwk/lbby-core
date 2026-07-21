@@ -20,13 +20,63 @@ const MAX_RESTARTS_IN_WINDOW: usize = 3;
 #[serde(rename_all = "lowercase")]
 pub enum ServerStatus {
     Stopped,
+    Installing,
+    DownloadingJava,
+    DownloadingJar,
+    Preparing,
     Starting,
     Running,
     Stopping,
+    Restarting,
+    Error,
+}
+
+impl ServerStatus {
+    /// Whether the server can be started from this state.
+    pub fn can_start(&self) -> bool {
+        matches!(self, Self::Stopped | Self::Error)
+    }
+
+    /// Whether the server can be stopped from this state.
+    pub fn can_stop(&self) -> bool {
+        matches!(self, Self::Running | Self::Starting | Self::Restarting)
+    }
+
+    /// Whether the server is busy with a non-interruptible operation.
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            Self::Installing
+                | Self::DownloadingJava
+                | Self::DownloadingJar
+                | Self::Preparing
+                | Self::Starting
+                | Self::Stopping
+                | Self::Restarting
+        )
+    }
+
+    /// Human-readable label for the current status.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Stopped => "Stopped",
+            Self::Installing => "Installing",
+            Self::DownloadingJava => "Downloading Java",
+            Self::DownloadingJar => "Downloading Server",
+            Self::Preparing => "Preparing",
+            Self::Starting => "Starting",
+            Self::Running => "Running",
+            Self::Stopping => "Stopping",
+            Self::Restarting => "Restarting",
+            Self::Error => "Error",
+        }
+    }
 }
 
 pub struct ServerManager {
     pub status: ServerStatus,
+    /// Human-readable detail for the current status (e.g. "Downloading Java 21...").
+    pub status_detail: Option<String>,
     pub stdin: Option<ChildStdin>,
     pub pid: Option<u32>,
     /// True when the user explicitly clicked Stop (or Restart). False when the
@@ -49,6 +99,7 @@ impl ServerManager {
     pub fn new() -> Self {
         Self {
             status: ServerStatus::Stopped,
+            status_detail: None,
             stdin: None,
             pid: None,
             stop_requested: false,
@@ -56,6 +107,12 @@ impl ServerManager {
             server_dir: None,
             restart_generation: 0,
         }
+    }
+
+    /// Transition to a new status, setting the detail message.
+    pub fn set_status(&mut self, status: ServerStatus, detail: Option<String>) {
+        self.status = status;
+        self.status_detail = detail;
     }
 }
 
@@ -68,14 +125,25 @@ pub fn start_server(
     app: Arc<AppEventSender>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
     Box::pin(async move {
+        // Guard: only start from Stopped or Error states
+        {
+            let state = app.state();
+            let srv = state.server.lock().await;
+            if !srv.status.can_start() {
+                return Err(format!(
+                    "Cannot start: server is {}",
+                    srv.status.label()
+                ));
+            }
+        }
         let result = do_start_server(app.clone()).await;
         if result.is_err() {
             // If we set the status to Starting but the start failed, reset to
             // Stopped so the UI doesn't get stuck on "Starting" forever.
             let state = app.state();
             let mut srv = state.server.lock().await;
-            if srv.status == ServerStatus::Starting {
-                srv.status = ServerStatus::Stopped;
+            if srv.status == ServerStatus::Starting || srv.status == ServerStatus::DownloadingJava || srv.status == ServerStatus::DownloadingJar || srv.status == ServerStatus::Preparing {
+                srv.set_status(ServerStatus::Error, Some(result.clone().unwrap_err()));
                 srv.stdin = None;
                 srv.pid = None;
                 app.emit("server-status", ServerStatus::Stopped).ok();
@@ -723,6 +791,13 @@ async fn graceful_or_force_stop_server(
             }
             ServerStatus::Stopping => srv.pid,
             ServerStatus::Stopped => None,
+            // New granular states: no process to stop in these states
+            ServerStatus::Installing
+            | ServerStatus::DownloadingJava
+            | ServerStatus::DownloadingJar
+            | ServerStatus::Preparing
+            | ServerStatus::Restarting
+            | ServerStatus::Error => None,
         }
     };
 
