@@ -270,7 +270,8 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
     }
 
     // Pick the Java version that matches the Minecraft version
-    let required_major = crate::java::required_java_for_mc(&cfg.minecraft_version);
+    let server_type_str = format!("{:?}", cfg.server_type);
+    let required_major = crate::java::required_java_for_mc_with_loader(&cfg.minecraft_version, Some(&server_type_str));
     let resolved_java = crate::java::find_java_with_version(required_major);
     let (java_bin, actual_major) = match resolved_java {
         Some(p) => (p, Some(required_major)),
@@ -1767,7 +1768,8 @@ pub async fn do_install_server(
         // If download fails, fall back to system Java but verify its version
         // is sufficient — never silently use a too-old JVM (especially for
         // Forge/NeoForge which hang silently on version mismatch).
-        let required_major = crate::java::required_java_for_mc(&cfg.minecraft_version);
+        let server_type_str = format!("{:?}", cfg.server_type);
+        let required_major = crate::java::required_java_for_mc_with_loader(&cfg.minecraft_version, Some(&server_type_str));
         cfg.java_path = match crate::java::ensure_java(required_major, &app).await {
             Ok(path) => path.to_string_lossy().to_string(),
             Err(download_err) => {

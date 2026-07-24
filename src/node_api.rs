@@ -147,7 +147,7 @@ pub async fn prepare_minecraft(
     tokio::fs::create_dir_all(instance_dir).await?;
 
     // Resolve Java version
-    let required_major = crate::java::required_java_for_mc(&spec.minecraft_version);
+    let required_major = crate::java::required_java_for_mc_with_loader(&spec.minecraft_version, Some(&spec.distribution));
     let app = noop_event_sender();
 
     let java_bin = match crate::java::find_java_with_version(required_major) {

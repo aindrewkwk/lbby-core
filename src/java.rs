@@ -8,6 +8,19 @@ use serde::Deserialize;
 /// Map a Minecraft version like "1.20.1" to the Java major version that should run it.
 /// Conservative — picks the highest Java the version is well-tested with.
 pub fn required_java_for_mc(mc_version: &str) -> u8 {
+    required_java_for_mc_with_loader(mc_version, None)
+}
+
+/// Returns the required Java major version for a given Minecraft version and server type.
+/// NeoForge requires Java 21 regardless of MC version.
+pub fn required_java_for_mc_with_loader(mc_version: &str, server_type: Option<&str>) -> u8 {
+    // NeoForge requires Java 21+ for all versions
+    if let Some(st) = server_type {
+        if st.eq_ignore_ascii_case("neoforge") {
+            return 21;
+        }
+    }
+
     // Parse "1.X.Y" → minor = X
     let minor = mc_version
         .strip_prefix("1.")
