@@ -46,8 +46,8 @@ pub async fn run(on_tier_change: Option<Arc<Mutex<dyn FnMut() + Send>>>) {
     loop {
         let cfg = config::load_config();
 
-        // Bail out if dashboard sync is not configured
-        if cfg.app_token.is_empty() || cfg.heartbeat_interval_secs == 0 {
+        // Bail out if heartbeat is disabled
+        if cfg.heartbeat_interval_secs == 0 {
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             continue;
         }
