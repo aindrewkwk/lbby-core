@@ -121,13 +121,14 @@ async fn send_heartbeat(cfg: &config::ServerConfig) -> Result<HeartbeatResponse,
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let resp = client
+    let mut req = client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", cfg.app_token))
         .header("Content-Type", "application/json")
-        .json(&payload)
-        .send()
-        .await
+        .json(&payload);
+    if !cfg.app_token.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", cfg.app_token));
+    }
+    let resp = req.send().await
         .map_err(|e| format!("Request failed: {}", e))?;
 
     if !resp.status().is_success() {
