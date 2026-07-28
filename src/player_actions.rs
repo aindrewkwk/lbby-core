@@ -108,22 +108,15 @@ fn nbt_to_json(val: &fastnbt::Value) -> serde_json::Value {
     }
 }
 
-fn nbt_get<'a>(
-    compound: &'a HashMap<String, fastnbt::Value>,
-    key: &str,
-) -> Option<&'a fastnbt::Value> {
-    compound.get(key)
-}
-
 fn nbt_str(compound: &HashMap<String, fastnbt::Value>, key: &str) -> Option<String> {
-    match nbt_get(compound, key)? {
+    match compound.get(key)? {
         fastnbt::Value::String(s) => Some(s.clone()),
         _ => None,
     }
 }
 
 fn nbt_i32(compound: &HashMap<String, fastnbt::Value>, key: &str) -> Option<i32> {
-    match nbt_get(compound, key)? {
+    match compound.get(key)? {
         fastnbt::Value::Int(v) => Some(*v),
         fastnbt::Value::Short(v) => Some(*v as i32),
         fastnbt::Value::Byte(v) => Some(*v as i32),
@@ -132,7 +125,7 @@ fn nbt_i32(compound: &HashMap<String, fastnbt::Value>, key: &str) -> Option<i32>
 }
 
 fn nbt_i64(compound: &HashMap<String, fastnbt::Value>, key: &str) -> Option<i64> {
-    match nbt_get(compound, key)? {
+    match compound.get(key)? {
         fastnbt::Value::Long(v) => Some(*v),
         fastnbt::Value::Int(v) => Some(*v as i64),
         fastnbt::Value::Short(v) => Some(*v as i64),
@@ -142,14 +135,14 @@ fn nbt_i64(compound: &HashMap<String, fastnbt::Value>, key: &str) -> Option<i64>
 }
 
 fn nbt_f32(compound: &HashMap<String, fastnbt::Value>, key: &str) -> Option<f32> {
-    match nbt_get(compound, key)? {
+    match compound.get(key)? {
         fastnbt::Value::Float(v) => Some(*v),
         _ => None,
     }
 }
 
 fn nbt_f64(compound: &HashMap<String, fastnbt::Value>, key: &str) -> Option<f64> {
-    match nbt_get(compound, key)? {
+    match compound.get(key)? {
         fastnbt::Value::Double(v) => Some(*v),
         fastnbt::Value::Float(v) => Some(*v as f64),
         _ => None,
@@ -160,7 +153,7 @@ fn nbt_list<'a>(
     compound: &'a HashMap<String, fastnbt::Value>,
     key: &str,
 ) -> Option<&'a Vec<fastnbt::Value>> {
-    match nbt_get(compound, key)? {
+    match compound.get(key)? {
         fastnbt::Value::List(v) => Some(v),
         _ => None,
     }
@@ -170,7 +163,7 @@ fn nbt_compound<'a>(
     compound: &'a HashMap<String, fastnbt::Value>,
     key: &str,
 ) -> Option<&'a HashMap<String, fastnbt::Value>> {
-    match nbt_get(compound, key)? {
+    match compound.get(key)? {
         fastnbt::Value::Compound(v) => Some(v),
         _ => None,
     }
@@ -275,8 +268,10 @@ fn read_player_dat(
     server_path: &Path,
     uuid: &str,
 ) -> Result<HashMap<String, fastnbt::Value>, String> {
+    // Use resolve_world_name to handle custom world names (not always "world").
+    let world_name = config::resolve_world_name(server_path);
     let dat_path = server_path
-        .join("world")
+        .join(&world_name)
         .join("playerdata")
         .join(format!("{}.dat", uuid));
     if !dat_path.exists() {
@@ -351,7 +346,7 @@ fn parse_effects(effects: &[fastnbt::Value]) -> Vec<ActiveEffect> {
             let id = nbt_str(c, "Id").unwrap_or_else(|| "unknown".into());
             let amplifier = nbt_i32(c, "Amplifier").unwrap_or(0);
             let duration = nbt_i32(c, "Duration").unwrap_or(0);
-            let ambient = nbt_get(c, "Ambient")
+            let ambient = c.get("Ambient")
                 .and_then(|v| match v {
                     fastnbt::Value::Byte(b) => Some(*b != 0),
                     _ => None,
@@ -384,9 +379,11 @@ pub fn get_player_full_data(name: String) -> Result<PlayerData, String> {
     let server_path = get_server_path()?;
     let uuid = resolve_uuid(&name, &server_path)?;
 
+    // Use resolve_world_name to handle custom world names (not always "world").
+    let world_name = config::resolve_world_name(&server_path);
     // Check player data cache (invalidated on file mtime change)
     let dat_path = server_path
-        .join("world")
+        .join(&world_name)
         .join("playerdata")
         .join(format!("{}.dat", uuid));
     let dat_mtime = std::fs::metadata(&dat_path)
@@ -525,9 +522,11 @@ pub fn get_player_inventory_only(name: String) -> Result<Vec<InventorySlot>, Str
     let server_path = get_server_path()?;
     let uuid = resolve_uuid(&name, &server_path)?;
 
+    // Use resolve_world_name to handle custom world names (not always "world").
+    let world_name = config::resolve_world_name(&server_path);
     // Check cache — reuse full player data if available
     let dat_path = server_path
-        .join("world")
+        .join(&world_name)
         .join("playerdata")
         .join(format!("{}.dat", uuid));
     let dat_mtime = std::fs::metadata(&dat_path)

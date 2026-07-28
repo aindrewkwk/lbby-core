@@ -199,6 +199,7 @@ pub async fn prepare_minecraft(
         spec.game_port,
         8,
         6,
+        None,
     );
     tokio::fs::write(properties_path, props).await?;
 

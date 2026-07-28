@@ -341,12 +341,6 @@ fn is_plugin_loader(st: &ServerType) -> bool {
     )
 }
 
-/// Whether this server type is a Terraria type (not compatible with Modrinth/CurseForge).
-#[allow(dead_code)]
-fn is_terraria_type(st: &ServerType) -> bool {
-    matches!(st, ServerType::Terraria | ServerType::TModLoader)
-}
-
 async fn latest_modrinth_version(
     project_id: &str,
     cfg: &ServerConfig,
@@ -1099,17 +1093,40 @@ pub async fn install_curseforge_modpack(
     app: std::sync::Arc<crate::app_state::AppEventSender>,
     zip_path: String,
 ) -> Result<ServerConfig, String> {
-    let api_key = config::load_config().curseforge_api_key;
-    if api_key.trim().is_empty() {
-        return Err(
-            "CurseForge modpack install requires a CurseForge API key. Add it in Settings first."
-                .to_string(),
-        );
-    }
     let file = std::fs::File::open(&zip_path).map_err(|e| e.to_string())?;
     let mut zip =
         zip::ZipArchive::new(file).map_err(|e| format!("Invalid CurseForge ZIP: {}", e))?;
-    let manifest: CurseManifest = read_zip_json(&mut zip, "manifest.json")?;
+    let manifest_result: Result<CurseManifest, String> = read_zip_json(&mut zip, "manifest.json");
+    if manifest_result.is_err() {
+        // No manifest.json = server pack. Extract directly to server directory.
+        eprintln!("[lbby] No manifest.json found — treating as server pack, extracting directly");
+        let mut cfg = config::load_config();
+        if let Ok(root) = server_dir(&cfg) {
+            backup_modpack_targets(&root)?;
+        }
+        let cfg2 = prepare_modpack_server(&app, cfg).await?;
+        let root = server_dir(&cfg2)?;
+        let total = zip.len() as u32;
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+            let outpath = root.join(entry.mangled_name());
+            if entry.is_dir() {
+                std::fs::create_dir_all(&outpath).ok();
+            } else {
+                if let Some(parent) = outpath.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                let mut outfile = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
+                std::io::copy(&mut entry, &mut outfile).map_err(|e| e.to_string())?;
+            }
+            if i % 50 == 0 || i + 1 == total as usize {
+                emit_mod_progress(&app, "Extracting server pack", &format!("{}/{} files", i + 1, total), (i + 1) as u32, total);
+            }
+        }
+        eprintln!("[lbby] Server pack extracted {} files to {}", total, root.display());
+        return Ok(cfg2);
+    }
+    let manifest = manifest_result.unwrap();
     let (server_type, loader_version) = loader_from_curse(&manifest.minecraft.mod_loaders)?;
     let mut cfg = config::load_config();
     if let Ok(root) = server_dir(&cfg) {
@@ -1144,7 +1161,6 @@ pub async fn install_curseforge_modpack(
                 "https://api.curseforge.com/v1/mods/{}/files/{}/download-url",
                 item.project_id, item.file_id
             ))
-            .header("x-api-key", api_key.trim())
             .send()
             .await
             .map_err(|e| e.to_string())?
@@ -1546,4 +1562,167 @@ pub async fn remove_all_mods() -> Result<u32, String> {
         removed += 1;
     }
     Ok(removed)
+}
+
+/// Information about a missing dependency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissingDependency {
+    pub mod_id: String,
+    pub version_range: String,
+    pub source_mod: String,
+}
+
+/// Scan installed mods for missing dependencies. Returns a list of missing deps.
+pub fn scan_missing_dependencies() -> Vec<MissingDependency> {
+    let cfg = config::load_config();
+    let Ok(target_dir) = mods_dir(&cfg) else {
+        return Vec::new();
+    };
+    let mut installed_ids = HashSet::new();
+    let mut installed_files = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&target_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "jar") {
+                installed_files.push(path);
+            }
+        }
+    }
+
+    for path in &installed_files {
+        let info = crate::helpers::read_mod_info(path);
+        if !info.display_name.is_empty() {
+            installed_ids.insert(info.display_name.to_lowercase());
+        }
+        let file_stem = path.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        installed_ids.insert(file_stem.to_lowercase());
+    }
+
+    let mut missing = Vec::new();
+    for path in &installed_files {
+        let info = crate::helpers::read_mod_info(path);
+        let source_mod = info.display_name.clone();
+
+        let deps = crate::helpers::read_forge_dependencies(path);
+        for (mod_id, version_range) in deps {
+            if !installed_ids.contains(&mod_id.to_lowercase()) {
+                missing.push(MissingDependency { mod_id, version_range, source_mod: source_mod.clone() });
+            }
+        }
+        let deps = crate::helpers::read_fabric_dependencies(path);
+        for (mod_id, version_range) in deps {
+            if !installed_ids.contains(&mod_id.to_lowercase()) {
+                missing.push(MissingDependency { mod_id, version_range, source_mod: source_mod.clone() });
+            }
+        }
+    }
+
+    missing.sort_by(|a, b| a.mod_id.cmp(&b.mod_id));
+    missing.dedup_by(|a, b| a.mod_id == b.mod_id);
+    missing
+}
+
+/// Install specific missing dependencies by mod_id using Modrinth API.
+pub async fn install_missing_dependencies(
+    app: std::sync::Arc<crate::app_state::AppEventSender>,
+    mod_ids: Vec<String>,
+) -> Result<u32, String> {
+    let cfg = config::load_config();
+    let target_dir = mods_dir(&cfg)?;
+    let mc_version = &cfg.minecraft_version;
+    let loader = match cfg.server_type {
+        crate::config::ServerType::NeoForge => "neoforge".to_string(),
+        crate::config::ServerType::Forge => "forge".to_string(),
+        crate::config::ServerType::Fabric => "fabric".to_string(),
+        _ => format!("{:?}", cfg.server_type).to_lowercase(),
+    };
+    let client = client()?;
+    let mut installed = 0u32;
+    let total = mod_ids.len();
+
+    for (i, mod_id) in mod_ids.iter().enumerate() {
+        emit_mod_progress(&app, "Installing dependencies", &format!("{}/{}: {}", i + 1, total, mod_id), (i + 1) as u32, total as u32);
+
+        let search_url = format!(
+            "https://api.modrinth.com/v2/search?query={}",
+            urlencoding::encode(mod_id)
+        );
+        eprintln!("[lbby] install_missing_deps: searching Modrinth for '{}' url='{}'", mod_id, search_url);
+        let resp = client.get(&search_url).timeout(std::time::Duration::from_secs(15)).send().await;
+        let Ok(resp) = resp else {
+            eprintln!("[lbby] install_missing_deps: search request failed for {}", mod_id);
+            continue;
+        };
+        let body = resp.text().await.unwrap_or_default();
+        eprintln!("[lbby] install_missing_deps: search response for {}: {} chars | first 200: {}", mod_id, body.len(), &body[..body.len().min(200)]);
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&body) else {
+            eprintln!("[lbby] install_missing_deps: JSON parse failed for {} (first 200: {})", mod_id, &body[..body.len().min(200)]);
+            continue;
+        };
+
+        let Some(hits) = data["hits"].as_array() else {
+            eprintln!("[lbby] install_missing_deps: no hits array for {}", mod_id);
+            continue;
+        };
+        eprintln!("[lbby] install_missing_deps: found {} hits for {}", hits.len(), mod_id);
+        // Flexible matching: remove all separators and compare
+        let normalized_id = mod_id.replace('_', "-").to_lowercase();
+        let strip_seps = |s: &str| s.replace(|c: char| c == '-' || c == '_' || c == ' ', "").to_lowercase();
+        let mid_clean = strip_seps(mod_id);
+        let matching = if hits.len() == 1 {
+            // Only 1 result from search = likely the right mod
+            eprintln!("[lbby]   auto-selecting only hit for {}", mod_id);
+            hits.first()
+        } else {
+            hits.iter().find(|h| {
+                let slug = h["slug"].as_str().unwrap_or("").to_lowercase();
+                let title = h["title"].as_str().unwrap_or("").to_lowercase();
+                let mid = mod_id.to_lowercase();
+                let slug_clean = strip_seps(&slug);
+                slug == mid
+                    || slug == normalized_id
+                    || slug.replace('-', "_") == mid
+                    || slug_clean == mid_clean
+                    || title.contains(&mid)
+                    || mid.contains(&slug)
+            })
+        };
+        let Some(hit) = matching else {
+            eprintln!("[lbby] install_missing_deps: no match for {} (tried slug, normalized, title)", mod_id);
+            continue;
+        };
+        let project_id = hit["project_id"].as_str().unwrap_or("");
+        if project_id.is_empty() { continue; }
+
+        let game_versions = format!("[\"{}\"]", mc_version);
+        let loaders = format!("[\"{}\"]", loader);
+        let versions_url = format!(
+            "https://api.modrinth.com/v2/project/{}/version?game_versions={}&loaders={}",
+            project_id, game_versions, loaders
+        );
+        let versions_resp = client.get(&versions_url).timeout(std::time::Duration::from_secs(15)).send().await;
+        let Ok(versions_resp) = versions_resp else { continue; };
+        let versions_body = versions_resp.text().await.unwrap_or_default();
+        let Ok(versions) = serde_json::from_str::<serde_json::Value>(&versions_body) else { continue; };
+        let Some(version_list) = versions.as_array() else { continue; };
+        let Some(version) = version_list.first() else { continue; };
+
+        let Some(files) = version["files"].as_array() else { continue; };
+        let Some(file) = files.first() else { continue; };
+        let download_url = file["url"].as_str().unwrap_or("");
+        let default_name = format!("{}.jar", mod_id);
+        let file_name = file["filename"].as_str().unwrap_or(&default_name);
+        if download_url.is_empty() { continue; }
+
+        let dest = target_dir.join(file_name);
+        if download_bytes_to_file(&app, download_url, &dest, "Installing dependencies", file_name, (i + 1) as u32, total as u32).await.is_ok() {
+            installed += 1;
+        }
+    }
+
+    emit_mod_progress(&app, "Done", &format!("Installed {} dependencies", installed), total as u32, total as u32);
+    Ok(installed)
 }

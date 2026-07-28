@@ -16,7 +16,7 @@ fn default_terraria_world_size() -> u8 {
     2 // medium
 }
 fn default_dashboard_url() -> String {
-    "https://web.rstudio.live".to_string()
+    "https://web.lbby.net".to_string()
 }
 fn default_heartbeat_interval() -> u64 {
     300 // 5 minutes
@@ -138,6 +138,8 @@ pub struct ServerConfig {
     pub java_path: String,
     pub minecraft_version: String,
     pub server_type: ServerType,
+    #[serde(default)]
+    pub curseforge_api_key: Option<String>,
     /// Forge / NeoForge / Fabric loader version, or Paper build number as string
     pub loader_version: Option<String>,
     pub ram_mb: u32,
@@ -188,9 +190,6 @@ pub struct ServerConfig {
     /// should auto-start on app launch (when remote_control_enabled is true).
     #[serde(default)]
     pub cloudflare_remote_enabled: bool,
-    /// Optional user-provided CurseForge API key. Required by CurseForge APIs.
-    #[serde(default)]
-    pub curseforge_api_key: String,
     // ── Terraria fields ────────────────────────────────────────────────────
     /// Terraria game version, e.g. "1.4.4.9". Only used when game is Terraria.
     #[serde(default)]
@@ -226,6 +225,12 @@ pub struct ServerConfig {
     /// JWT token for authenticating with the dashboard API.
     #[serde(default)]
     pub app_token: String,
+    /// Whether to enable online-mode (Mojang authentication) for the server.
+    /// When `Some(true)`, forces `online-mode=true` in server.properties.
+    /// When `Some(false)`, forces `online-mode=false`.
+    /// When `None`, preserves whatever the user has set (or defaults to `true`).
+    #[serde(default)]
+    pub online_mode: Option<bool>,
     /// Heartbeat interval in seconds. 0 = disabled.
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_secs: u64,

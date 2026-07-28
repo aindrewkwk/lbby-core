@@ -234,7 +234,7 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
             }
         }
     }
-    let ram = cfg.ram_mb;
+    let ram = if cfg.ram_mb < 512 { 4096 } else { cfg.ram_mb };
     if matches!(cfg.server_type, ServerType::Forge | ServerType::NeoForge) {
         upsert_managed_jvm_args(&server_dir, &cfg)?;
     }
@@ -1865,6 +1865,7 @@ pub async fn do_install_server(
             cfg.default_port(),
             view_distance,
             simulation_distance,
+            cfg.online_mode,
         );
         if !cfg.minecraft_seed.trim().is_empty()
             && !props.lines().any(|line| line.starts_with("level-seed="))

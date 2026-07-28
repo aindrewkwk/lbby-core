@@ -200,7 +200,9 @@ fn read_forge_mod_info<R: Read + std::io::Seek>(
     file_name: &str,
 ) -> Option<crate::app_state::ModInfo> {
     let text =
-        read_zip_text(zip, "META-INF/mods.toml").or_else(|| read_zip_text(zip, "mods.toml"))?;
+        read_zip_text(zip, "META-INF/neoforge.mods.toml")
+            .or_else(|| read_zip_text(zip, "META-INF/mods.toml"))
+            .or_else(|| read_zip_text(zip, "mods.toml"))?;
     let value: toml::Value = text.parse().ok()?;
     let mods = value.get("mods")?.as_array()?;
     let first = mods.first()?;
@@ -234,6 +236,75 @@ fn read_forge_mod_info<R: Read + std::io::Seek>(
         description,
         icon_data_url,
     })
+}
+
+/// Extract dependencies from a Forge mod JAR's META-INF/mods.toml.
+/// Returns a list of (mod_id, version_range) tuples.
+pub fn read_forge_dependencies(path: &std::path::Path) -> Vec<(String, String)> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(mut zip) = zip::ZipArchive::new(file) else {
+        return Vec::new();
+    };
+    let text = match read_zip_text(&mut zip, "META-INF/neoforge.mods.toml")
+        .or_else(|| read_zip_text(&mut zip, "META-INF/mods.toml"))
+        .or_else(|| read_zip_text(&mut zip, "mods.toml"))
+    {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    let Ok(value) = text.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    let Some(deps) = value.get("dependencies").and_then(|d| d.as_table()) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for (_key, dep_list) in deps {
+        if let Some(arr) = dep_list.as_array() {
+            for dep in arr {
+                let mod_id = dep.get("modId").and_then(|v| v.as_str()).unwrap_or("");
+                let version_range = dep.get("versionRange").and_then(|v| v.as_str()).unwrap_or("");
+                let mandatory = dep.get("mandatory").and_then(|v| v.as_bool()).unwrap_or(true);
+                let dep_type = dep.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let is_required = mandatory || dep_type.eq_ignore_ascii_case("required");
+                if is_required && !mod_id.is_empty() && mod_id != "forge" && mod_id != "neoforge" && mod_id != "minecraft" {
+                    result.push((mod_id.to_string(), version_range.to_string()));
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Extract dependencies from a Fabric mod JAR's fabric.mod.json.
+/// Returns a list of (mod_id, version_range) tuples.
+pub fn read_fabric_dependencies(path: &std::path::Path) -> Vec<(String, String)> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(mut zip) = zip::ZipArchive::new(file) else {
+        return Vec::new();
+    };
+    let text = match read_zip_text(&mut zip, "fabric.mod.json") {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(deps) = value.get("depends").and_then(|d| d.as_object()) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for (mod_id, version) in deps {
+        let version_str = version.as_str().unwrap_or("*");
+        if mod_id != "fabricloader" && mod_id != "fabric" && mod_id != "minecraft" {
+            result.push((mod_id.clone(), version_str.to_string()));
+        }
+    }
+    result
 }
 
 /// Read mod info from a JAR/ZIP file. Always returns a ModInfo — falls back
@@ -554,4 +625,78 @@ pub fn read_zip_icon_data_url<R: Read + std::io::Seek>(
         mime,
         base64::engine::general_purpose::STANDARD.encode(bytes)
     ))
+}
+
+#[cfg(test)]
+mod dep_tests {
+    use super::*;
+
+    #[test]
+    fn test_neoforge_dependency_parsing() {
+        // Test with a real neoforge.mods.toml
+        let test_toml = r#"
+modLoader="javafml"
+loaderVersion="[4,)"
+
+[[mods]]
+modId="testmod"
+displayName="Test Mod"
+
+[[dependencies.testmod]]
+    modId="neoforge"
+    type="required"
+    versionRange="[21.1.0,)"
+
+[[dependencies.testmod]]
+    modId="minecraft"
+    type="required"
+    versionRange="[1.21,)"
+
+[[dependencies.testmod]]
+    modId="create"
+    type="required"
+    versionRange="[6.0.9,)"
+
+[[dependencies.testmod]]
+    modId="curios"
+    mandatory=true
+    versionRange="[9.0.0,)"
+"#;
+
+        let value: toml::Value = test_toml.parse().unwrap();
+        let deps = value.get("dependencies").unwrap().as_table().unwrap();
+        
+        let mut result = Vec::new();
+        for (_key, dep_list) in deps {
+            if let Some(arr) = dep_list.as_array() {
+                for dep in arr {
+                    let mod_id = dep.get("modId").and_then(|v| v.as_str()).unwrap_or("");
+                    let version_range = dep.get("versionRange").and_then(|v| v.as_str()).unwrap_or("");
+                    let mandatory = dep.get("mandatory").and_then(|v| v.as_bool()).unwrap_or(true);
+                    let dep_type = dep.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let is_required = mandatory || dep_type.eq_ignore_ascii_case("required");
+                    if is_required && mod_id != "neoforge" && mod_id != "minecraft" {
+                        result.push((mod_id.to_string(), version_range.to_string()));
+                    }
+                }
+            }
+        }
+        
+        assert_eq!(result.len(), 2, "Should find create and curios as dependencies");
+        assert!(result.iter().any(|(id, _)| id == "create"), "Should find create");
+        assert!(result.iter().any(|(id, _)| id == "curios"), "Should find curios");
+    }
+}
+
+#[test]
+fn test_real_jar_dependencies() {
+    let jar_path = std::path::Path::new("/Users/cc-tienanh/Library/Application Support/lbby/profiles/f3fc661d91c3468aa3a67f024e13cf70/server/mods/irons_jewelry-1.21.1-1.6.1.1.jar");
+    if !jar_path.exists() {
+        println!("Test JAR not found, skipping");
+        return;
+    }
+    let deps = read_forge_dependencies(jar_path);
+    println!("irons_jewelry deps: {:?}", deps);
+    assert!(!deps.is_empty(), "Should find dependencies");
+    assert!(deps.iter().any(|(id, _)| id == "apothic_attributes"), "Should find apothic_attributes");
 }
