@@ -1126,7 +1126,7 @@ pub async fn install_curseforge_modpack(
     if manifest_result.is_err() {
         // No manifest.json = server pack. Extract directly to server directory.
         eprintln!("[lbby] No manifest.json found — treating as server pack, extracting directly");
-        let mut cfg = config::load_config();
+        let cfg = config::load_config();
         if let Ok(root) = server_dir(&cfg) {
             backup_modpack_targets(&root)?;
         }
