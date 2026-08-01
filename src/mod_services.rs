@@ -178,6 +178,29 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
+fn curseforge_client() -> Result<reqwest::Client, String> {
+    let api_key = config::load_config()
+        .curseforge_api_key
+        .filter(|key| !key.trim().is_empty())
+        .ok_or_else(|| {
+            "CurseForge client packs require an API key so Lbby can resolve their files. Add one in Mods > Modpacks, or choose the official server-pack ZIP instead."
+                .to_string()
+        })?;
+    reqwest::Client::builder()
+        .user_agent("Lbby/0.1.0 (Minecraft server hosting app)")
+        .default_headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                "x-api-key",
+                reqwest::header::HeaderValue::from_str(api_key.trim())
+                    .map_err(|_| "Invalid CurseForge API key".to_string())?,
+            );
+            headers
+        })
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 fn server_dir(cfg: &ServerConfig) -> Result<PathBuf, String> {
     if cfg.server_path.trim().is_empty() {
         return Err("Choose a server folder first.".to_string());
@@ -265,6 +288,17 @@ fn safe_extract_prefix<R: Read + Seek>(
         std::io::copy(&mut file, &mut output).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+fn apply_mrpack_overrides<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    dest: &Path,
+) -> Result<(), String> {
+    // `overrides` applies to both sides. Server-specific files must be applied
+    // afterwards so they win conflicts. `client-overrides` is intentionally
+    // never extracted into a dedicated server.
+    safe_extract_prefix(zip, "overrides", dest)?;
+    safe_extract_prefix(zip, "server-overrides", dest)
 }
 
 async fn download_bytes_to_file(
@@ -958,14 +992,6 @@ pub async fn install_modrinth_modpack(
         if file.env.get("server").is_some_and(|v| v == "unsupported") {
             continue;
         }
-        // Skip client-only mods: if the mod is marked as client-required
-        // but has no server env specified, it's a client-side mod (e.g.
-        // Sodium, Iris, shaders, minimap, etc.) that would crash a server.
-        let server_env = file.env.get("server").map(|s| s.as_str());
-        let client_env = file.env.get("client").map(|s| s.as_str());
-        if server_env.is_none() && client_env == Some("required") {
-            continue;
-        }
         let url = file
             .downloads
             .first()
@@ -990,7 +1016,7 @@ pub async fn install_modrinth_modpack(
         1,
         1,
     );
-    safe_extract_prefix(&mut zip, "overrides", &root)?;
+    apply_mrpack_overrides(&mut zip, &root)?;
     let quarantined = crate::mod_side::quarantine_client_only_mods(&root).await?;
     if !quarantined.is_empty() {
         emit_mod_progress(
@@ -1145,7 +1171,7 @@ pub async fn install_curseforge_modpack(
         .await
         .map_err(|e| e.to_string())?;
     let total = manifest.files.iter().filter(|f| f.required).count() as u32;
-    let cf = client()?;
+    let cf = curseforge_client()?;
     let mut current = 0;
     for item in manifest.files.iter().filter(|f| f.required) {
         current += 1;
@@ -1725,4 +1751,43 @@ pub async fn install_missing_dependencies(
 
     emit_mod_progress(&app, "Done", &format!("Installed {} dependencies", installed), total as u32, total as u32);
     Ok(installed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_mrpack_overrides;
+    use std::io::{Cursor, Write};
+
+    #[test]
+    fn mrpack_applies_server_overrides_and_ignores_client_overrides() {
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut bytes);
+            let options = zip::write::SimpleFileOptions::default();
+            writer.start_file("overrides/config/common.txt", options).unwrap();
+            writer.write_all(b"common").unwrap();
+            writer
+                .start_file("server-overrides/config/side.txt", options)
+                .unwrap();
+            writer.write_all(b"server").unwrap();
+            writer
+                .start_file("client-overrides/config/client.txt", options)
+                .unwrap();
+            writer.write_all(b"client").unwrap();
+            writer.finish().unwrap();
+        }
+        bytes.set_position(0);
+        let mut archive = zip::ZipArchive::new(bytes).unwrap();
+        let dest = std::env::temp_dir().join(format!(
+            "lbby-mrpack-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+
+        apply_mrpack_overrides(&mut archive, &dest).unwrap();
+
+        assert_eq!(std::fs::read(dest.join("config/common.txt")).unwrap(), b"common");
+        assert_eq!(std::fs::read(dest.join("config/side.txt")).unwrap(), b"server");
+        assert!(!dest.join("config/client.txt").exists());
+        std::fs::remove_dir_all(dest).unwrap();
+    }
 }
