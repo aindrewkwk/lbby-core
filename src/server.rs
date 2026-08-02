@@ -1700,17 +1700,12 @@ struct DownloadItem {
 
 #[derive(Debug, Deserialize)]
 struct PaperBuild {
-    downloads: PaperDownloads,
+    downloads: HashMap<String, PaperDownload>,
 }
 
 #[derive(Debug, Deserialize)]
-struct PaperDownloads {
-    application: PaperApp,
-}
-
-#[derive(Debug, Deserialize)]
-struct PaperApp {
-    name: String,
+struct PaperDownload {
+    url: String,
 }
 
 // ── Download + progress helpers ──────────────────────────────────────────────
@@ -2036,7 +2031,7 @@ async fn install_paper(
     let client = reqwest::Client::new();
     let info: PaperBuild = client
         .get(format!(
-            "https://api.papermc.io/v2/projects/paper/versions/{}/builds/{}",
+            "https://fill.papermc.io/v3/projects/paper/versions/{}/builds/{}",
             mc, build
         ))
         .send()
@@ -2045,10 +2040,13 @@ async fn install_paper(
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    let url = format!(
-        "https://api.papermc.io/v2/projects/paper/versions/{}/builds/{}/downloads/{}",
-        mc, build, info.downloads.application.name
-    );
+    let url = info
+        .downloads
+        .get("server:default")
+        .or_else(|| info.downloads.values().next())
+        .ok_or("Paper build has no server download")?
+        .url
+        .clone();
     emit_progress(app, "Downloading Paper\u{2026}", 0.2);
     download_to_file(app, &url, &server_dir.join("server.jar"), "Paper").await
 }
@@ -2285,7 +2283,7 @@ async fn install_folia(
     let client = reqwest::Client::new();
     let info: PaperBuild = client
         .get(format!(
-            "https://api.papermc.io/v2/projects/folia/versions/{}/builds/{}",
+            "https://fill.papermc.io/v3/projects/folia/versions/{}/builds/{}",
             mc, build
         ))
         .send()
@@ -2294,10 +2292,13 @@ async fn install_folia(
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    let url = format!(
-        "https://api.papermc.io/v2/projects/folia/versions/{}/builds/{}/downloads/{}",
-        mc, build, info.downloads.application.name
-    );
+    let url = info
+        .downloads
+        .get("server:default")
+        .or_else(|| info.downloads.values().next())
+        .ok_or("Folia build has no server download")?
+        .url
+        .clone();
     emit_progress(app, "Downloading Folia\u{2026}", 0.2);
     download_to_file(app, &url, &server_dir.join("server.jar"), "Folia").await
 }
@@ -3091,6 +3092,19 @@ pub async fn get_pregen_state(
 #[cfg(test)]
 mod install_tests {
     use super::*;
+
+    #[test]
+    fn parses_paper_v3_default_download() {
+        let build: PaperBuild = serde_json::from_str(
+            r#"{"downloads":{"server:default":{"url":"https://example.test/server.jar"}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            build.downloads.get("server:default").unwrap().url,
+            "https://example.test/server.jar"
+        );
+    }
 
     #[test]
     fn staged_runtimes_remain_isolated_for_same_loader_version() {
