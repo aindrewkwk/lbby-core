@@ -17,6 +17,7 @@ pub mod license;
 pub mod minecraft_properties;
 pub mod mod_services;
 pub mod mod_side;
+pub mod modpack_discovery;
 pub mod node_api;
 pub mod player_actions;
 #[cfg(feature = "sqlite")]
