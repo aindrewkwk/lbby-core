@@ -174,10 +174,26 @@ pub(crate) fn client() -> Result<reqwest::Client, String> {
 }
 
 fn curseforge_client() -> Result<reqwest::Client, String> {
-    // CurseForge downloads use CDN (edge.forgecdn.net) which doesn't require an API key.
-    // File metadata can be retrieved from www.curseforge.com/api/v1 (no key needed).
+    // CurseForge official API requires API key
+    // If no API key is configured, return error with helpful message
+    let api_key = config::load_config()
+        .curseforge_api_key
+        .filter(|key| !key.trim().is_empty())
+        .ok_or_else(|| {
+            "CurseForge API key is required. Get one from https://curseforge.com/account/api-tokens and add it in Settings.".to_string()
+        })?;
+    
     reqwest::Client::builder()
         .user_agent("Lbby/0.1.0 (Minecraft server hosting app)")
+        .default_headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                "x-api-key",
+                reqwest::header::HeaderValue::from_str(api_key.trim())
+                    .map_err(|_| "Invalid CurseForge API key".to_string())?,
+            );
+            headers
+        })
         .build()
         .map_err(|e| e.to_string())
 }
@@ -1163,49 +1179,51 @@ pub async fn install_curseforge_modpack(
             current,
             total,
         );
-        // CurseForge CDN URL format: https://edge.forgecdn.net/files/{prefix}/{suffix}/{file_name}
-        // prefix = first 4 chars of mod_id, suffix = file_id % 1000 (no zero-padding)
-        // This doesn't require an API key.
-        let mod_id_str = item.project_id.to_string();
-        let prefix = &mod_id_str[..mod_id_str.len().min(4)];
-        let suffix = (item.file_id % 1000).to_string();
-        
-        // Get filename from CurseForge website API (no key needed)
-        let file_info_url = format!(
-            "https://www.curseforge.com/api/v1/mods/{}/files/{}",
+        // Use CurseForge official API to get download URL
+        // API key is already included in curseforge_client() headers
+        let download_url_endpoint = format!(
+            "https://api.curseforge.com/v1/mods/{}/files/{}/download-url",
             item.project_id, item.file_id
         );
-        let file_name = match cf.get(&file_info_url).send().await {
+        
+        let download_url = match cf.get(&download_url_endpoint).send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
                     #[derive(serde::Deserialize)]
-                    struct FileInfoResponse {
-                        data: FileInfo,
+                    struct DownloadUrlResponse {
+                        data: String,
                     }
-                    #[derive(serde::Deserialize)]
-                    struct FileInfo {
-                        #[serde(default, rename = "fileName")]
-                        file_name: Option<String>,
-                    }
-                    match resp.json::<FileInfoResponse>().await {
-                        Ok(info) => info.data.file_name.unwrap_or_else(|| format!("mod_{}.jar", item.file_id)),
-                        Err(_) => format!("mod_{}.jar", item.file_id),
+                    match resp.json::<DownloadUrlResponse>().await {
+                        Ok(info) => info.data,
+                        Err(e) => {
+                            eprintln!("[lbby] Failed to parse download URL: {}", e);
+                            return Err(format!("Failed to get download URL for mod {}", item.project_id));
+                        }
                     }
                 } else {
-                    format!("mod_{}.jar", item.file_id)
+                    eprintln!("[lbby] Download URL endpoint failed: {}", resp.status());
+                    return Err(format!("Failed to get download URL for mod {} (HTTP {})", item.project_id, resp.status()));
                 }
             }
-            Err(_) => format!("mod_{}.jar", item.file_id),
+            Err(e) => {
+                eprintln!("[lbby] Download URL request failed: {}", e);
+                return Err(format!("Failed to get download URL for mod {}: {}", item.project_id, e));
+            }
         };
         
-        let cdn_url = format!(
-            "https://edge.forgecdn.net/files/{}/{}/{}",
-            prefix, suffix, file_name
-        );
-        
+        // Extract filename from URL
+        let file_name = download_url
+            .rsplit('/')
+            .next()
+            .unwrap_or(&format!("mod_{}.jar", item.file_id))
+            .split('?')
+            .next()
+            .unwrap_or(&format!("mod_{}.jar", item.file_id))
+            .to_string();
+
         download_bytes_to_file(
             &app,
-            &cdn_url,
+            &download_url,
             &target_dir.join(&file_name),
             "Downloading CurseForge mods",
             &file_name,
