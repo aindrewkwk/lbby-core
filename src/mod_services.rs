@@ -141,11 +141,6 @@ struct CurseFileRef {
     required: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct CurseDownloadUrl {
-    data: String,
-}
-
 fn emit_mod_progress(
     app: &std::sync::Arc<crate::app_state::AppEventSender>,
     stage: &str,
@@ -179,24 +174,10 @@ pub(crate) fn client() -> Result<reqwest::Client, String> {
 }
 
 fn curseforge_client() -> Result<reqwest::Client, String> {
-    let api_key = config::load_config()
-        .curseforge_api_key
-        .filter(|key| !key.trim().is_empty())
-        .ok_or_else(|| {
-            "CurseForge client packs require an API key so Lbby can resolve their files. Add one in Mods > Modpacks, or choose the official server-pack ZIP instead."
-                .to_string()
-        })?;
+    // CurseForge downloads use CDN (edge.forgecdn.net) which doesn't require an API key.
+    // File metadata can be retrieved from www.curseforge.com/api/v1 (no key needed).
     reqwest::Client::builder()
         .user_agent("Lbby/0.1.0 (Minecraft server hosting app)")
-        .default_headers({
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(
-                "x-api-key",
-                reqwest::header::HeaderValue::from_str(api_key.trim())
-                    .map_err(|_| "Invalid CurseForge API key".to_string())?,
-            );
-            headers
-        })
         .build()
         .map_err(|e| e.to_string())
 }
@@ -1182,31 +1163,48 @@ pub async fn install_curseforge_modpack(
             current,
             total,
         );
-        let resp: CurseDownloadUrl = cf
-            .get(format!(
-                "https://api.curseforge.com/v1/mods/{}/files/{}/download-url",
-                item.project_id, item.file_id
-            ))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())?;
-        let file_name = resp
-            .data
-            .rsplit('/')
-            .next()
-            .unwrap_or("mod.jar")
-            .split('?')
-            .next()
-            .unwrap_or("mod.jar");
+        // CurseForge CDN URL format: https://edge.forgecdn.net/files/{prefix}/{suffix}/{file_name}
+        // prefix = first 4 chars of mod_id, suffix = last 3 digits of file_id (zero-padded)
+        // This doesn't require an API key.
+        let mod_id_str = item.project_id.to_string();
+        let prefix = &mod_id_str[..mod_id_str.len().min(4)];
+        let suffix = format!("{:03}", item.file_id % 1000);
+        
+        // Get filename from CurseForge website API (no key needed)
+        let file_info_url = format!(
+            "https://www.curseforge.com/api/v1/mods/{}/files/{}",
+            item.project_id, item.file_id
+        );
+        let file_name = match cf.get(&file_info_url).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    #[derive(serde::Deserialize)]
+                    struct FileInfo {
+                        #[serde(default, rename = "fileName")]
+                        file_name: Option<String>,
+                    }
+                    match resp.json::<FileInfo>().await {
+                        Ok(info) => info.file_name.unwrap_or_else(|| format!("mod_{}.jar", item.file_id)),
+                        Err(_) => format!("mod_{}.jar", item.file_id),
+                    }
+                } else {
+                    format!("mod_{}.jar", item.file_id)
+                }
+            }
+            Err(_) => format!("mod_{}.jar", item.file_id),
+        };
+        
+        let cdn_url = format!(
+            "https://edge.forgecdn.net/files/{}/{}/{}",
+            prefix, suffix, file_name
+        );
+        
         download_bytes_to_file(
             &app,
-            &resp.data,
-            &target_dir.join(file_name),
+            &cdn_url,
+            &target_dir.join(&file_name),
             "Downloading CurseForge mods",
-            file_name,
+            &file_name,
             current,
             total,
         )

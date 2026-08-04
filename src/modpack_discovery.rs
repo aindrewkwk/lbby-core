@@ -8,9 +8,6 @@ use std::collections::HashMap;
 
 pub const CURSEFORGE_GAME_ID: u32 = 432;
 pub const CURSEFORGE_MODPACK_CLASS_ID: u32 = 4471;
-/// Shown when no CurseForge API key is configured. Never includes the key.
-pub const CURSEFORGE_MISSING_KEY_ERROR: &str =
-    "CurseForge requires an API key so Lbby can search and resolve modpacks. Add one in Mods > Modpacks, or search Modrinth instead.";
 /// CurseForge caps pageSize at 50; keep one limit that works for both.
 const MAX_PAGE_LIMIT: u32 = 50;
 
@@ -117,8 +114,9 @@ pub struct ModpackSearchFilter<'a> {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Search modpacks on the given provider. CurseForge requires a configured
-/// API key (`curseforge_api_key` in config); the key is never logged.
+/// Search modpacks on the given provider.
+/// - Modrinth: Uses official API (no key needed)
+/// - CurseForge: Uses website API (no key needed), but may be blocked by Cloudflare
 pub async fn search_modpacks(
     filter: &ModpackSearchFilter<'_>,
 ) -> Result<ModpackSearchResults, String> {
@@ -164,9 +162,7 @@ pub async fn list_modpack_versions(
             parse_modrinth_versions(&body, project_id)
         }
         ModpackProvider::CurseForge => {
-            let key = validate_curseforge_key(
-                crate::config::load_config().curseforge_api_key.as_deref(),
-            )?;
+            // Use CurseForge website API (no key needed)
             let mut q: Vec<(&str, String)> = vec![("pageSize", "100".to_string())];
             if let Some(mc) = nonempty(minecraft_version) {
                 q.push(("gameVersion", mc.to_string()));
@@ -174,9 +170,9 @@ pub async fn list_modpack_versions(
             if let Some(l) = nonempty(loader) {
                 q.push(("gameVersion", curseforge_loader_name(l)));
             }
-            let resp = curseforge_client(&key)?
+            let resp = curseforge_client()?
                 .get(format!(
-                    "https://api.curseforge.com/v1/mods/{}/files",
+                    "https://www.curseforge.com/api/v1/mods/{}/files",
                     project_id
                 ))
                 .query(&q)
@@ -185,7 +181,7 @@ pub async fn list_modpack_versions(
                 .map_err(|e| e.to_string())?;
             if !resp.status().is_success() {
                 return Err(format!(
-                    "CurseForge file lookup failed with HTTP {}",
+                    "CurseForge file lookup failed with HTTP {} (may be blocked by Cloudflare)",
                     resp.status()
                 ));
             }
@@ -249,15 +245,6 @@ pub fn resolve_modpack_version<'a>(
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested, no network)
 // ---------------------------------------------------------------------------
-
-/// Validate a configured CurseForge API key. Pure so the missing-key path is
-/// testable without touching config files.
-fn validate_curseforge_key(key: Option<&str>) -> Result<String, String> {
-    key.map(str::trim)
-        .filter(|k| !k.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| CURSEFORGE_MISSING_KEY_ERROR.to_string())
-}
 
 /// Keep facet values alphanumeric plus `.-_` so user input cannot break the
 /// facet JSON.
@@ -634,18 +621,10 @@ struct CfHash {
     value: String,
 }
 
-fn curseforge_client(api_key: &str) -> Result<reqwest::Client, String> {
+fn curseforge_client() -> Result<reqwest::Client, String> {
+    // CurseForge website API doesn't require an API key
     reqwest::Client::builder()
         .user_agent("Lbby/0.1.0 (Minecraft server hosting app)")
-        .default_headers({
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(
-                "x-api-key",
-                reqwest::header::HeaderValue::from_str(api_key)
-                    .map_err(|_| "Invalid CurseForge API key".to_string())?,
-            );
-            headers
-        })
         .build()
         .map_err(|e| e.to_string())
 }
@@ -654,7 +633,8 @@ async fn search_curseforge(
     filter: &ModpackSearchFilter<'_>,
     limit: u32,
 ) -> Result<ModpackSearchResults, String> {
-    let key = validate_curseforge_key(crate::config::load_config().curseforge_api_key.as_deref())?;
+    // Use CurseForge website API (no key needed)
+    // Note: May be blocked by Cloudflare in some regions
     let mut q: Vec<(&str, String)> = vec![
         ("gameId", CURSEFORGE_GAME_ID.to_string()),
         ("classId", CURSEFORGE_MODPACK_CLASS_ID.to_string()),
@@ -672,15 +652,15 @@ async fn search_curseforge(
     if let Some(l) = nonempty(filter.loader) {
         q.push(("gameVersion", curseforge_loader_name(l)));
     }
-    let resp = curseforge_client(&key)?
-        .get("https://api.curseforge.com/v1/mods/search")
+    let resp = curseforge_client()?
+        .get("https://www.curseforge.com/api/v1/mods/search")
         .query(&q)
         .send()
         .await
         .map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!(
-            "CurseForge search failed with HTTP {}",
+            "CurseForge search failed with HTTP {} (may be blocked by Cloudflare)",
             resp.status()
         ));
     }
@@ -1118,15 +1098,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[test]
-    fn missing_curseforge_key_gives_clear_error_without_key() {
-        let err = validate_curseforge_key(None).unwrap_err();
-        assert_eq!(err, CURSEFORGE_MISSING_KEY_ERROR);
-        let err = validate_curseforge_key(Some("   ")).unwrap_err();
-        assert_eq!(err, CURSEFORGE_MISSING_KEY_ERROR);
-        assert_eq!(validate_curseforge_key(Some(" key ")).unwrap(), "key");
     }
 
     #[test]
