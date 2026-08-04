@@ -1164,11 +1164,11 @@ pub async fn install_curseforge_modpack(
             total,
         );
         // CurseForge CDN URL format: https://edge.forgecdn.net/files/{prefix}/{suffix}/{file_name}
-        // prefix = first 4 chars of mod_id, suffix = last 3 digits of file_id (zero-padded)
+        // prefix = first 4 chars of mod_id, suffix = file_id % 1000 (no zero-padding)
         // This doesn't require an API key.
         let mod_id_str = item.project_id.to_string();
         let prefix = &mod_id_str[..mod_id_str.len().min(4)];
-        let suffix = format!("{:03}", item.file_id % 1000);
+        let suffix = (item.file_id % 1000).to_string();
         
         // Get filename from CurseForge website API (no key needed)
         let file_info_url = format!(
@@ -1179,12 +1179,16 @@ pub async fn install_curseforge_modpack(
             Ok(resp) => {
                 if resp.status().is_success() {
                     #[derive(serde::Deserialize)]
+                    struct FileInfoResponse {
+                        data: FileInfo,
+                    }
+                    #[derive(serde::Deserialize)]
                     struct FileInfo {
                         #[serde(default, rename = "fileName")]
                         file_name: Option<String>,
                     }
-                    match resp.json::<FileInfo>().await {
-                        Ok(info) => info.file_name.unwrap_or_else(|| format!("mod_{}.jar", item.file_id)),
+                    match resp.json::<FileInfoResponse>().await {
+                        Ok(info) => info.data.file_name.unwrap_or_else(|| format!("mod_{}.jar", item.file_id)),
                         Err(_) => format!("mod_{}.jar", item.file_id),
                     }
                 } else {
