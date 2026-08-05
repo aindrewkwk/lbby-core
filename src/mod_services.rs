@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek};
+use std::io::{BufReader, Read, Seek};
 use std::path::{Component, Path, PathBuf};
 
 use tokio::io::AsyncWriteExt;
@@ -139,6 +139,459 @@ struct CurseFileRef {
     file_id: u64,
     #[serde(default)]
     required: bool,
+}
+
+// ── CurseForge Search & API Types ──────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CurseFilesResponse {
+    pub data: Vec<CurseFileEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CurseFileEntry {
+    pub id: i64,
+    #[serde(default, rename = "fileName")]
+    pub file_name: String,
+    #[serde(default, rename = "fileLength")]
+    pub file_length: u64,
+    #[serde(default, rename = "downloadUrl")]
+    pub download_url: Option<String>,
+    #[serde(default, rename = "serverPackFileId")]
+    pub server_pack_file_id: Option<i64>,
+    #[serde(default, rename = "isServerPack")]
+    pub is_server_pack: bool,
+    #[serde(default, rename = "parentProjectFileId")]
+    pub parent_project_file_id: Option<i64>,
+    #[serde(default, rename = "gameVersions")]
+    pub game_versions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CurseFingerprintResponse {
+    pub data: CurseFingerprintData,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CurseFingerprintData {
+    #[serde(default, rename = "exactMatches")]
+    pub exact_matches: Vec<CurseFingerprintMatch>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CurseFingerprintMatch {
+    pub file: CurseFileEntry,
+}
+
+pub const UNVERIFIED_CURSEFORGE_ZIP: &str = "UNVERIFIED_CURSEFORGE_ZIP:";
+
+// ── CurseForge Helpers ──────────────────────────────────────────────────────
+
+pub fn response_preview(body: &str) -> String {
+    body.chars().take(200).collect()
+}
+
+/// Resolve CurseForge source to (mod_id, optional_file_id).
+/// Source can be: numeric ID, slug, or URL like .../modpacks/{slug}/files/{fileId}
+pub fn parse_curseforge_source(source: &str) -> (String, Option<i64>) {
+    let trimmed = source.trim().trim_end_matches('/');
+    // Extract from URL: .../modpacks/{slug}/files/{fileId}
+    if let Some(after_modpacks) = trimmed.split("/modpacks/").nth(1) {
+        let parts: Vec<&str> = after_modpacks.split('/').collect();
+        let slug = parts[0];
+        let file_id = if parts.len() >= 3 && parts[1] == "files" {
+            parts[2].parse::<i64>().ok()
+        } else {
+            None
+        };
+        return (slug.to_string(), file_id);
+    }
+    // Plain numeric ID
+    if let Ok(id) = trimmed.parse::<i64>() {
+        return (id.to_string(), None);
+    }
+    // Assume it's a slug
+    (trimmed.to_string(), None)
+}
+
+pub fn curseforge_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent(format!(
+            "Lbby/{} (Minecraft server hosting app)",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))
+}
+
+pub fn expected_curseforge_loader(server_type: &ServerType) -> Option<&'static str> {
+    match server_type {
+        ServerType::Forge => Some("forge"),
+        ServerType::Fabric => Some("fabric"),
+        ServerType::NeoForge => Some("neoforge"),
+        _ => None,
+    }
+}
+
+pub fn validate_curseforge_file_for_profile(
+    file: &CurseFileEntry,
+    cfg: &ServerConfig,
+) -> Result<(), String> {
+    let has_mc_version = file
+        .game_versions
+        .iter()
+        .any(|version| version.eq_ignore_ascii_case(cfg.minecraft_version.trim()));
+    if !has_mc_version {
+        return Err(format!(
+            "CurseForge file {} is not for Minecraft {}. Available metadata: {}",
+            file.id,
+            cfg.minecraft_version,
+            if file.game_versions.is_empty() {
+                "none".to_string()
+            } else {
+                file.game_versions.join(", ")
+            }
+        ));
+    }
+
+    let Some(expected_loader) = expected_curseforge_loader(&cfg.server_type) else {
+        return Ok(());
+    };
+    let known_loaders = ["forge", "fabric", "neoforge", "quilt"];
+    let declared_loaders: Vec<String> = file
+        .game_versions
+        .iter()
+        .filter(|value| known_loaders.iter().any(|loader| value.eq_ignore_ascii_case(loader)))
+        .map(|value| value.to_ascii_lowercase())
+        .collect();
+    if !declared_loaders
+        .iter()
+        .any(|loader| loader == expected_loader)
+    {
+        return Err(format!(
+            "CurseForge file {} does not match the profile loader {}. Declared loaders: {}",
+            file.id,
+            expected_loader,
+            if declared_loaders.is_empty() {
+                "none".to_string()
+            } else {
+                declared_loaders.join(", ")
+            }
+        ));
+    }
+    Ok(())
+}
+
+pub async fn curseforge_file_by_id(
+    client: &reqwest::Client,
+    api_key: &str,
+    file_id: i64,
+) -> Result<CurseFileEntry, String> {
+    let response = client
+        .post("https://api.curseforge.com/v1/mods/files")
+        .header("x-api-key", api_key)
+        .json(&serde_json::json!({"fileIds": [file_id]}))
+        .send()
+        .await
+        .map_err(|e| format!("CurseForge file lookup error: {}", e))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "CurseForge file lookup error ({}): {}",
+            status,
+            response_preview(&body)
+        ));
+    }
+    serde_json::from_str::<CurseFilesResponse>(&body)
+        .map_err(|e| format!("CurseForge file parse error: {}", e))?
+        .data
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("CurseForge file {} was not found", file_id))
+}
+
+pub async fn curseforge_validation_file(
+    client: &reqwest::Client,
+    api_key: &str,
+    file: &CurseFileEntry,
+) -> Result<CurseFileEntry, String> {
+    if file.is_server_pack {
+        if let Some(parent_id) = file.parent_project_file_id.filter(|id| *id > 0) {
+            return curseforge_file_by_id(client, api_key, parent_id).await;
+        }
+    }
+    Ok(file.clone())
+}
+
+// ── CurseForge Fingerprinting ──────────────────────────────────────────────
+
+fn is_curseforge_whitespace(byte: u8) -> bool {
+    matches!(byte, b'\t' | b'\n' | b'\r' | b' ')
+}
+
+fn murmur2_block(hash: &mut u32, block: [u8; 4]) {
+    const M: u32 = 0x5bd1_e995;
+    let mut value = u32::from_le_bytes(block);
+    value = value.wrapping_mul(M);
+    value ^= value >> 24;
+    value = value.wrapping_mul(M);
+    *hash = hash.wrapping_mul(M) ^ value;
+}
+
+pub fn curseforge_fingerprint_reader<R: Read>(mut reader: R, normalized_len: usize) -> Result<u32, String> {
+    const M: u32 = 0x5bd1_e995;
+    let normalized_len = u32::try_from(normalized_len)
+        .map_err(|_| "CurseForge fingerprint input exceeds 4 GiB".to_string())?;
+    let mut hash = 1u32 ^ normalized_len;
+    let mut input = [0u8; 64 * 1024];
+    let mut block = [0u8; 4];
+    let mut block_len = 0usize;
+    loop {
+        let read = reader.read(&mut input).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        for byte in input[..read]
+            .iter()
+            .copied()
+            .filter(|byte| !is_curseforge_whitespace(*byte))
+        {
+            block[block_len] = byte;
+            block_len += 1;
+            if block_len == 4 {
+                murmur2_block(&mut hash, block);
+                block_len = 0;
+                block = [0u8; 4];
+            }
+        }
+    }
+    match block_len {
+        3 => {
+            hash ^= (block[2] as u32) << 16;
+            hash ^= (block[1] as u32) << 8;
+            hash ^= block[0] as u32;
+            hash = hash.wrapping_mul(M);
+        }
+        2 => {
+            hash ^= (block[1] as u32) << 8;
+            hash ^= block[0] as u32;
+            hash = hash.wrapping_mul(M);
+        }
+        1 => {
+            hash ^= block[0] as u32;
+            hash = hash.wrapping_mul(M);
+        }
+        _ => {}
+    }
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(M);
+    hash ^= hash >> 15;
+    Ok(hash)
+}
+
+pub fn curseforge_fingerprint_file(path: &Path) -> Result<u32, String> {
+    let mut counter = BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?);
+    let mut input = [0u8; 64 * 1024];
+    let mut normalized_len = 0usize;
+    loop {
+        let read = counter.read(&mut input).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        normalized_len += input[..read]
+            .iter()
+            .filter(|byte| !is_curseforge_whitespace(**byte))
+            .count();
+    }
+    let reader = BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?);
+    curseforge_fingerprint_reader(reader, normalized_len)
+}
+
+pub async fn identify_curseforge_upload(
+    client: &reqwest::Client,
+    api_key: &str,
+    path: &Path,
+) -> Result<Option<CurseFileEntry>, String> {
+    let path = path.to_path_buf();
+    let fingerprint = tokio::task::spawn_blocking(move || curseforge_fingerprint_file(&path))
+        .await
+        .map_err(|e| format!("Fingerprint task failed: {}", e))??;
+    let response = client
+        .post("https://api.curseforge.com/v1/fingerprints/432")
+        .header("x-api-key", api_key)
+        .json(&serde_json::json!({"fingerprints": [fingerprint]}))
+        .send()
+        .await
+        .map_err(|e| format!("CurseForge fingerprint lookup failed: {}", e))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "CurseForge fingerprint lookup failed ({}): {}",
+            status,
+            response_preview(&body)
+        ));
+    }
+    let response: CurseFingerprintResponse = serde_json::from_str(&body)
+        .map_err(|e| format!("CurseForge fingerprint response was invalid: {}", e))?;
+    Ok(response
+        .data
+        .exact_matches
+        .into_iter()
+        .next()
+        .map(|matched| matched.file))
+}
+
+// ── CurseForge Download ────────────────────────────────────────────────────
+
+pub fn official_server_pack_id(file: &CurseFileEntry) -> Option<i64> {
+    (!file.is_server_pack)
+        .then_some(file.server_pack_file_id)
+        .flatten()
+        .filter(|id| *id > 0)
+}
+
+pub fn curseforge_cdn_parts(file_id: i64) -> Result<(String, String), String> {
+    if file_id <= 0 {
+        return Err("CurseForge returned an invalid file ID".to_string());
+    }
+    let digits = file_id.to_string();
+    if digits.len() <= 4 {
+        return Err("CurseForge returned a file ID that is too short".to_string());
+    }
+    let prefix = digits[..4].to_string();
+    let suffix = digits[4..].trim_start_matches('0');
+    Ok((
+        prefix,
+        if suffix.is_empty() { "0" } else { suffix }.to_string(),
+    ))
+}
+
+pub async fn prefer_curseforge_server_pack(
+    app: &crate::app_state::AppEventSender,
+    client: &reqwest::Client,
+    api_key: &str,
+    client_file: CurseFileEntry,
+) -> Result<CurseFileEntry, String> {
+    if client_file.is_server_pack {
+        return Ok(client_file);
+    }
+    let Some(server_pack_id) = official_server_pack_id(&client_file) else {
+        let _ = app.emit(
+            "mod-task-progress",
+            ModTaskProgress {
+                stage: "No official server pack".to_string(),
+                message: "The author did not publish a server pack; using the side-filtered client manifest.".to_string(),
+                current: 0,
+                total: 1,
+                progress: 0.0,
+            },
+        );
+        return Ok(client_file);
+    };
+    let _ = app.emit(
+        "mod-task-progress",
+        ModTaskProgress {
+            stage: "Selecting server pack".to_string(),
+            message: format!("Using official CurseForge server pack {}", server_pack_id),
+            current: 1,
+            total: 1,
+            progress: 1.0,
+        },
+    );
+    curseforge_file_by_id(client, api_key, server_pack_id).await
+}
+
+pub async fn download_curseforge_file(
+    app: &crate::app_state::AppEventSender,
+    client: &reqwest::Client,
+    file: &CurseFileEntry,
+) -> Result<PathBuf, String> {
+    let safe_file_name = Path::new(&file.file_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or("CurseForge returned an invalid file name")?;
+    let (prefix, suffix) = curseforge_cdn_parts(file.id)?;
+    let encoded_name = urlencoding::encode(safe_file_name);
+    let download_url = file
+        .download_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "https://edge.forgecdn.net/files/{}/{}/{}",
+                prefix, suffix, encoded_name
+            )
+        });
+    let temp_dir = std::env::temp_dir()
+        .join("lbby-curseforge")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+    let zip_path = temp_dir.join(safe_file_name);
+
+    let mut response = None;
+    for attempt in 1..=3 {
+        match client.get(&download_url).send().await {
+            Ok(candidate) if candidate.status().is_success() => {
+                response = Some(candidate);
+                break;
+            }
+            Ok(candidate) if attempt == 3 => {
+                return Err(format!("CurseForge CDN error ({})", candidate.status()));
+            }
+            Err(error) if attempt == 3 => {
+                return Err(format!("CurseForge download error: {error}"));
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+        }
+    }
+    let response = response.ok_or("CurseForge download failed after 3 attempts")?;
+    let total_size = response.content_length().unwrap_or(file.file_length);
+    let mut downloaded = 0u64;
+    let mut stream = response.bytes_stream();
+    let mut writer = std::fs::File::create(&zip_path)
+        .map_err(|e| format!("Failed to create downloaded modpack: {e}"))?;
+    let mut last_emit = std::time::Instant::now();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("CurseForge download stream error: {e}"))?;
+        std::io::Write::write_all(&mut writer, &chunk)
+            .map_err(|e| format!("Failed to write downloaded modpack: {e}"))?;
+        downloaded += chunk.len() as u64;
+        if last_emit.elapsed() >= std::time::Duration::from_millis(500) {
+            let _ = app.emit(
+                "mod-task-progress",
+                ModTaskProgress {
+                    stage: "Downloading modpack".to_string(),
+                    message: format!("{} / {} MB", downloaded / 1024 / 1024, total_size / 1024 / 1024),
+                    current: downloaded as u32,
+                    total: total_size as u32,
+                    progress: if total_size > 0 { downloaded as f64 / total_size as f64 } else { 0.0 },
+                },
+            );
+            last_emit = std::time::Instant::now();
+        }
+    }
+    writer
+        .sync_all()
+        .map_err(|e| format!("Failed to finalize downloaded modpack: {e}"))?;
+    Ok(zip_path)
+}
+
+// ── CurseForge Search ──────────────────────────────────────────────────────
+
+pub async fn search_curseforge_mods(
+    _query: String,
+    _minecraft_version: String,
+    _server_type: ServerType,
+) -> Result<Vec<ModrinthSearchHit>, String> {
+    // CurseForge search API is blocked by Cloudflare (403).
+    // Use Modrinth for search instead. CurseForge is only available for
+    // modpack install by numeric ID.
+    Err("CurseForge search is temporarily unavailable. Use Modrinth for search, or install CurseForge modpacks by numeric ID.".to_string())
 }
 
 fn emit_mod_progress(
@@ -1954,7 +2407,97 @@ pub async fn install_missing_dependencies(
 #[cfg(test)]
 mod tests {
     use super::apply_mrpack_overrides;
+    use crate::config::{ServerConfig, ServerType};
     use std::io::{Cursor, Write};
+    use super::{
+        curseforge_cdn_parts, curseforge_fingerprint_reader, official_server_pack_id,
+        parse_curseforge_source, validate_curseforge_file_for_profile, CurseFilesResponse,
+    };
+    use std::io::Cursor;
+
+    #[test]
+    fn parses_file_id_from_curseforge_url() {
+        assert_eq!(
+            parse_curseforge_source(
+                "https://www.curseforge.com/minecraft/modpacks/example-pack/files/8448977"
+            ),
+            ("example-pack".to_string(), Some(8_448_977))
+        );
+    }
+
+    #[test]
+    fn reads_server_pack_file_id_from_api_response() {
+        let response: CurseFilesResponse = serde_json::from_str(
+            r#"{"data":[{"id":10,"fileName":"client.zip","fileLength":5,"isServerPack":false,"serverPackFileId":11}]}"#,
+        )
+        .unwrap();
+        assert_eq!(response.data[0].server_pack_file_id, Some(11));
+        assert_eq!(official_server_pack_id(&response.data[0]), Some(11));
+    }
+
+    #[test]
+    fn does_not_follow_invalid_or_recursive_server_pack_ids() {
+        let response: CurseFilesResponse = serde_json::from_str(
+            r#"{"data":[{"id":10,"fileName":"server.zip","fileLength":5,"isServerPack":true,"serverPackFileId":11},{"id":12,"fileName":"client.zip","fileLength":5,"serverPackFileId":0}]}"#,
+        )
+        .unwrap();
+        assert_eq!(official_server_pack_id(&response.data[0]), None);
+        assert_eq!(official_server_pack_id(&response.data[1]), None);
+    }
+
+    #[test]
+    fn validates_minecraft_version_and_loader_metadata() {
+        let response: CurseFilesResponse = serde_json::from_str(
+            r#"{"data":[{"id":10,"fileName":"pack.zip","fileLength":5,"gameVersions":["1.20.1","Forge"],"parentProjectFileId":9}]}"#,
+        )
+        .unwrap();
+        let file = &response.data[0];
+        assert_eq!(file.parent_project_file_id, Some(9));
+        let mut config = ServerConfig {
+            minecraft_version: "1.20.1".to_string(),
+            server_type: ServerType::Forge,
+            ..ServerConfig::default()
+        };
+        assert!(validate_curseforge_file_for_profile(file, &config).is_ok());
+
+        config.minecraft_version = "1.21.1".to_string();
+        assert!(validate_curseforge_file_for_profile(file, &config)
+            .unwrap_err()
+            .contains("not for Minecraft 1.21.1"));
+        config.minecraft_version = "1.20.1".to_string();
+        config.server_type = ServerType::NeoForge;
+        assert!(validate_curseforge_file_for_profile(file, &config)
+            .unwrap_err()
+            .contains("does not match the profile loader neoforge"));
+    }
+
+    #[test]
+    fn fingerprint_ignores_curseforge_whitespace() {
+        let with_whitespace = b"Curse Forge\n test\tdata";
+        let compact = b"CurseForgetestdata";
+        let first = curseforge_fingerprint_reader(Cursor::new(with_whitespace), compact.len())
+            .unwrap();
+        let second = curseforge_fingerprint_reader(Cursor::new(compact), compact.len()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first, 2_704_042_519);
+    }
+
+    #[test]
+    fn builds_cdn_parts_without_truncating_long_file_ids() {
+        assert_eq!(
+            curseforge_cdn_parts(8_448_977).unwrap(),
+            ("8448".to_string(), "977".to_string())
+        );
+        assert_eq!(
+            curseforge_cdn_parts(12_345_678).unwrap(),
+            ("1234".to_string(), "5678".to_string())
+        );
+        assert_eq!(
+            curseforge_cdn_parts(12_340_078).unwrap(),
+            ("1234".to_string(), "78".to_string())
+        );
+    }
+
 
     #[test]
     fn mrpack_applies_server_overrides_and_ignores_client_overrides() {
