@@ -1526,6 +1526,184 @@ pub async fn install_modpack_from_file(
     }
 }
 
+// ── CurseForge URL / CDN resolver ──────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct CfWidgetResponse {
+    id: u64,
+    name: Option<String>,
+    files: Vec<CfWidgetFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CfWidgetFile {
+    id: u64,
+    name: String,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+/// Parse a CurseForge URL into (slug, optional file_id).
+/// Supported formats:
+///   https://www.curseforge.com/minecraft/modpacks/{slug}
+///   https://www.curseforge.com/minecraft/modpacks/{slug}/files/{fileId}
+fn parse_curseforge_url(url: &str) -> Result<(String, Option<u64>), String> {
+    let url = url.trim().trim_end_matches('/');
+    let prefix = "/minecraft/modpacks/";
+    let rest = url
+        .split(prefix)
+        .nth(1)
+        .ok_or_else(|| format!("Not a valid CurseForge modpack URL: {}", url))?;
+    let mut parts = rest.split('/');
+    let slug = parts
+        .next()
+        .ok_or("Missing modpack slug in URL")?
+        .to_string();
+    let file_id = if parts.next() == Some("files") {
+        parts.next().and_then(|s| s.parse::<u64>().ok())
+    } else {
+        None
+    };
+    Ok((slug, file_id))
+}
+
+/// Construct a CurseForge CDN download URL from a file ID and filename.
+fn curseforge_cdn_url(file_id: u64, filename: &str) -> String {
+    let prefix = file_id / 1000;
+    let suffix = file_id % 1000;
+    format!(
+        "https://edge.forgecdn.net/files/{}/{}/{}",
+        prefix, suffix, filename
+    )
+}
+
+/// Fetch project info from CFWidget API (no API key needed).
+async fn cfwidget_project(slug: &str) -> Result<CfWidgetResponse, String> {
+    let url = format!("https://api.cfwidget.com/minecraft/modpacks/{}", slug);
+    let resp = client()?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("CFWidget request failed: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("CFWidget response parse error: {}", e))?;
+    Ok(resp)
+}
+
+/// Find a specific file in CFWidget response by file ID, or return the latest file.
+fn cfwidget_find_file<'a>(
+    project: &'a CfWidgetResponse,
+    file_id: Option<u64>,
+) -> Result<&'a CfWidgetFile, String> {
+    if let Some(fid) = file_id {
+        project
+            .files
+            .iter()
+            .find(|f| f.id == fid)
+            .ok_or_else(|| format!("File ID {} not found for this modpack", fid))
+    } else {
+        project
+            .files
+            .first()
+            .ok_or_else(|| "No files found for this modpack".to_string())
+    }
+}
+
+/// Install a CurseForge modpack from a URL
+/// (e.g. https://www.curseforge.com/minecraft/modpacks/...).
+/// Uses CFWidget API to resolve project info, then downloads from CDN.
+pub async fn install_curseforge_modpack_link(
+    app: std::sync::Arc<crate::app_state::AppEventSender>,
+    url: String,
+) -> Result<ServerConfig, String> {
+    let (slug, file_id) = parse_curseforge_url(&url)?;
+    emit_mod_progress(
+        &app,
+        "Resolving CurseForge pack",
+        &format!("Looking up {}", slug),
+        0,
+        1,
+    );
+
+    let project = cfwidget_project(&slug).await?;
+    let file = cfwidget_find_file(&project, file_id)?;
+    let cdn_url = curseforge_cdn_url(file.id, &file.name);
+
+    emit_mod_progress(
+        &app,
+        "Downloading CurseForge pack",
+        &file.name,
+        0,
+        1,
+    );
+    let tmp = std::env::temp_dir().join(format!(
+        "lbby-cf-{}.zip",
+        uuid::Uuid::new_v4().simple()
+    ));
+    download_bytes_to_file(
+        &app,
+        &cdn_url,
+        &tmp,
+        "Downloading CurseForge pack",
+        &file.name,
+        1,
+        1,
+    )
+    .await?;
+
+    // Delegate to existing CurseForge installer
+    let result = install_curseforge_modpack(app, tmp.to_string_lossy().to_string()).await;
+    // Clean up temp file
+    let _ = tokio::fs::remove_file(&tmp).await;
+    result
+}
+
+// ── Modrinth modpack search ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModrinthModpackHit {
+    pub project_id: String,
+    pub slug: String,
+    pub title: String,
+    pub description: String,
+    pub icon_url: Option<String>,
+    pub downloads: u64,
+    pub versions: Vec<String>,
+    pub server_side: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModrinthModpackSearchResponse {
+    hits: Vec<ModrinthModpackHit>,
+}
+
+/// Search Modrinth for modpacks matching a query.
+pub async fn search_modrinth_modpacks(
+    query: String,
+    mc_version: String,
+    loader: String,
+) -> Result<Vec<ModrinthModpackHit>, String> {
+    let facets = format!(
+        "[[\"project_type:modpack\"],[\"versions:{}\"],[\"categories:{}\"]]",
+        mc_version, loader
+    );
+    let resp: ModrinthModpackSearchResponse = client()?
+        .get("https://api.modrinth.com/v2/search")
+        .query(&[
+            ("query", query.as_str()),
+            ("facets", facets.as_str()),
+            ("limit", "20"),
+        ])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(resp.hits)
+}
+
 pub async fn add_mod(file_path: String, overwrite: Option<bool>) -> Result<(), String> {
     let cfg = config::load_config();
     let src = PathBuf::from(&file_path);
