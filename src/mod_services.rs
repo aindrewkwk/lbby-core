@@ -1791,8 +1791,10 @@ pub async fn install_curseforge_modpack(
             item.project_id, item.file_id
         );
         
+        eprintln!("[lbby] Download URL request: {} (API key: {})", download_url_endpoint, &CURSEFORGE_API_KEY[..10]);
         let download_url = match cf.get(&download_url_endpoint).send().await {
             Ok(resp) => {
+                eprintln!("[lbby] Download URL response: {}", resp.status());
                 if resp.status().is_success() {
                     #[derive(serde::Deserialize)]
                     struct DownloadUrlResponse {
