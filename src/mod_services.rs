@@ -2408,15 +2408,17 @@ pub struct MissingDependency {
     pub mod_id: String,
     pub version_range: String,
     pub source_mod: String,
+    pub installed_version: Option<String>,
+    pub issue_type: String, // "missing" or "incompatible"
 }
 
-/// Scan installed mods for missing dependencies. Returns a list of missing deps.
+/// Scan installed mods for missing or incompatible dependencies.
 pub fn scan_missing_dependencies() -> Vec<MissingDependency> {
     let cfg = config::load_config();
     let Ok(target_dir) = mods_dir(&cfg) else {
         return Vec::new();
     };
-    let mut installed_ids = HashSet::new();
+    let mut installed_mods: HashMap<String, String> = HashMap::new(); // mod_id -> version
     let mut installed_files = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(&target_dir) {
@@ -2428,39 +2430,91 @@ pub fn scan_missing_dependencies() -> Vec<MissingDependency> {
         }
     }
 
+    // Build map of installed mods: id -> version
     for path in &installed_files {
         let info = crate::helpers::read_mod_info(path);
-        if !info.display_name.is_empty() {
-            installed_ids.insert(info.display_name.to_lowercase());
-        }
         let file_stem = path.file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        installed_ids.insert(file_stem.to_lowercase());
+        let version = crate::helpers::extract_mod_version(&file_stem).unwrap_or_default();
+
+        // Try to get mod ID from filename (strip version)
+        let mod_id = if let Some(pos) = file_stem.rfind('-') {
+            file_stem[..pos].to_lowercase()
+        } else {
+            file_stem.to_lowercase()
+        };
+
+        if !mod_id.is_empty() {
+            installed_mods.insert(mod_id, version.clone());
+        }
+        // Also index by display name
+        if !info.display_name.is_empty() {
+            installed_mods.insert(info.display_name.to_lowercase(), version);
+        }
     }
 
-    let mut missing = Vec::new();
+    let mut issues = Vec::new();
     for path in &installed_files {
         let info = crate::helpers::read_mod_info(path);
         let source_mod = info.display_name.clone();
 
+        // Check Forge dependencies
         let deps = crate::helpers::read_forge_dependencies(path);
         for (mod_id, version_range) in deps {
-            if !installed_ids.contains(&mod_id.to_lowercase()) {
-                missing.push(MissingDependency { mod_id, version_range, source_mod: source_mod.clone() });
+            if let Some(installed_ver) = installed_mods.get(&mod_id.to_lowercase()) {
+                // Mod exists - check version compatibility
+                if !version_range.is_empty() && !crate::helpers::version_matches_range(installed_ver, &version_range) {
+                    issues.push(MissingDependency {
+                        mod_id,
+                        version_range,
+                        source_mod: source_mod.clone(),
+                        installed_version: Some(installed_ver.clone()),
+                        issue_type: "incompatible".to_string(),
+                    });
+                }
+            } else {
+                // Mod missing
+                issues.push(MissingDependency {
+                    mod_id,
+                    version_range,
+                    source_mod: source_mod.clone(),
+                    installed_version: None,
+                    issue_type: "missing".to_string(),
+                });
             }
         }
+
+        // Check Fabric dependencies
         let deps = crate::helpers::read_fabric_dependencies(path);
         for (mod_id, version_range) in deps {
-            if !installed_ids.contains(&mod_id.to_lowercase()) {
-                missing.push(MissingDependency { mod_id, version_range, source_mod: source_mod.clone() });
+            if let Some(installed_ver) = installed_mods.get(&mod_id.to_lowercase()) {
+                // Mod exists - check version compatibility
+                if !version_range.is_empty() && !crate::helpers::version_matches_range(installed_ver, &version_range) {
+                    issues.push(MissingDependency {
+                        mod_id,
+                        version_range,
+                        source_mod: source_mod.clone(),
+                        installed_version: Some(installed_ver.clone()),
+                        issue_type: "incompatible".to_string(),
+                    });
+                }
+            } else {
+                // Mod missing
+                issues.push(MissingDependency {
+                    mod_id,
+                    version_range,
+                    source_mod: source_mod.clone(),
+                    installed_version: None,
+                    issue_type: "missing".to_string(),
+                });
             }
         }
     }
 
-    missing.sort_by(|a, b| a.mod_id.cmp(&b.mod_id));
-    missing.dedup_by(|a, b| a.mod_id == b.mod_id);
-    missing
+    issues.sort_by(|a, b| a.mod_id.cmp(&b.mod_id));
+    issues.dedup_by(|a, b| a.mod_id == b.mod_id);
+    issues
 }
 
 /// Install specific missing dependencies by mod_id using Modrinth API.
@@ -2563,6 +2617,115 @@ pub async fn install_missing_dependencies(
 
     emit_mod_progress(&app, "Done", &format!("Installed {} dependencies", installed), total as u32, total as u32);
     Ok(installed)
+}
+
+/// Auto-fix dependency issues: install missing mods and fix incompatible versions.
+pub async fn auto_fix_dependencies(
+    app: std::sync::Arc<crate::app_state::AppEventSender>,
+) -> Result<u32, String> {
+    let issues = scan_missing_dependencies();
+    if issues.is_empty() {
+        return Ok(0);
+    }
+
+    let cfg = config::load_config();
+    let target_dir = mods_dir(&cfg)?;
+    let mc_version = &cfg.minecraft_version;
+    let loader = match cfg.server_type {
+        crate::config::ServerType::NeoForge => "neoforge".to_string(),
+        crate::config::ServerType::Forge => "forge".to_string(),
+        crate::config::ServerType::Fabric => "fabric".to_string(),
+        _ => format!("{:?}", cfg.server_type).to_lowercase(),
+    };
+
+    let client = client()?;
+    let mut fixed = 0u32;
+    let total = issues.len();
+
+    for (i, issue) in issues.iter().enumerate() {
+        let action = if issue.issue_type == "incompatible" {
+            format!("Fixing {} (have {})", issue.mod_id, issue.installed_version.as_deref().unwrap_or("?"))
+        } else {
+            format!("Installing {}", issue.mod_id)
+        };
+        emit_mod_progress(&app, "Fixing dependencies", &format!("{}/{}: {}", i + 1, total, action), (i + 1) as u32, total as u32);
+
+        // Search Modrinth for the mod
+        let search_url = format!(
+            "https://api.modrinth.com/v2/search?query={}",
+            urlencoding::encode(&issue.mod_id)
+        );
+
+        let resp = client.get(&search_url).timeout(std::time::Duration::from_secs(15)).send().await;
+        let Ok(resp) = resp else { continue; };
+        let body = resp.text().await.unwrap_or_default();
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&body) else { continue; };
+        let Some(hits) = data["hits"].as_array() else { continue; };
+
+        // Find matching mod
+        let normalized_id = issue.mod_id.replace('_', "-").to_lowercase();
+        let matching = hits.iter().find(|h| {
+            let slug = h["slug"].as_str().unwrap_or("").to_lowercase();
+            let title = h["title"].as_str().unwrap_or("").to_lowercase();
+            let mid = issue.mod_id.to_lowercase();
+            slug == mid || slug == normalized_id || title.contains(&mid) || mid.contains(&slug)
+        });
+
+        let Some(hit) = matching else { continue; };
+        let project_id = hit["project_id"].as_str().unwrap_or("");
+        if project_id.is_empty() { continue; }
+
+        // Get versions with compatible game version and loader
+        let game_versions = format!("[\"{}\"]", mc_version);
+        let loaders = format!("[\"{}\"]", loader);
+        let versions_url = format!(
+            "https://api.modrinth.com/v2/project/{}/version?game_versions={}&loaders={}",
+            project_id, game_versions, loaders
+        );
+        let versions_resp = client.get(&versions_url).timeout(std::time::Duration::from_secs(15)).send().await;
+        let Ok(versions_resp) = versions_resp else { continue; };
+        let versions_body = versions_resp.text().await.unwrap_or_default();
+        let Ok(versions) = serde_json::from_str::<serde_json::Value>(&versions_body) else { continue; };
+        let Some(version_list) = versions.as_array() else { continue; };
+
+        // For incompatible versions, try to find a version that matches the range
+        let compatible_version = if issue.issue_type == "incompatible" && !issue.version_range.is_empty() {
+            version_list.iter().find(|v| {
+                let ver_num = v["version_number"].as_str().unwrap_or("");
+                crate::helpers::version_matches_range(ver_num, &issue.version_range)
+            })
+        } else {
+            version_list.first()
+        };
+
+        let Some(version) = compatible_version else {
+            eprintln!("[lbby] auto_fix: no compatible version found for {} (need {})", issue.mod_id, issue.version_range);
+            continue;
+        };
+
+        let Some(files) = version["files"].as_array() else { continue; };
+        let Some(file) = files.first() else { continue; };
+        let download_url = file["url"].as_str().unwrap_or("");
+        let file_name = file["filename"].as_str().unwrap_or(&issue.mod_id);
+        if download_url.is_empty() { continue; }
+
+        let dest = target_dir.join(file_name);
+
+        // For incompatible versions, remove the old mod first
+        if issue.issue_type == "incompatible" {
+            if let Some(old_version) = &issue.installed_version {
+                let _ = remove_mod(format!("{}-{}", issue.mod_id, old_version));
+            }
+        }
+
+        if download_bytes_to_file(&app, download_url, &dest, "Fixing dependencies", file_name, (i + 1) as u32, total as u32).await.is_ok() {
+            fixed += 1;
+            eprintln!("[lbby] auto_fix: installed {} v{}", issue.mod_id, version["version_number"].as_str().unwrap_or("?"));
+        }
+    }
+
+    emit_mod_progress(&app, "Done", &format!("Fixed {} dependency issues", fixed), total as u32, total as u32);
+    Ok(fixed)
 }
 
 #[cfg(test)]

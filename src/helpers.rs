@@ -701,3 +701,91 @@ fn test_real_jar_dependencies() {
     assert!(!deps.is_empty(), "Should find dependencies");
     assert!(deps.iter().any(|(id, _)| id == "apothic_attributes"), "Should find apothic_attributes");
 }
+
+// ── Version Compatibility ─────────────────────────────────────────────────
+
+/// Check if a version string satisfies a version range (Forge/Fabric style).
+/// Supports: [1.0.0,) (inclusive lower, unbounded upper)
+///           (1.0.0,2.0.0) (exclusive bounds)
+///           [1.0.0,2.0.0] (inclusive bounds)
+///           1.0.0 (exact match)
+pub fn version_matches_range(version: &str, range: &str) -> bool {
+    let range = range.trim();
+    if range.is_empty() {
+        return true; // No constraint
+    }
+
+    // Parse the installed version (strip metadata like -hotfix, -beta, etc.)
+    let ver_str = version.split('-').next().unwrap_or(version);
+    let installed = match semver::Version::parse(ver_str) {
+        Ok(v) => v,
+        Err(_) => return false, // Can't parse, assume incompatible
+    };
+
+    // Handle simple exact version: "1.0.0"
+    if !range.contains(',') && !range.contains('(') && !range.contains('[') {
+        if let Ok(req) = semver::VersionReq::parse(range) {
+            return req.matches(&installed);
+        }
+        return false;
+    }
+
+    // Parse range format: [lower,upper] or (lower,upper) or mixed
+    let range = range.trim_start_matches('[').trim_start_matches('(');
+    let range = range.trim_end_matches(']').trim_end_matches(')');
+
+    let parts: Vec<&str> = range.splitn(2, ',').collect();
+    let lower_str = parts[0].trim();
+    let upper_str = parts.get(1).map(|s| s.trim()).unwrap_or("");
+
+    // Check lower bound
+    if !lower_str.is_empty() {
+        if let Ok(lower) = semver::Version::parse(lower_str) {
+            if installed < lower {
+                return false;
+            }
+        }
+    }
+
+    // Check upper bound
+    if !upper_str.is_empty() {
+        if let Ok(upper) = semver::Version::parse(upper_str) {
+            // Check if original range used exclusive upper bound
+            let original = range;
+            let is_exclusive_upper = original.ends_with(')') || original.contains(", ");
+            if is_exclusive_upper {
+                if installed >= upper {
+                    return false;
+                }
+            } else {
+                if installed > upper {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
+/// Extract mod version from filename (e.g., "tacz-1.1.8-hotfix.jar" -> "1.1.8")
+pub fn extract_mod_version(filename: &str) -> Option<String> {
+    let stem = std::path::Path::new(filename)
+        .file_stem()?
+        .to_str()?;
+
+    // Try to find version pattern: after last dash, before .jar
+    // Common patterns: "modname-1.0.0.jar", "modname-1.0.0-beta.jar"
+    let parts: Vec<&str> = stem.rsplitn(2, '-').collect();
+    if parts.len() == 2 {
+        let version_part = parts[0];
+        // Strip common suffixes
+        let version = version_part
+            .split('+').next()
+            .unwrap_or(version_part)
+            .split('_').next()
+            .unwrap_or(version_part);
+        return Some(version.to_string());
+    }
+    None
+}
