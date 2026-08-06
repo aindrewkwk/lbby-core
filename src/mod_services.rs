@@ -2505,6 +2505,11 @@ pub fn scan_missing_dependencies() -> Vec<MissingDependency> {
 
     issues.sort_by(|a, b| a.mod_id.cmp(&b.mod_id));
     issues.dedup_by(|a, b| a.mod_id == b.mod_id);
+    eprintln!("[lbby] scan_missing_dependencies: found {} issues (missing: {}, incompatible: {})",
+        issues.len(),
+        issues.iter().filter(|i| i.issue_type == "missing").count(),
+        issues.iter().filter(|i| i.issue_type == "incompatible").count()
+    );
     issues
 }
 
@@ -2614,7 +2619,12 @@ pub async fn install_missing_dependencies(
 pub async fn auto_fix_dependencies(
     app: std::sync::Arc<crate::app_state::AppEventSender>,
 ) -> Result<u32, String> {
+    eprintln!("[lbby] auto_fix_dependencies: scanning...");
     let issues = scan_missing_dependencies();
+    eprintln!("[lbby] auto_fix_dependencies: found {} issues", issues.len());
+    for issue in &issues {
+        eprintln!("  - {} ({}) for {}", issue.mod_id, issue.issue_type, issue.source_mod);
+    }
     if issues.is_empty() {
         return Ok(0);
     }
