@@ -1808,8 +1808,8 @@ pub async fn install_curseforge_modpack(
                         }
                     }
                 } else {
-                    eprintln!("[lbby] Download URL endpoint failed: {}", resp.status());
-                    return Err(format!("Failed to get download URL for mod {} (HTTP {})", item.project_id, resp.status()));
+                    eprintln!("[lbby] Download URL endpoint failed: {} for mod {} (skipping)", resp.status(), item.project_id);
+                    continue;
                 }
             }
             Err(e) => {
