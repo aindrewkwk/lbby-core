@@ -622,13 +622,7 @@ struct CfHash {
 }
 
 fn curseforge_client() -> Result<reqwest::Client, String> {
-    // CurseForge official API requires API key
-    let api_key = crate::config::load_config()
-        .curseforge_api_key
-        .filter(|key| !key.trim().is_empty())
-        .ok_or_else(|| {
-            "CurseForge API key is required. Get one from https://curseforge.com/account/api-tokens and add it in Settings.".to_string()
-        })?;
+    let api_key = crate::mod_services::CURSEFORGE_API_KEY;
     
     reqwest::Client::builder()
         .user_agent("Lbby/0.1.0 (Minecraft server hosting app)")

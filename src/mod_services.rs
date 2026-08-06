@@ -185,6 +185,9 @@ pub struct CurseFingerprintMatch {
 
 pub const UNVERIFIED_CURSEFORGE_ZIP: &str = "UNVERIFIED_CURSEFORGE_ZIP:";
 
+// CurseForge API Key (shared across all Lbby instances)
+pub const CURSEFORGE_API_KEY: &str = "$2a$10$ng5QfluekSLUzzSyFt3Ea.OTs1q028T1gAo/rMr0LBshjtdbqD.W2";
+
 // ── CurseForge Helpers ──────────────────────────────────────────────────────
 
 pub fn response_preview(body: &str) -> String {
@@ -681,10 +684,7 @@ pub async fn search_curseforge_mods(
     minecraft_version: String,
     _server_type: ServerType,
 ) -> Result<Vec<ModrinthSearchHit>, String> {
-    let api_key = crate::config::load_config()
-        .curseforge_api_key
-        .filter(|k| !k.trim().is_empty())
-        .ok_or("CurseForge search requires an API key")?;
+    let api_key = CURSEFORGE_API_KEY;
 
     let client = curseforge_http_client()?;
     let url = format!(
@@ -695,7 +695,7 @@ pub async fn search_curseforge_mods(
 
     let resp = client
         .get(&url)
-        .header("x-api-key", &api_key)
+        .header("x-api-key", api_key)
         .send()
         .await
         .map_err(|e| format!("CurseForge search error: {}", e))?;
@@ -787,15 +787,6 @@ pub(crate) fn client() -> Result<reqwest::Client, String> {
 }
 
 fn curseforge_client() -> Result<reqwest::Client, String> {
-    // CurseForge official API requires API key
-    // If no API key is configured, return error with helpful message
-    let api_key = config::load_config()
-        .curseforge_api_key
-        .filter(|key| !key.trim().is_empty())
-        .ok_or_else(|| {
-            "CurseForge API key is required. Get one from https://curseforge.com/account/api-tokens and add it in Settings.".to_string()
-        })?;
-    
     reqwest::Client::builder()
         .user_agent("Lbby/0.1.0 (Minecraft server hosting app)")
         .timeout(std::time::Duration::from_secs(30))
@@ -803,7 +794,7 @@ fn curseforge_client() -> Result<reqwest::Client, String> {
             let mut headers = reqwest::header::HeaderMap::new();
             headers.insert(
                 "x-api-key",
-                reqwest::header::HeaderValue::from_str(api_key.trim())
+                reqwest::header::HeaderValue::from_str(CURSEFORGE_API_KEY)
                     .map_err(|_| "Invalid CurseForge API key".to_string())?,
             );
             headers
