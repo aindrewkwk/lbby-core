@@ -173,6 +173,12 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
         }
     }
 
+    // Remove client-only mods before starting server
+    let removed = crate::mod_services::remove_client_only_mods(&app);
+    if !removed.is_empty() {
+        eprintln!("[lbby] Removed {} client-only mods before server start: {}", removed.len(), removed.join(", "));
+    }
+
     // Mark the server as Starting immediately — before any Java download or
     // version detection — so the frontend shows the "Starting" status pill
     // right away instead of staying on "Stopped" during network activity.

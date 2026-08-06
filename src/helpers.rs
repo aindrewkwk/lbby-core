@@ -440,11 +440,52 @@ pub fn is_client_only_mod(path: &std::path::Path) -> bool {
         "optifine", "iris", "shaders", "sodium", "lithium",
         "phosphor", "starlight", "rubidium", "embeddium",
         "oculus", "continuity", "indium", "immediatelyfast",
-        "capes", "cosmetics", "emotes",
+        "capes", "cosmetics", "emotes", "chattoggle", "zylob",
+        "itemphysic", "shouldersurfing", "journeymap",
     ];
     for name in &client_only_names {
         if filename.contains(name) {
             return true;
+        }
+    }
+
+    // Scan jar for client class references in main mod classes
+    // Re-open zip for scanning
+    let Ok(file2) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(mut zip2) = zip::ZipArchive::new(file2) else {
+        return false;
+    };
+    let client_classes = [
+        "net/minecraft/client/gui/screens/Screen",
+        "net/minecraft/client/KeyMapping",
+        "net/minecraft/client/renderer/GameRenderer",
+        "net/minecraft/client/gui/Gui",
+        "net/minecraft/client/player/LocalPlayer",
+        "net/minecraft/client/particle/",
+        "net/minecraft/client/model/",
+        "net/minecraft/client/renderer/RenderType",
+        "net/minecraft/client/renderer/entity/",
+        "com/mojang/blaze3d/",
+    ];
+    for i in 0..zip2.len() {
+        let Ok(entry) = zip2.by_index(i) else { continue };
+        let name = entry.name().to_string();
+        // Only check main mod classes, not META-INF
+        if name.starts_with("META-INF/") || !name.ends_with(".class") {
+            continue;
+        }
+        // Read class bytes and check for client class references
+        let mut buf = Vec::new();
+        let mut limited = entry.take(65536);
+        let Ok(_) = std::io::Read::read_to_end(&mut limited, &mut buf) else { continue };
+        let content = String::from_utf8_lossy(&buf);
+        for client_class in &client_classes {
+            if content.contains(client_class) {
+                eprintln!("[lbby] Detected client class ref '{}' in {}", client_class, name);
+                return true;
+            }
         }
     }
 
