@@ -478,30 +478,123 @@ pub async fn prefer_curseforge_server_pack(
     if client_file.is_server_pack {
         return Ok(client_file);
     }
-    let Some(server_pack_id) = official_server_pack_id(&client_file) else {
+
+    // 1. Check official serverPackFileId on the client file
+    if let Some(server_pack_id) = official_server_pack_id(&client_file) {
         let _ = app.emit(
             "mod-task-progress",
             ModTaskProgress {
-                stage: "No official server pack".to_string(),
-                message: "The author did not publish a server pack; using the side-filtered client manifest.".to_string(),
-                current: 0,
+                stage: "Selecting server pack".to_string(),
+                message: format!("Using official CurseForge server pack {}", server_pack_id),
+                current: 1,
                 total: 1,
-                progress: 0.0,
+                progress: 1.0,
             },
         );
-        return Ok(client_file);
-    };
+        return curseforge_file_by_id(client, api_key, server_pack_id).await;
+    }
+
+    // 2. Search CurseForge for a separate server pack mod (e.g. "{slug} server pack")
     let _ = app.emit(
         "mod-task-progress",
         ModTaskProgress {
-            stage: "Selecting server pack".to_string(),
-            message: format!("Using official CurseForge server pack {}", server_pack_id),
+            stage: "Searching for server pack".to_string(),
+            message: "Looking for a dedicated server pack on CurseForge...".to_string(),
+            current: 0,
+            total: 1,
+            progress: 0.0,
+        },
+    );
+
+    // Extract mod name from file_name to build search query
+    let mod_name = client_file
+        .file_name
+        .replace(".zip", "")
+        .replace("-server", "")
+        .replace("-client", "")
+        .replace("_server", "")
+        .replace("_client", "");
+    let search_query = format!("{} server pack", mod_name);
+
+    let search_url = format!(
+        "https://api.curseforge.com/v1/mods/search?gameId=432&searchFilter={}&classId=4471&pageSize=5",
+        urlencoding::encode(&search_query)
+    );
+
+    let resp = client
+        .get(&search_url)
+        .header("x-api-key", api_key)
+        .send()
+        .await;
+
+    if let Ok(resp) = resp {
+        if resp.status().is_success() {
+            if let Ok(data) = resp.json::<serde_json::Value>().await {
+                if let Some(hits) = data["data"].as_array() {
+                    // Find a mod that looks like a server pack
+                    for hit in hits {
+                        let name = hit["name"].as_str().unwrap_or("").to_string();
+                        let id = hit["id"].as_u64();
+                        let slug = hit["slug"].as_str().unwrap_or("");
+
+                        // Check if this mod's name contains "server" and is related to the original
+                        if name.to_lowercase().contains("server")
+                            && (slug.to_lowercase().contains(&mod_name.to_lowercase().replace(" ", "-"))
+                                || name.to_lowercase().contains(&mod_name.to_lowercase()))
+                        {
+                            if let Some(mod_id) = id {
+                                // Get the latest file for this server pack mod
+                                let files_url = format!(
+                                    "https://api.curseforge.com/v1/mods/{}/files?gameVersion={}&pageSize=1",
+                                    mod_id,
+                                    urlencoding::encode(&client_file.game_versions.first().map(|s| s.as_str()).unwrap_or(""))
+                                );
+                                if let Ok(files_resp) = client
+                                    .get(&files_url)
+                                    .header("x-api-key", api_key)
+                                    .send()
+                                    .await
+                                {
+                                    if let Ok(files_data) = files_resp.json::<serde_json::Value>().await {
+                                        if let Some(files) = files_data["data"].as_array() {
+                                            if let Some(file) = files.first() {
+                                                if let Ok(server_file) = serde_json::from_value::<CurseFileEntry>(file.clone()) {
+                                                    let _ = app.emit(
+                                                        "mod-task-progress",
+                                                        ModTaskProgress {
+                                                            stage: "Found server pack".to_string(),
+                                                            message: format!("Using CurseForge server pack: {}", server_file.file_name),
+                                                            current: 1,
+                                                            total: 1,
+                                                            progress: 1.0,
+                                                        },
+                                                    );
+                                                    return Ok(server_file);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. No server pack found - use client pack
+    let _ = app.emit(
+        "mod-task-progress",
+        ModTaskProgress {
+            stage: "No server pack found".to_string(),
+            message: "No dedicated server pack found; using the client modpack.".to_string(),
             current: 1,
             total: 1,
             progress: 1.0,
         },
     );
-    curseforge_file_by_id(client, api_key, server_pack_id).await
+    Ok(client_file)
 }
 
 pub async fn download_curseforge_file(
