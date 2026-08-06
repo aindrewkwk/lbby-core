@@ -373,6 +373,84 @@ pub async fn do_install_server(
 
 // ── Generic helpers (migrated from lbby-agent/src/lib.rs) ────────────────────
 
+/// Check if a mod JAR is client-only (should not be on a dedicated server).
+pub fn is_client_only_mod(path: &std::path::Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(mut zip) = zip::ZipArchive::new(file) else {
+        return false;
+    };
+
+    // Check Forge mods.toml
+    if let Some(text) = read_zip_text(&mut zip, "META-INF/mods.toml")
+        .or_else(|| read_zip_text(&mut zip, "META-INF/neoforge.mods.toml"))
+        .or_else(|| read_zip_text(&mut zip, "mods.toml"))
+    {
+        if let Ok(value) = text.parse::<toml::Value>() {
+            // Check dependencies for clientSideOnly
+            if let Some(deps) = value.get("dependencies").and_then(|d| d.as_table()) {
+                for (_key, dep_list) in deps {
+                    if let Some(arr) = dep_list.as_array() {
+                        for dep in arr {
+                            if dep.get("clientSideOnly").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            // Check display name or other indicators
+            if let Some(title) = value.get("title").and_then(|v| v.as_str()) {
+                let lower = title.to_lowercase();
+                if lower.contains("shader") || lower.contains("optifine") || lower.contains("iris") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Check Fabric fabric.mod.json
+    if let Some(text) = read_zip_text(&mut zip, "fabric.mod.json") {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            // Check environment field
+            if let Some(env) = value.get("environment").and_then(|v| v.as_str()) {
+                if env == "client" {
+                    return true;
+                }
+            }
+            // Check mixins for client-only indicators
+            if let Some(mixins) = value.get("mixins") {
+                if let Some(arr) = mixins.as_array() {
+                    for m in arr {
+                        if let Some(s) = m.as_str() {
+                            if s.to_lowercase().contains("client") {
+                                // Could be client-only, but need more context
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check filename for common client-only indicators
+    let filename = path.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let client_only_names = [
+        "optifine", "iris", "shaders", "sodium", "lithium",
+        "phosphor", "starlight", "rubidium", "embeddium",
+        "oculus", "continuity", "indium", "immediatelyfast",
+        "capes", "cosmetics", "emotes",
+    ];
+    for name in &client_only_names {
+        if filename.contains(name) {
+            return true;
+        }
+    }
+
+    false
+}
+
 pub fn is_private_or_local_host(host: &str) -> bool {
     let h = host
         .trim_matches(|c| c == '[' || c == ']')

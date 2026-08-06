@@ -2404,6 +2404,44 @@ pub struct MissingDependency {
 }
 
 /// Scan installed mods for missing or incompatible dependencies.
+/// Scan mods directory for client-only mods and remove them.
+/// Returns list of removed mod names.
+pub fn remove_client_only_mods(app: &std::sync::Arc<crate::app_state::AppEventSender>) -> Vec<String> {
+    let cfg = config::load_config();
+    let Ok(target_dir) = mods_dir(&cfg) else {
+        return Vec::new();
+    };
+
+    let mut removed = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&target_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "jar") {
+                if crate::helpers::is_client_only_mod(&path) {
+                    let name = path.file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    eprintln!("[lbby] Removing client-only mod: {}", name);
+                    if std::fs::remove_file(&path).is_ok() {
+                        removed.push(name);
+                    }
+                }
+            }
+        }
+    }
+
+    if !removed.is_empty() {
+        emit_mod_progress(
+            app,
+            "Client mods removed",
+            &format!("Removed {} client-only mods: {}", removed.len(), removed.join(", ")),
+            1, 1,
+        );
+    }
+
+    removed
+}
+
 pub fn scan_missing_dependencies() -> Vec<MissingDependency> {
     let cfg = config::load_config();
     let Ok(target_dir) = mods_dir(&cfg) else {
