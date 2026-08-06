@@ -2404,6 +2404,35 @@ pub struct MissingDependency {
 }
 
 /// Scan installed mods for missing or incompatible dependencies.
+/// File that stores names of mods removed as client-only (so we don't re-install them).
+fn client_removed_file() -> std::path::PathBuf {
+    crate::config::config_path().parent().unwrap_or(std::path::Path::new(".")).join("client_removed_mods.txt")
+}
+
+/// Load list of previously removed client-only mod names.
+pub fn load_client_removed_mods() -> Vec<String> {
+    std::fs::read_to_string(client_removed_file())
+        .unwrap_or_default()
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Add mod names to the client-removed list (so they won't be re-installed).
+pub fn save_client_removed_mods(names: &[String]) {
+    let path = client_removed_file();
+    let mut existing = load_client_removed_mods();
+    for name in names {
+        let lower = name.to_lowercase();
+        if !existing.iter().any(|e| e.to_lowercase() == lower) {
+            existing.push(name.clone());
+        }
+    }
+    let _ = std::fs::write(path, existing.join("
+"));
+}
+
 /// Scan mods directory for client-only mods and remove them.
 /// Returns list of removed mod names.
 pub fn remove_client_only_mods(app: &std::sync::Arc<crate::app_state::AppEventSender>) -> Vec<String> {
@@ -2431,6 +2460,8 @@ pub fn remove_client_only_mods(app: &std::sync::Arc<crate::app_state::AppEventSe
     }
 
     if !removed.is_empty() {
+        // Save removed names so we don't re-install them
+        save_client_removed_mods(&removed);
         emit_mod_progress(
             app,
             "Client mods removed",
@@ -2569,7 +2600,20 @@ pub async fn install_missing_dependencies(
     let mut installed = 0u32;
     let total = mod_ids.len();
 
+    // Load list of mods removed as client-only (don't re-install them)
+    let client_removed = load_client_removed_mods();
+    let client_removed_lower: Vec<String> = client_removed.iter().map(|s| s.to_lowercase()).collect();
+
     for (i, mod_id) in mod_ids.iter().enumerate() {
+        // Skip mods that were removed as client-only
+        let mod_id_lower = mod_id.to_lowercase();
+        if client_removed_lower.iter().any(|removed| {
+            mod_id_lower.contains(removed) || removed.contains(&mod_id_lower)
+        }) {
+            eprintln!("[lbby] Skipping {} (was removed as client-only)", mod_id);
+            continue;
+        }
+
         emit_mod_progress(&app, "Installing dependencies", &format!("{}/{}: {}", i + 1, total, mod_id), (i + 1) as u32, total as u32);
 
         let search_url = format!(
