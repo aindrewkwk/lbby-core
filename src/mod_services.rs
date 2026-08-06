@@ -569,7 +569,7 @@ pub async fn download_curseforge_file(
                     message: format!("{} / {} MB", downloaded / 1024 / 1024, total_size / 1024 / 1024),
                     current: downloaded as u32,
                     total: total_size as u32,
-                    progress: if total_size > 0 { downloaded as f64 / total_size as f64 } else { 0.0 },
+                    progress: if total_size > 0 { downloaded as f32 / total_size as f32 } else { 0.0 },
                 },
             );
             last_emit = std::time::Instant::now();
