@@ -1986,7 +1986,10 @@ async fn install_vanilla(
     server_dir: &Path,
 ) -> Result<(), String> {
     emit_progress(app, "Fetching version info\u{2026}", 0.05);
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let manifest: VersionManifest = client
         .get("https://launchermeta.mojang.com/mc/game/version_manifest_v2.json")
         .send()
@@ -2028,7 +2031,10 @@ async fn install_paper(
     let build = cfg.loader_version.as_deref().ok_or("No build selected")?;
     let mc = &cfg.minecraft_version;
     emit_progress(app, "Fetching Paper build info\u{2026}", 0.1);
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let info: PaperBuild = client
         .get(format!(
             "https://fill.papermc.io/v3/projects/paper/versions/{}/builds/{}",
@@ -2280,7 +2286,10 @@ async fn install_folia(
         .ok_or("No Folia build selected")?;
     let mc = &cfg.minecraft_version;
     emit_progress(app, "Fetching Folia build info\u{2026}", 0.1);
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let info: PaperBuild = client
         .get(format!(
             "https://fill.papermc.io/v3/projects/folia/versions/{}/builds/{}",
@@ -2462,7 +2471,10 @@ async fn install_sponge_forge(
         .ok_or("No SpongeForge version selected")?;
 
     // Fetch the Sponge API to find the specific Forge version for this Sponge version
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let api_url = format!(
         "https://dl-api.spongepowered.org/v2/groups/org.spongepowered/artifacts/spongeforge/versions?tags=minecraft:{}&limit=50",
         mc
@@ -2765,7 +2777,10 @@ async fn install_tmodloader(
     emit_progress(app, "Fetching tModLoader release info\u{2026}", 0.05);
 
     // Get the latest release from GitHub
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let releases_url = "https://api.github.com/repos/tModLoader/tModLoader/releases/latest";
     let release: serde_json::Value = client
         .get(releases_url)

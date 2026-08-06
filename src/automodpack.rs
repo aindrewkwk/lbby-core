@@ -78,6 +78,7 @@ fn mods_dir(cfg: &ServerConfig) -> Result<PathBuf, String> {
 fn http() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent("Lbby/0.1.0 (AutoModpack installer)")
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| e.to_string())
 }

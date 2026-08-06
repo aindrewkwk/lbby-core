@@ -91,7 +91,10 @@ struct SpongeArtifactInfo {
 // ── Version-fetching functions ───────────────────────────────────────────────
 
 pub async fn fetch_mc_versions() -> Result<Vec<McVersion>, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let manifest: VersionManifest = client
         .get("https://launchermeta.mojang.com/mc/game/version_manifest_v2.json")
         .send()
@@ -114,7 +117,10 @@ pub async fn fetch_mc_versions() -> Result<Vec<McVersion>, String> {
 }
 
 pub async fn fetch_paper_versions() -> Result<Vec<String>, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let proj: PaperProject = client
         .get("https://api.papermc.io/v2/projects/paper")
         .send()
@@ -129,7 +135,10 @@ pub async fn fetch_paper_versions() -> Result<Vec<String>, String> {
 }
 
 pub async fn fetch_paper_builds(mc_version: String) -> Result<Vec<LoaderVersion>, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let v: PaperVersion = client
         .get(format!(
             "https://api.papermc.io/v2/projects/paper/versions/{}",
@@ -149,7 +158,10 @@ pub async fn fetch_paper_builds(mc_version: String) -> Result<Vec<LoaderVersion>
 }
 
 pub async fn fetch_forge_versions(mc_version: String) -> Result<Vec<LoaderVersion>, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let promos: ForgePromotions = client
         .get("https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json")
         .header("User-Agent", "MCHost/0.1")
@@ -179,7 +191,10 @@ pub async fn fetch_forge_versions(mc_version: String) -> Result<Vec<LoaderVersio
 }
 
 pub async fn fetch_fabric_versions(mc_version: String) -> Result<Vec<LoaderVersion>, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let loaders: Vec<FabricLoader> = client
         .get(format!(
             "https://meta.fabricmc.net/v2/versions/loader/{}",
@@ -203,7 +218,10 @@ pub async fn fetch_fabric_versions(mc_version: String) -> Result<Vec<LoaderVersi
 
 pub async fn fetch_neoforge_versions(mc_version: String) -> Result<Vec<LoaderVersion>, String> {
     // NeoForge versions look like "20.4.244" → MC 1.20.4. We want the prefix matching mc_version.
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let v: NeoForgeVersions = client
         .get("https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge")
         .send()
@@ -234,7 +252,10 @@ pub async fn fetch_neoforge_versions(mc_version: String) -> Result<Vec<LoaderVer
 // ── Folia versions (same API as Paper, different project) ────────────────────
 
 pub async fn fetch_folia_versions() -> Result<Vec<String>, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let proj: PaperProject = client
         .get("https://api.papermc.io/v2/projects/folia")
         .send()
@@ -249,7 +270,10 @@ pub async fn fetch_folia_versions() -> Result<Vec<String>, String> {
 }
 
 pub async fn fetch_folia_builds(mc_version: String) -> Result<Vec<LoaderVersion>, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let v: PaperVersion = client
         .get(format!(
             "https://api.papermc.io/v2/projects/folia/versions/{}",
@@ -271,7 +295,10 @@ pub async fn fetch_folia_builds(mc_version: String) -> Result<Vec<LoaderVersion>
 // ── Purpur versions ──────────────────────────────────────────────────────────
 
 pub async fn fetch_purpur_versions() -> Result<Vec<String>, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let v: PurpurVersions = client
         .get("https://api.purpurmc.org/v2/purpur")
         .send()
@@ -286,7 +313,10 @@ pub async fn fetch_purpur_versions() -> Result<Vec<String>, String> {
 }
 
 pub async fn fetch_purpur_builds(mc_version: String) -> Result<Vec<LoaderVersion>, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let v: PurpurBuilds = client
         .get(format!("https://api.purpurmc.org/v2/purpur/{}", mc_version))
         .send()
@@ -306,7 +336,10 @@ pub async fn fetch_purpur_builds(mc_version: String) -> Result<Vec<LoaderVersion
 pub async fn fetch_sponge_vanilla_versions(
     mc_version: String,
 ) -> Result<Vec<LoaderVersion>, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let url = format!(
         "https://dl-api.spongepowered.org/v2/groups/org.spongepowered/artifacts/spongevanilla/versions?tags=minecraft:{}&limit=5",
         mc_version
@@ -332,7 +365,10 @@ pub async fn fetch_sponge_vanilla_versions(
 }
 
 pub async fn fetch_sponge_forge_versions(mc_version: String) -> Result<Vec<LoaderVersion>, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let url = format!(
         "https://dl-api.spongepowered.org/v2/groups/org.spongepowered/artifacts/spongeforge/versions?tags=minecraft:{}&limit=5",
         mc_version

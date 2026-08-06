@@ -321,7 +321,10 @@ async fn download_jre(
     );
 
     // Query Adoptium for the download URL
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let assets: Vec<AdoptiumAsset> = client
         .get(&api_url)
         .send()

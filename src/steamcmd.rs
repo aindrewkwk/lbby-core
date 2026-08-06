@@ -142,7 +142,10 @@ pub async fn install_steamcmd(
     )
     .ok();
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
     let resp = client
         .get(url)
         .send()

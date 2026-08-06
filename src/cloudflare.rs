@@ -126,6 +126,7 @@ pub async fn ensure_cloudflared() -> Result<PathBuf, String> {
 
     let bytes = reqwest::Client::builder()
         .user_agent("Lbby")
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| e.to_string())?
         .get(url)

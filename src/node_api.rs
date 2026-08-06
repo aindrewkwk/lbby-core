@@ -465,7 +465,10 @@ async fn download_server_jar(
     server_dir: &Path,
     app: &Arc<AppEventSender>,
 ) -> Result<(), NodeApiError> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
 
     match spec.distribution.as_str() {
         "paper" => {

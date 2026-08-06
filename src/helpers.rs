@@ -56,6 +56,7 @@ pub async fn download_to_file(
 ) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .user_agent("Lbby")
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
