@@ -1,6 +1,6 @@
 [package]
 name = "lbby-core"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 description = "Shared core library for Lbby agent and app — server management, mods, tunnels, backups"
 
