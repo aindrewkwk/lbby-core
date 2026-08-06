@@ -584,14 +584,80 @@ pub async fn download_curseforge_file(
 // ── CurseForge Search ──────────────────────────────────────────────────────
 
 pub async fn search_curseforge_mods(
-    _query: String,
-    _minecraft_version: String,
+    query: String,
+    minecraft_version: String,
     _server_type: ServerType,
 ) -> Result<Vec<ModrinthSearchHit>, String> {
-    // CurseForge search API is blocked by Cloudflare (403).
-    // Use Modrinth for search instead. CurseForge is only available for
-    // modpack install by numeric ID.
-    Err("CurseForge search is temporarily unavailable. Use Modrinth for search, or install CurseForge modpacks by numeric ID.".to_string())
+    let api_key = crate::config::load_config()
+        .curseforge_api_key
+        .filter(|k| !k.trim().is_empty())
+        .ok_or("CurseForge search requires an API key")?;
+
+    let client = curseforge_http_client()?;
+    let url = format!(
+        "https://api.curseforge.com/v1/mods/search?gameId=432&searchFilter={}&gameVersion={}&classId=6&pageSize=20",
+        urlencoding::encode(&query),
+        urlencoding::encode(&minecraft_version)
+    );
+
+    let resp = client
+        .get(&url)
+        .header("x-api-key", &api_key)
+        .send()
+        .await
+        .map_err(|e| format!("CurseForge search error: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("CurseForge search failed ({}): {}", status, response_preview(&text)));
+    }
+
+    let data: serde_json::Value = resp.json().await.map_err(|e| format!("CurseForge parse error: {}", e))?;
+    let hits = data["data"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    let id = m["id"].as_u64()?;
+                    let name = m["name"].as_str()?.to_string();
+                    let slug = m["slug"].as_str()?.to_string();
+                    let desc = m["summary"].as_str().unwrap_or("").to_string();
+                    let icon = m.get("logo").and_then(|l| l["thumbnailUrl"].as_str()).map(|s| s.to_string());
+                    let versions: Vec<String> = m.get("latestFiles")
+                        .and_then(|f| f.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|f| f["gameVersion"].as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let loaders: Vec<String> = m.get("latestFiles")
+                        .and_then(|f| f.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|f| f.get("gameVersion"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some(ModrinthSearchHit {
+                        project_id: id.to_string(),
+                        slug,
+                        title: name,
+                        description: desc,
+                        icon_url: icon,
+                        versions,
+                        loaders,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(hits)
 }
 
 fn emit_mod_progress(
