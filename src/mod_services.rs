@@ -2776,7 +2776,6 @@ mod tests {
         curseforge_cdn_parts, curseforge_fingerprint_reader, official_server_pack_id,
         parse_curseforge_source, validate_curseforge_file_for_profile, CurseFilesResponse,
     };
-    use std::io::Cursor;
 
     #[test]
     fn parses_file_id_from_curseforge_url() {
