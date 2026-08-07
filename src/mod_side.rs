@@ -35,6 +35,45 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
+fn jar_get_dependencies(path: &Path) -> Option<Vec<String>> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return None;
+    };
+    let Ok(mut jar) = zip::ZipArchive::new(file) else {
+        return None;
+    };
+
+    // Check Fabric fabric.mod.json
+    if let Ok(mut entry) = jar.by_name("fabric.mod.json") {
+        let mut contents = String::new();
+        if entry.read_to_string(&mut contents).is_ok() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
+                if let Some(deps) = value.get("depends").and_then(|d| d.as_object()) {
+                    let dep_names: Vec<String> = deps.keys().cloned().collect();
+                    return Some(dep_names);
+                }
+            }
+        }
+    }
+
+    // Check Forge mods.toml
+    for metadata_path in ["META-INF/mods.toml", "META-INF/neoforge.mods.toml"] {
+        if let Ok(mut entry) = jar.by_name(metadata_path) {
+            let mut contents = String::new();
+            if entry.read_to_string(&mut contents).is_ok() {
+                if let Ok(value) = contents.parse::<toml::Value>() {
+                    if let Some(deps) = value.get("dependencies").and_then(|d| d.as_table()) {
+                        let dep_names: Vec<String> = deps.keys().cloned().collect();
+                        return Some(dep_names);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 pub fn jar_declares_client_only(path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
         return false;
@@ -259,12 +298,40 @@ pub async fn quarantine_client_only_mods(server_root: &Path) -> Result<Vec<Strin
 
     let quarantine = server_root.join(".lbby-client-only-mods");
     let mut moved = Vec::new();
+    let mut client_mod_ids = HashSet::new();
+
+    // First pass: identify client-only mods
+    for path in &jars {
+        if jar_declares_client_only(path) {
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            client_mod_ids.insert(name);
+        }
+    }
+
+    // Second pass: check for mods that depend on client-only mods
+    for path in &jars {
+        if client_mod_ids.contains(&path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()) {
+            continue; // Skip client mods themselves
+        }
+        // Check if this mod depends on any client-only mod
+        if let Some(deps) = jar_get_dependencies(path) {
+            for dep in &deps {
+                if client_mod_ids.iter().any(|c| c.contains(dep) || dep.contains(&c[..c.len().min(10)])) {
+                    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    eprintln!("[lbby] Removing {} because it depends on client mod {}", name, dep);
+                    client_mod_ids.insert(name);
+                }
+            }
+        }
+    }
+
     for path in jars {
         let should_move = !cached_safe_paths.contains(&path)
             && (jar_declares_client_only(&path)
                 || hashes_by_path
                     .get(&path)
-                    .is_some_and(|hash| remote_client_only.contains(hash)));
+                    .is_some_and(|hash| remote_client_only.contains(hash))
+                || client_mod_ids.contains(&path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()));
         if !should_move {
             if let Some((name, signature)) = signatures.get(&path) {
                 if remote_complete || !hashes_by_path.contains_key(&path) {
