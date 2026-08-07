@@ -419,16 +419,21 @@ pub fn is_client_only_mod(path: &std::path::Path) -> bool {
                     return true;
                 }
             }
-            // Check mixins for client-only indicators
-            if let Some(mixins) = value.get("mixins") {
-                if let Some(arr) = mixins.as_array() {
-                    for m in arr {
-                        if let Some(s) = m.as_str() {
-                            if s.to_lowercase().contains("client") {
-                                // Could be client-only, but need more context
-                            }
-                        }
-                    }
+            // Check if ONLY has client entrypoint (no main/server entrypoint)
+            if let Some(entrypoints) = value.get("entrypoints") {
+                let has_client = entrypoints.get("client").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+                let has_main = entrypoints.get("main").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+                let has_server = entrypoints.get("server").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+                // If only client entrypoint and no main/server, it's client-only
+                if has_client && !has_main && !has_server {
+                    return true;
+                }
+            }
+            // Check description for client-only keywords
+            if let Some(desc) = value.get("description").and_then(|v| v.as_str()) {
+                let lower = desc.to_lowercase();
+                if lower.contains("shader") || lower.contains("iris") || lower.contains("render") {
+                    return true;
                 }
             }
         }
