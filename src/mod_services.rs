@@ -1774,70 +1774,78 @@ pub async fn install_curseforge_modpack(
         .map_err(|e| e.to_string())?;
     let total = manifest.files.iter().filter(|f| f.required).count() as u32;
     let cf = curseforge_client()?;
-    let mut current = 0;
-    for item in manifest.files.iter().filter(|f| f.required) {
-        current += 1;
-        emit_mod_progress(
-            &app,
-            "Resolving CurseForge file",
-            &format!("{} / {}", current, total),
-            current,
-            total,
-        );
-        // Use CurseForge official API to get download URL
-        // API key is already included in curseforge_client() headers
-        let download_url_endpoint = format!(
-            "https://api.curseforge.com/v1/mods/{}/files/{}/download-url",
-            item.project_id, item.file_id
-        );
-        
-        eprintln!("[lbby] Download URL request: {} (API key: {})", download_url_endpoint, &CURSEFORGE_API_KEY[..10]);
-        let download_url = match cf.get(&download_url_endpoint).send().await {
-            Ok(resp) => {
-                eprintln!("[lbby] Download URL response: {}", resp.status());
-                if resp.status().is_success() {
-                    #[derive(serde::Deserialize)]
-                    struct DownloadUrlResponse {
-                        data: String,
-                    }
-                    match resp.json::<DownloadUrlResponse>().await {
-                        Ok(info) => info.data,
-                        Err(e) => {
-                            eprintln!("[lbby] Failed to parse download URL: {}", e);
-                            return Err(format!("Failed to get download URL for mod {}", item.project_id));
-                        }
-                    }
-                } else {
-                    eprintln!("[lbby] Download URL endpoint failed: {} for mod {} (skipping)", resp.status(), item.project_id);
-                    continue;
-                }
-            }
-            Err(e) => {
-                eprintln!("[lbby] Download URL request failed: {}", e);
-                return Err(format!("Failed to get download URL for mod {}: {}", item.project_id, e));
-            }
-        };
-        
-        // Extract filename from URL
-        let file_name = download_url
-            .rsplit('/')
-            .next()
-            .unwrap_or(&format!("mod_{}.jar", item.file_id))
-            .split('?')
-            .next()
-            .unwrap_or(&format!("mod_{}.jar", item.file_id))
-            .to_string();
+    let CONCURRENCY: usize = 5;
+    let files: Vec<(u64, u64)> = manifest.files.iter()
+        .filter(|f| f.required)
+        .map(|f| (f.project_id, f.file_id))
+        .collect();
+    let mut downloaded = std::sync::atomic::AtomicU32::new(0);
 
-        download_bytes_to_file(
-            &app,
-            &download_url,
-            &target_dir.join(&file_name),
-            "Downloading CurseForge mods",
-            &file_name,
-            current,
-            total,
-        )
-        .await?;
+    // Resolve all download URLs first (parallel API calls)
+    let mut url_tasks = Vec::new();
+    for (project_id, file_id) in &files {
+        let cf_clone = cf.clone();
+        let pid = *project_id;
+        let fid = *file_id;
+        let url_task = tokio::spawn(async move {
+            let endpoint = format!(
+                "https://api.curseforge.com/v1/mods/{}/files/{}/download-url",
+                pid, fid
+            );
+            let resp = cf_clone.get(&endpoint).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    #[derive(serde::Deserialize)]
+                    struct D { data: String }
+                    r.json::<D>().await.map(|d| d.data).ok()
+                }
+                _ => None,
+            }
+        });
+        url_tasks.push((file_id, url_task));
+    }
+
+    // Collect URLs
+    let mut downloads: Vec<(String, String)> = Vec::new(); // (url, filename)
+    for (file_id, task) in url_tasks {
+        if let Ok(Some(url)) = task.await {
+            let file_name = url
+                .rsplit('/')
+                .next()
+                .unwrap_or(&format!("mod_{}.jar", file_id))
+                .split('?')
+                .next()
+                .unwrap_or(&format!("mod_{}.jar", file_id))
+                .to_string();
+            downloads.push((url, file_name));
+        }
+    }
+
+    // Download in parallel batches
+    for chunk in downloads.chunks(CONCURRENCY) {
+        let mut handles = Vec::new();
+        for (url, file_name) in chunk {
+            let app_clone = app.clone();
+            let url = url.clone();
+            let file_name = file_name.clone();
+            let dest = target_dir.join(&file_name);
+            let current = downloaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let handle = tokio::spawn(async move {
+                download_bytes_to_file(
+                    &app_clone,
+                    &url,
+                    &dest,
+                    "Downloading CurseForge mods",
+                    &file_name,
+                    current,
+                    total,
+                ).await
+            });
+            handles.push(handle);
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
     }
     if let Some(overrides) = manifest.overrides.as_deref() {
         emit_mod_progress(
