@@ -74,6 +74,43 @@ fn jar_get_dependencies(path: &Path) -> Option<Vec<String>> {
     None
 }
 
+fn jar_get_mod_id(path: &Path) -> Option<String> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return None;
+    };
+    let Ok(mut jar) = zip::ZipArchive::new(file) else {
+        return None;
+    };
+
+    // Check Fabric fabric.mod.json
+    if let Ok(mut entry) = jar.by_name("fabric.mod.json") {
+        let mut contents = String::new();
+        if entry.read_to_string(&mut contents).is_ok() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
+                if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
+                    return Some(id.to_string());
+                }
+            }
+        }
+    }
+
+    // Check Forge mods.toml
+    for metadata_path in ["META-INF/mods.toml", "META-INF/neoforge.mods.toml"] {
+        if let Ok(mut entry) = jar.by_name(metadata_path) {
+            let mut contents = String::new();
+            if entry.read_to_string(&mut contents).is_ok() {
+                if let Ok(value) = contents.parse::<toml::Value>() {
+                    if let Some(mod_id) = value.get("mods").and_then(|m| m.as_array()).and_then(|arr| arr.first()).and_then(|m| m.get("modId")).and_then(|v| v.as_str()) {
+                        return Some(mod_id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 pub fn jar_declares_client_only(path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
         return false;
@@ -294,17 +331,30 @@ pub async fn quarantine_client_only_mods(server_root: &Path) -> Result<Vec<Strin
     }
 
     // Second pass: check for mods that depend on client-only mods
+    // Build a set of client mod IDs (not file names)
+    let mut client_mod_ids_set = HashSet::new();
     for path in &jars {
-        if client_mod_ids.contains(&path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()) {
-            continue; // Skip client mods themselves
+        if jar_declares_client_only(path) {
+            // Extract mod ID from fabric.mod.json
+            if let Some(mod_id) = jar_get_mod_id(path) {
+                client_mod_ids_set.insert(mod_id);
+            }
+        }
+    }
+    eprintln!("[lbby] Client mod IDs: {:?}", client_mod_ids_set);
+
+    for path in &jars {
+        let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if client_mod_ids.contains(&file_name) {
+            continue;
         }
         // Check if this mod depends on any client-only mod
         if let Some(deps) = jar_get_dependencies(path) {
             for dep in &deps {
-                if client_mod_ids.iter().any(|c| c.contains(dep) || dep.contains(&c[..c.len().min(10)])) {
-                    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                    eprintln!("[lbby] Removing {} because it depends on client mod {}", name, dep);
-                    client_mod_ids.insert(name);
+                if client_mod_ids_set.contains(dep.as_str()) {
+                    eprintln!("[lbby] Removing {} because it depends on client mod {}", file_name, dep);
+                    client_mod_ids.insert(file_name.clone());
+                    break;
                 }
             }
         }
