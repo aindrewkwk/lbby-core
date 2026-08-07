@@ -1717,6 +1717,98 @@ fn loader_from_curse(loaders: &[CurseLoader]) -> Result<(ServerType, Option<Stri
     }
 }
 
+/// Ensure a server loader (Fabric/Forge) is installed for server packs
+/// that don't have a manifest.json (extracted directly).
+async fn ensure_server_loader(
+    app: &std::sync::Arc<crate::app_state::AppEventSender>,
+    cfg: &ServerConfig,
+    server_dir: &std::path::Path,
+) -> Result<(), String> {
+    let server_jar = server_dir.join("server.jar");
+    let fabric_jar = server_dir.join("fabric-server-launch.jar");
+    let forge_jar = server_dir.join("forge-*-server.jar");
+
+    // Check if server.jar already exists and is valid (>1MB)
+    if server_jar.exists() {
+        if let Ok(meta) = std::fs::metadata(&server_jar) {
+            if meta.len() > 1_000_000 {
+                eprintln!("[lbby] server.jar already exists ({} bytes)", meta.len());
+                return Ok(());
+            }
+        }
+    }
+
+    // Detect loader type from extracted files
+    let has_fabric = fabric_jar.exists() || server_dir.join("libraries/net/fabricmc").exists();
+    let has_forge = server_dir.join("libraries/net/minecraftforge").exists()
+        || server_dir.join("libraries/net/neoforged").exists();
+
+    if has_fabric {
+        eprintln!("[lbby] Detected Fabric server pack — installing Fabric loader");
+        emit_mod_progress(app, "Installing Fabric loader", "Downloading Fabric server", 0, 1);
+
+        // Download Minecraft server.jar first
+        let mc_version = &cfg.minecraft_version;
+        if !mc_version.is_empty() {
+            let version_url = format!(
+                "https://piston-meta.mojang.com/mc/game/version_manifest.json"
+            );
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let manifest: serde_json::Value = client.get(&version_url)
+                .send().await.map_err(|e| e.to_string())?
+                .json().await.map_err(|e| e.to_string())?;
+
+            // Find the version entry
+            let version_entry = manifest["versions"].as_array()
+                .and_then(|v| v.iter().find(|e| e["id"].as_str() == Some(mc_version)))
+                .ok_or_else(|| format!("Minecraft version {} not found", mc_version))?;
+
+            let version_meta_url = version_entry["url"].as_str()
+                .ok_or("Version URL not found")?;
+            let version_meta: serde_json::Value = client.get(version_meta_url)
+                .send().await.map_err(|e| e.to_string())?
+                .json().await.map_err(|e| e.to_string())?;
+
+            let server_url = version_meta["downloads"]["server"]["url"].as_str()
+                .ok_or("Server download URL not found")?;
+
+            eprintln!("[lbby] Downloading Minecraft {} server.jar", mc_version);
+            download_bytes_to_file(
+                app, server_url, &server_jar, "Minecraft server", "server.jar", 1, 1
+            ).await?;
+        }
+
+        // Download Fabric server launcher
+        let loader_version = cfg.loader_version.as_deref().unwrap_or("0.19.3");
+        let fabric_url = format!(
+            "https://meta.fabricmc.net/v2/versions/loader/{}/{}/1.0.1/server/jar",
+            mc_version, loader_version
+        );
+        eprintln!("[lbby] Downloading Fabric launcher {}", fabric_url);
+        download_bytes_to_file(
+            app, &fabric_url, &fabric_jar, "Fabric launcher", "fabric-server-launch.jar", 1, 1
+        ).await?;
+
+        // Create fabric-server-launcher.properties
+        let props_path = server_dir.join("fabric-server-launcher.properties");
+        if !props_path.exists() {
+            let props = format!("serverJar=server.jar\n");
+            std::fs::write(&props_path, props).map_err(|e| e.to_string())?;
+        }
+
+        emit_mod_progress(app, "Fabric loader installed", "Ready to start", 1, 1);
+    } else if has_forge {
+        eprintln!("[lbby] Detected Forge server pack — Forge installer should be present");
+    } else {
+        eprintln!("[lbby] No loader detected — server may need manual setup");
+    }
+
+    Ok(())
+}
+
 pub async fn install_curseforge_modpack(
     app: std::sync::Arc<crate::app_state::AppEventSender>,
     zip_path: String,
@@ -1758,6 +1850,8 @@ pub async fn install_curseforge_modpack(
             eprintln!("[lbby] Quarantined {} client-only mods", quarantined.len());
             emit_mod_progress(&app, "Filtering client-only mods", &format!("Removed {} client-only mods", quarantined.len()), quarantined.len() as u32, quarantined.len() as u32);
         }
+        // Install Fabric/Forge loader if not already present
+        ensure_server_loader(&app, &cfg2, &root).await?;
         return Ok(cfg2);
     }
     let manifest = manifest_result.unwrap();
