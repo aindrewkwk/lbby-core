@@ -778,12 +778,19 @@ fn emit_mod_progress(
     .ok();
 }
 
+// Cached HTTP client - reused across downloads
+static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
 pub(crate) fn client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .user_agent("Lbby/0.1.0 (Minecraft server hosting app)")
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| e.to_string())
+    Ok(HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("Lbby/0.1.0 (Minecraft server hosting app)")
+            .timeout(std::time::Duration::from_secs(60))
+            .pool_max_idle_per_host(20)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to create HTTP client")
+    }).clone())
 }
 
 fn curseforge_client() -> Result<reqwest::Client, String> {
@@ -912,41 +919,49 @@ async fn download_bytes_to_file(
     current: u32,
     total: u32,
 ) -> Result<(), String> {
-    let resp = client()?
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("Download failed: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "Download failed with HTTP {} for {}",
-            resp.status(),
-            url
-        ));
+    // Retry up to 3 times on failure
+    let mut last_err = String::new();
+    for attempt in 1..=3 {
+        match client()?.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Some(parent) = dest.parent() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                let size = resp.content_length().unwrap_or(0);
+                let mut stream = resp.bytes_stream();
+                let mut file = tokio::fs::File::create(dest)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut downloaded = 0u64;
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|e| e.to_string())?;
+                    file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+                    downloaded += chunk.len() as u64;
+                    let percent = if size > 0 {
+                        format!(" ({:.0}%)", downloaded as f64 / size as f64 * 100.0)
+                    } else {
+                        String::new()
+                    };
+                    emit_mod_progress(app, stage, &format!("{}{}", label, percent), current, total);
+                }
+                return Ok(());
+            }
+            Ok(resp) => {
+                last_err = format!("HTTP {}", resp.status());
+                eprintln!("[lbby] Download attempt {} failed: {} for {}", attempt, last_err, label);
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                eprintln!("[lbby] Download attempt {} failed: {} for {}", attempt, last_err, label);
+            }
+        }
+        if attempt < 3 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
     }
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    let size = resp.content_length().unwrap_or(0);
-    let mut stream = resp.bytes_stream();
-    let mut file = tokio::fs::File::create(dest)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut downloaded = 0u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
-        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-        downloaded += chunk.len() as u64;
-        let percent = if size > 0 {
-            format!(" ({:.0}%)", downloaded as f64 / size as f64 * 100.0)
-        } else {
-            String::new()
-        };
-        emit_mod_progress(app, stage, &format!("{}{}", label, percent), current, total);
-    }
-    Ok(())
+    Err(format!("Download failed after 3 attempts: {} for {}", last_err, label))
 }
 
 fn verify_sha512(path: &Path, expected: Option<&str>) -> Result<(), String> {
@@ -1833,7 +1848,7 @@ pub async fn install_curseforge_modpack(
         .map_err(|e| e.to_string())?;
     let total = manifest.files.iter().filter(|f| f.required).count() as u32;
     let cf = curseforge_client()?;
-    let CONCURRENCY: usize = 10;
+    let CONCURRENCY: usize = 20;
     let files: Vec<(u64, u64)> = manifest.files.iter()
         .filter(|f| f.required)
         .map(|f| (f.project_id, f.file_id))
@@ -1864,7 +1879,7 @@ pub async fn install_curseforge_modpack(
         url_tasks.push((file_id, url_task));
     }
 
-    // Collect URLs
+    // Collect URLs with CDN fallback
     let mut downloads: Vec<(String, String)> = Vec::new(); // (url, filename)
     for (file_id, task) in url_tasks {
         if let Ok(Some(url)) = task.await {
@@ -1876,7 +1891,14 @@ pub async fn install_curseforge_modpack(
                 .next()
                 .unwrap_or(&format!("mod_{}.jar", file_id))
                 .to_string();
-            downloads.push((url, file_name));
+            // Use CDN URL if available (faster than edge.forgecdn.net)
+            let cdn_url = if url.contains("edge.forgecdn.net") {
+                // Try to use cf-forgecdn CDN (faster)
+                url.replace("edge.forgecdn.net", "mediafilez.forgecdn.net")
+            } else {
+                url
+            };
+            downloads.push((cdn_url, file_name));
         }
     }
 
