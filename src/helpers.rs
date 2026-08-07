@@ -441,10 +441,12 @@ pub fn is_client_only_mod(path: &std::path::Path) -> bool {
 
     // Check filename for common client-only indicators
     let filename = path.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default();
+    // NOTE: lithium, modernfix, immersive_optimization are SERVER performance mods
+    // Do NOT add them here - they cause server crashes if quarantined
     let client_only_names = [
-        "optifine", "iris", "shaders", "sodium", "lithium",
-        "phosphor", "starlight", "rubidium", "embeddium",
-        "oculus", "continuity", "indium", "immediatelyfast",
+        "optifine", "iris", "shaders", "sodium",
+        "phosphor", "rubidium", "embeddium",
+        "oculus", "continuity", "immediatelyfast",
         "capes", "cosmetics", "emotes", "chattoggle", "zylob",
         "itemphysic", "shouldersurfing", "journeymap",
     ];
