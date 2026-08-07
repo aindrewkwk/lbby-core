@@ -1821,7 +1821,8 @@ pub async fn install_curseforge_modpack(
         }
     }
 
-    // Download in parallel batches
+    // Download in parallel batches, skip client-only mods
+    let mut client_skipped = 0u32;
     for chunk in downloads.chunks(CONCURRENCY) {
         let mut handles = Vec::new();
         for (url, file_name) in chunk {
@@ -1829,23 +1830,47 @@ pub async fn install_curseforge_modpack(
             let url = url.clone();
             let file_name = file_name.clone();
             let dest = target_dir.join(&file_name);
+            let temp_dest = std::env::temp_dir().join("lbby-download").join(&file_name);
             let current = downloaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let handle = tokio::spawn(async move {
-                download_bytes_to_file(
+                // Download to temp first
+                if let Err(e) = download_bytes_to_file(
                     &app_clone,
                     &url,
-                    &dest,
+                    &temp_dest,
                     "Downloading CurseForge mods",
                     &file_name,
                     current,
                     total,
-                ).await
+                ).await {
+                    return Err(e);
+                }
+                // Check if client-only
+                if crate::mod_side::jar_declares_client_only(&temp_dest) {
+                    eprintln!("[lbby] Skipping client-only mod: {}", file_name);
+                    let _ = std::fs::remove_file(&temp_dest);
+                    return Ok(true); // true = client-only, skipped
+                }
+                // Move to mods folder
+                if let Err(e) = std::fs::rename(&temp_dest, &dest) {
+                    return Err(format!("Failed to move mod: {}", e));
+                }
+                Ok(false) // false = server mod, installed
             });
             handles.push(handle);
         }
         for handle in handles {
-            let _ = handle.await;
+            match handle.await {
+                Ok(Ok(true)) => client_skipped += 1,
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => eprintln!("[lbby] Download error: {}", e),
+                Err(e) => eprintln!("[lbby] Task error: {}", e),
+            }
         }
+    }
+    if client_skipped > 0 {
+        eprintln!("[lbby] Skipped {} client-only mods", client_skipped);
+        emit_mod_progress(&app, "Client mods filtered", &format!("Skipped {} client-only mods", client_skipped), client_skipped, client_skipped);
     }
     if let Some(overrides) = manifest.overrides.as_deref() {
         emit_mod_progress(

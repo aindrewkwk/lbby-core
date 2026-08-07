@@ -35,7 +35,7 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
-fn jar_declares_client_only(path: &Path) -> bool {
+pub fn jar_declares_client_only(path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
