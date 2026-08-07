@@ -102,7 +102,8 @@ pub fn jar_declares_client_only(path: &Path) -> bool {
             let mut contents = String::new();
             if entry.read_to_string(&mut contents).is_ok() {
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
-                    // Check environment field
+                    // ONLY environment: "client" means client-only
+                    // environment: * or environment: server means it works on server
                     let environment = value
                         .get("environment")
                         .or_else(|| value.pointer("/quilt_loader/metadata/environment"))
@@ -110,22 +111,6 @@ pub fn jar_declares_client_only(path: &Path) -> bool {
                         .and_then(serde_json::Value::as_str);
                     if environment == Some("client") {
                         return true;
-                    }
-                    // Check entrypoints: if only client entrypoint, it's client-only
-                    if let Some(entrypoints) = value.get("entrypoints") {
-                        let has_client = entrypoints.get("client").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
-                        let has_main = entrypoints.get("main").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
-                        let has_server = entrypoints.get("server").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
-                        if has_client && !has_main && !has_server {
-                            return true;
-                        }
-                    }
-                    // Check description for client-only keywords
-                    if let Some(desc) = value.get("description").and_then(|v| v.as_str()) {
-                        let lower = desc.to_lowercase();
-                        if lower.contains("shader") || lower.contains("iris") || lower.contains("render") {
-                            return true;
-                        }
                     }
                 }
             }
