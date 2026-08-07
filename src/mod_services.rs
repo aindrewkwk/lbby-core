@@ -1752,6 +1752,12 @@ pub async fn install_curseforge_modpack(
             }
         }
         eprintln!("[lbby] Server pack extracted {} files to {}", total, root.display());
+        // Filter client-only mods after extraction
+        let quarantined = crate::mod_side::quarantine_client_only_mods(&root).await.unwrap_or_default();
+        if !quarantined.is_empty() {
+            eprintln!("[lbby] Quarantined {} client-only mods", quarantined.len());
+            emit_mod_progress(&app, "Filtering client-only mods", &format!("Removed {} client-only mods", quarantined.len()), quarantined.len() as u32, quarantined.len() as u32);
+        }
         return Ok(cfg2);
     }
     let manifest = manifest_result.unwrap();
