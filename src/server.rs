@@ -189,11 +189,9 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
         }
     }
 
-    // Remove client-only mods before starting server
-    let removed = crate::mod_services::remove_client_only_mods(&app);
-    if !removed.is_empty() {
-        eprintln!("[lbby] Removed {} client-only mods before server start: {}", removed.len(), removed.join(", "));
-    }
+    // Client-only mod handling is done via quarantine (mod_side::quarantine_client_only_mods)
+    // later in this function. No aggressive pre-deletion — the quarantine system uses
+    // reliable metadata checks and moves mods to a recoverable directory.
 
     // Mark the server as Starting immediately — before any Java download or
     // version detection — so the frontend shows the "Starting" status pill
@@ -2190,6 +2188,36 @@ pub(crate) async fn install_modloader_transactional(
         ModLoaderKind::Forge => "Forge installer",
         ModLoaderKind::NeoForge => "NeoForge installer",
     };
+
+    // Clean old libraries + run scripts when version changes to prevent stale conflicts
+    let old_libraries = server_dir.join("libraries");
+    let old_run_sh = server_dir.join("run.sh");
+    let old_run_bat = server_dir.join("run.bat");
+    let old_unix_args = server_dir.join("unix_args.txt");
+    let old_win_args = server_dir.join("win_args.txt");
+
+    // Check if we're installing a different version than what's currently present
+    let version_marker = server_dir.join(".lbby-modloader-version");
+    let needs_clean = if let Ok(existing) = std::fs::read_to_string(&version_marker) {
+        existing.trim() != version_key
+    } else {
+        old_libraries.exists()
+    };
+
+    if needs_clean {
+        eprintln!("[lbby] Modloader version change detected, cleaning old runtime...");
+        for old_file in [&old_run_sh, &old_run_bat, &old_unix_args, &old_win_args] {
+            if old_file.exists() {
+                std::fs::remove_file(old_file).ok();
+            }
+        }
+        if old_libraries.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&old_libraries) {
+                eprintln!("[lbby] Warning: could not clean old libraries: {}", e);
+            }
+        }
+    }
+
     emit_progress(app, &format!("Downloading {label}…"), 0.2);
     let cached = cached_modloader_installer(app, url, label).await?;
     let staging = server_dir.with_file_name(format!(
@@ -2232,6 +2260,8 @@ pub(crate) async fn install_modloader_transactional(
     }
     tokio::fs::remove_dir_all(&staging).await.ok();
     detect_modloader_launch(server_dir, kind, version_key)?;
+    // Write version marker for future change detection
+    std::fs::write(server_dir.join(".lbby-modloader-version"), version_key).ok();
     Ok(())
 }
 

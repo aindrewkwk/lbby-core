@@ -137,9 +137,11 @@ struct CurseFileRef {
     project_id: u64,
     #[serde(rename = "fileID")]
     file_id: u64,
-    #[serde(default)]
+    #[serde(default = "default_required")]
     required: bool,
 }
+
+fn default_required() -> bool { true }
 
 // ── CurseForge Search & API Types ──────────────────────────────────────────
 
@@ -1543,8 +1545,10 @@ async fn prepare_modpack_server(
     if cfg.server_path.trim().is_empty() {
         cfg.server_path = default_server_path_value(None);
     }
-    if cfg.ram_mb == 0 {
-        cfg.ram_mb = 4096;
+    // Dynamic RAM allocation for modpacks based on mod count
+    // Modpacks with 200+ mods need 6-8GB, heavy packs need 8-12GB
+    if cfg.ram_mb == 0 || cfg.ram_mb < 4096 {
+        cfg.ram_mb = 6144; // Safe default for most modpacks
     }
     if cfg.max_players == 0 {
         cfg.max_players = 10;
@@ -1661,6 +1665,20 @@ pub async fn install_modrinth_modpack(
         if has_packs {
             let _ = update_resource_pack_requirement(&cfg, true);
         }
+    }
+
+    // Post-install dependency scan — catch missing deps before user tries to start
+    let missing = scan_missing_dependencies();
+    if !missing.is_empty() {
+        let names: Vec<String> = missing.iter().map(|d| d.mod_id.clone()).collect();
+        let msg = format!(
+            "WARNING: {} missing dependency mod(s) detected: {}",
+            missing.len(),
+            names.join(", ")
+        );
+        eprintln!("[lbby] {}", msg);
+        emit_mod_progress(&app, "Dependency check", &msg, missing.len() as u32, missing.len() as u32);
+        eprintln!("[lbby] Run 'Install Missing Dependencies' from the mods page to fix these.");
     }
 
     emit_mod_progress(&app, "Finalizing", "Modpack is ready", 1, 1);
@@ -1785,7 +1803,17 @@ pub async fn install_curseforge_modpack(
         let total = zip.len() as u32;
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
-            let outpath = root.join(entry.mangled_name());
+            // Use safe path extraction — validate against path traversal
+            let entry_name = entry.mangled_name();
+            let relative = match std::path::Path::new(&entry_name).strip_prefix("/") {
+                Ok(r) => r.to_path_buf(),
+                Err(_) => std::path::PathBuf::from(&entry_name),
+            };
+            // Block path traversal
+            if relative.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                continue;
+            }
+            let outpath = root.join(&relative);
             if entry.is_dir() {
                 std::fs::create_dir_all(&outpath).ok();
             } else {
@@ -1881,29 +1909,43 @@ pub async fn install_curseforge_modpack(
 
     // Collect URLs with CDN fallback
     let mut downloads: Vec<(String, String)> = Vec::new(); // (url, filename)
+    let mut url_failures: Vec<u64> = Vec::new();
     for (file_id, task) in url_tasks {
-        if let Ok(Some(url)) = task.await {
-            let file_name = url
-                .rsplit('/')
-                .next()
-                .unwrap_or(&format!("mod_{}.jar", file_id))
-                .split('?')
-                .next()
-                .unwrap_or(&format!("mod_{}.jar", file_id))
-                .to_string();
-            // Use CDN URL if available (faster than edge.forgecdn.net)
-            let cdn_url = if url.contains("edge.forgecdn.net") {
-                // Try to use cf-forgecdn CDN (faster)
-                url.replace("edge.forgecdn.net", "mediafilez.forgecdn.net")
-            } else {
-                url
-            };
-            downloads.push((cdn_url, file_name));
+        match task.await {
+            Ok(Some(url)) => {
+                let file_name = url
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&format!("mod_{}.jar", file_id))
+                    .split('?')
+                    .next()
+                    .unwrap_or(&format!("mod_{}.jar", file_id))
+                    .to_string();
+                // Use CDN URL if available (faster than edge.forgecdn.net)
+                let cdn_url = if url.contains("edge.forgecdn.net") {
+                    url.replace("edge.forgecdn.net", "mediafilez.forgecdn.net")
+                } else {
+                    url
+                };
+                downloads.push((cdn_url, file_name));
+            }
+            Ok(None) => {
+                eprintln!("[lbby] Failed to resolve download URL for file_id {}", file_id);
+                url_failures.push(*file_id);
+            }
+            Err(e) => {
+                eprintln!("[lbby] Task error resolving URL for file_id {}: {}", file_id, e);
+                url_failures.push(*file_id);
+            }
         }
+    }
+    if !url_failures.is_empty() {
+        eprintln!("[lbby] WARNING: {} mod(s) could not be resolved from CurseForge API", url_failures.len());
     }
 
     // Download in parallel batches, skip client-only mods
     let mut client_skipped = 0u32;
+    let mut download_failures: Vec<String> = Vec::new();
     for chunk in downloads.chunks(concurrency) {
         let mut handles = Vec::new();
         for (url, file_name) in chunk {
@@ -1913,45 +1955,89 @@ pub async fn install_curseforge_modpack(
             let dest = target_dir.join(&file_name);
             let temp_dest = std::env::temp_dir().join("lbby-download").join(&file_name);
             let current = downloaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let file_name_for_task = file_name.clone();
             let handle = tokio::spawn(async move {
-                // Download to temp first
-                if let Err(e) = download_bytes_to_file(
-                    &app_clone,
-                    &url,
-                    &temp_dest,
-                    "Downloading CurseForge mods",
-                    &file_name,
-                    current,
-                    total,
-                ).await {
-                    return Err(e);
+                // Try primary URL first, then fallback to original edge.forgecdn.net
+                let urls_to_try = if url.contains("mediafilez.forgecdn.net") {
+                    let fallback = url.replace("mediafilez.forgecdn.net", "edge.forgecdn.net");
+                    vec![url.clone(), fallback]
+                } else {
+                    vec![url.clone()]
+                };
+                let mut last_err = String::new();
+                for try_url in &urls_to_try {
+                    match download_bytes_to_file(
+                        &app_clone,
+                        try_url,
+                        &temp_dest,
+                        "Downloading CurseForge mods",
+                        &file_name_for_task,
+                        current,
+                        total,
+                    ).await {
+                        Ok(()) => {
+                            // Check if client-only
+                            if crate::mod_side::jar_declares_client_only(&temp_dest) {
+                                eprintln!("[lbby] Skipping client-only mod: {}", file_name_for_task);
+                                let _ = std::fs::remove_file(&temp_dest);
+                                return Ok(true); // true = client-only, skipped
+                            }
+                            // Move to mods folder
+                            if let Err(e) = std::fs::rename(&temp_dest, &dest) {
+                                return Err(format!("Failed to move {}: {}", file_name_for_task, e));
+                            }
+                            return Ok(false); // false = server mod, installed
+                        }
+                        Err(e) => {
+                            last_err = e;
+                        }
+                    }
                 }
-                // Check if client-only
-                if crate::mod_side::jar_declares_client_only(&temp_dest) {
-                    eprintln!("[lbby] Skipping client-only mod: {}", file_name);
-                    let _ = std::fs::remove_file(&temp_dest);
-                    return Ok(true); // true = client-only, skipped
-                }
-                // Move to mods folder
-                if let Err(e) = std::fs::rename(&temp_dest, &dest) {
-                    return Err(format!("Failed to move mod: {}", e));
-                }
-                Ok(false) // false = server mod, installed
+                Err(format!("{}: {}", file_name_for_task, last_err))
             });
-            handles.push(handle);
+            handles.push((file_name.clone(), handle));
         }
-        for handle in handles {
+        for (file_name, handle) in handles {
             match handle.await {
                 Ok(Ok(true)) => client_skipped += 1,
                 Ok(Ok(false)) => {}
-                Ok(Err(e)) => eprintln!("[lbby] Download error: {}", e),
-                Err(e) => eprintln!("[lbby] Task error: {}", e),
+                Ok(Err(e)) => {
+                    eprintln!("[lbby] Download error: {}", e);
+                    download_failures.push(file_name);
+                }
+                Err(e) => {
+                    eprintln!("[lbby] Task error: {}", e);
+                    download_failures.push(file_name);
+                }
             }
         }
     }
     if client_skipped > 0 {
         eprintln!("[lbby] Skipped {} client-only mods", client_skipped);
         emit_mod_progress(&app, "Client mods filtered", &format!("Skipped {} client-only mods", client_skipped), client_skipped, client_skipped);
+    }
+    if !download_failures.is_empty() {
+        let msg = format!(
+            "WARNING: {} mod(s) failed to download: {}",
+            download_failures.len(),
+            download_failures.join(", ")
+        );
+        eprintln!("[lbby] {}", msg);
+        emit_mod_progress(&app, "Download failures", &msg, download_failures.len() as u32, download_failures.len() as u32);
+    }
+    // Verify we got a reasonable number of mods
+    let expected_count = files.len();
+    let actual_count = std::fs::read_dir(&target_dir)
+        .map(|d| d.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|ext| ext == "jar")).count())
+        .unwrap_or(0);
+    if actual_count == 0 && expected_count > 0 {
+        return Err(format!(
+            "No mods were installed! Expected {} mods from CurseForge manifest. Check your internet connection and CurseForge API access.",
+            expected_count
+        ));
+    }
+    if actual_count < expected_count / 2 {
+        eprintln!("[lbby] WARNING: Only {}/{} mods installed — server may be missing critical dependencies", actual_count, expected_count);
     }
     if let Some(overrides) = manifest.overrides.as_deref() {
         emit_mod_progress(
@@ -1990,6 +2076,20 @@ pub async fn install_curseforge_modpack(
         if has_packs {
             let _ = update_resource_pack_requirement(&cfg, true);
         }
+    }
+
+    // Post-install dependency scan — catch missing deps before user tries to start
+    let missing = scan_missing_dependencies();
+    if !missing.is_empty() {
+        let names: Vec<String> = missing.iter().map(|d| d.mod_id.clone()).collect();
+        let msg = format!(
+            "WARNING: {} missing dependency mod(s) detected: {}",
+            missing.len(),
+            names.join(", ")
+        );
+        eprintln!("[lbby] {}", msg);
+        emit_mod_progress(&app, "Dependency check", &msg, missing.len() as u32, missing.len() as u32);
+        eprintln!("[lbby] Run 'Install Missing Dependencies' from the mods page to fix these.");
     }
 
     emit_mod_progress(&app, "Finalizing", "CurseForge modpack is ready", 1, 1);
