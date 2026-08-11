@@ -429,7 +429,8 @@ pub async fn init_revocation() {
     // Load cached version first (instant, no network)
     let cached = load_revoked_cache();
     if let Some(ref list) = cached {
-        if let Ok(mut guard) = REVOKED_CACHE.lock() {
+        {
+            let mut guard = REVOKED_CACHE.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(RevokedList {
                 version: list.version,
                 generated_at: list.generated_at,
@@ -451,7 +452,8 @@ pub async fn init_revocation() {
     match fetch_revoked_list().await {
         Some(fresh) => {
             save_revoked_cache(&fresh);
-            if let Ok(mut guard) = REVOKED_CACHE.lock() {
+            {
+                let mut guard = REVOKED_CACHE.lock().unwrap_or_else(|e| e.into_inner());
                 *guard = Some(fresh);
             }
         }
@@ -466,10 +468,9 @@ pub async fn init_revocation() {
 
 /// Check if a JWT ID is in the revocation list.
 fn is_jwt_revoked(jti: &str) -> bool {
-    if let Ok(guard) = REVOKED_CACHE.lock() {
-        if let Some(list) = &*guard {
-            return list.entries.iter().any(|e| e.jwt_id == jti);
-        }
+    let guard = REVOKED_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(list) = &*guard {
+        return list.entries.iter().any(|e| e.jwt_id == jti);
     }
     false
 }

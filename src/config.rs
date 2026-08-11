@@ -371,10 +371,14 @@ fn load_profiles_file() -> ProfilesFile {
 }
 
 fn save_profiles_file(file: &ProfilesFile) -> Result<(), String> {
+    use std::io::Write;
     let path = profiles_path();
     let json = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json).map_err(|e| e.to_string())?;
+    let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    f.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?; // Ensure data hits disk before rename
+    drop(f);
     let result = std::fs::rename(&tmp, &path).map_err(|e| e.to_string());
     CONFIG_CACHE.invalidate();
     result

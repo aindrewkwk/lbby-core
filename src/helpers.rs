@@ -739,6 +739,8 @@ pub fn version_matches_range(version: &str, range: &str) -> bool {
     }
 
     // Parse range format: [lower,upper] or (lower,upper) or mixed
+    // Save bracket types BEFORE stripping
+    let upper_exclusive = range.ends_with(')');
     let range = range.trim_start_matches('[').trim_start_matches('(');
     let range = range.trim_end_matches(']').trim_end_matches(')');
 
@@ -758,14 +760,13 @@ pub fn version_matches_range(version: &str, range: &str) -> bool {
     // Check upper bound
     if !upper_str.is_empty() {
         if let Ok(upper) = semver::Version::parse(upper_str) {
-            // Check if original range used exclusive upper bound
-            let original = range;
-            let is_exclusive_upper = original.ends_with(')') || original.contains(", ");
-            if is_exclusive_upper {
+            if upper_exclusive {
+                // Exclusive upper: version must be strictly less than upper
                 if installed >= upper {
                     return false;
                 }
             } else {
+                // Inclusive upper: version can be equal to upper
                 if installed > upper {
                     return false;
                 }

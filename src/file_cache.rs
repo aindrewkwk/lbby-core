@@ -23,7 +23,7 @@ impl<T: Clone> FileCache<T> {
     ) -> Result<T, String> {
         if let Ok(meta) = std::fs::metadata(path) {
             if let Ok(modified) = meta.modified() {
-                let cache = self.inner.lock().unwrap();
+                let cache = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some((ref val, cached_time)) = *cache {
                     if modified == cached_time {
                         return Ok(val.clone());
@@ -34,13 +34,13 @@ impl<T: Clone> FileCache<T> {
         let val = load()?;
         if let Ok(meta) = std::fs::metadata(path) {
             if let Ok(modified) = meta.modified() {
-                *self.inner.lock().unwrap() = Some((val.clone(), modified));
+                *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = Some((val.clone(), modified));
             }
         }
         Ok(val)
     }
 
     pub fn invalidate(&self) {
-        *self.inner.lock().unwrap() = None;
+        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }

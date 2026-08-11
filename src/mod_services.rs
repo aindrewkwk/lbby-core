@@ -2385,9 +2385,14 @@ fn parse_curseforge_url(url: &str) -> Result<(String, Option<u64>), String> {
 }
 
 /// Construct a CurseForge CDN download URL from a file ID and filename.
+/// Uses the same digit-string formula as curseforge_cdn_parts.
 fn curseforge_cdn_url(file_id: u64, filename: &str) -> String {
-    let prefix = file_id / 1000;
-    let suffix = file_id % 1000;
+    let digits = file_id.to_string();
+    if digits.len() <= 4 {
+        return format!("https://edge.forgecdn.net/files/{}/{}/{}", digits, "0", filename);
+    }
+    let (prefix, suffix) = digits.split_at(4);
+    let suffix = suffix.trim_start_matches('0');
     format!(
         "https://edge.forgecdn.net/files/{}/{}/{}",
         prefix, suffix, filename

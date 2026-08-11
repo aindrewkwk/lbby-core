@@ -461,6 +461,9 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     hide_child_window(&mut cmd);
+    // On Windows, tokio's Child kills the process on drop by default.
+    // We need to disable this since we take stdin/stdout/stderr and drop the handle.
+    cmd.kill_on_drop(false);
 
     let mut child = cmd
         .spawn()
