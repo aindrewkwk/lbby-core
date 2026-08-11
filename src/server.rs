@@ -59,6 +59,22 @@ impl ServerStatus {
         )
     }
 
+    /// Compact status for dashboard sync (app heartbeat payload).
+    /// Uses the same vocabulary as the agent heartbeat: running/starting/stopping/stopped.
+    pub fn sync_status(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Starting
+            | Self::Restarting
+            | Self::Installing
+            | Self::DownloadingJava
+            | Self::DownloadingJar
+            | Self::Preparing => "starting",
+            Self::Stopping => "stopping",
+            Self::Stopped | Self::Error => "stopped",
+        }
+    }
+
     /// Human-readable label for the current status.
     pub fn label(&self) -> &'static str {
         match self {

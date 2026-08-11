@@ -1848,12 +1848,12 @@ pub async fn install_curseforge_modpack(
         .map_err(|e| e.to_string())?;
     let total = manifest.files.iter().filter(|f| f.required).count() as u32;
     let cf = curseforge_client()?;
-    let CONCURRENCY: usize = 20;
+    let concurrency: usize = 20;
     let files: Vec<(u64, u64)> = manifest.files.iter()
         .filter(|f| f.required)
         .map(|f| (f.project_id, f.file_id))
         .collect();
-    let mut downloaded = std::sync::atomic::AtomicU32::new(0);
+    let downloaded = std::sync::atomic::AtomicU32::new(0);
 
     // Resolve all download URLs first (parallel API calls)
     let mut url_tasks = Vec::new();
@@ -1904,7 +1904,7 @@ pub async fn install_curseforge_modpack(
 
     // Download in parallel batches, skip client-only mods
     let mut client_skipped = 0u32;
-    for chunk in downloads.chunks(CONCURRENCY) {
+    for chunk in downloads.chunks(concurrency) {
         let mut handles = Vec::new();
         for (url, file_name) in chunk {
             let app_clone = app.clone();
@@ -2251,8 +2251,6 @@ pub async fn install_modpack_from_file(
 
 #[derive(Debug, Deserialize)]
 struct CfWidgetResponse {
-    id: u64,
-    name: Option<String>,
     files: Vec<CfWidgetFile>,
 }
 
@@ -2260,8 +2258,6 @@ struct CfWidgetResponse {
 struct CfWidgetFile {
     id: u64,
     name: String,
-    #[serde(default)]
-    version: Option<String>,
 }
 
 /// Parse a CurseForge URL into (slug, optional file_id).

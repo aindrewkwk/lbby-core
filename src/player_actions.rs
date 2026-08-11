@@ -67,47 +67,6 @@ pub struct PlayerData {
 
 // ── NBT helpers ─────────────────────────────────────────────────────────────
 
-fn nbt_to_json(val: &fastnbt::Value) -> serde_json::Value {
-    match val {
-        fastnbt::Value::Byte(v) => serde_json::Value::Number((*v as i64).into()),
-        fastnbt::Value::Short(v) => serde_json::Value::Number((*v as i64).into()),
-        fastnbt::Value::Int(v) => serde_json::Value::Number((*v as i64).into()),
-        fastnbt::Value::Long(v) => serde_json::Value::Number((*v).into()),
-        fastnbt::Value::Float(v) => serde_json::Number::from_f64(*v as f64)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        fastnbt::Value::Double(v) => serde_json::Number::from_f64(*v)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        fastnbt::Value::String(s) => serde_json::Value::String(s.clone()),
-        fastnbt::Value::Compound(map) => {
-            let obj: serde_json::Map<String, serde_json::Value> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), nbt_to_json(v)))
-                .collect();
-            serde_json::Value::Object(obj)
-        }
-        fastnbt::Value::List(items) => {
-            serde_json::Value::Array(items.iter().map(nbt_to_json).collect())
-        }
-        fastnbt::Value::ByteArray(a) => serde_json::Value::Array(
-            a.iter()
-                .map(|b| serde_json::Value::Number((*b as i64).into()))
-                .collect(),
-        ),
-        fastnbt::Value::IntArray(a) => serde_json::Value::Array(
-            a.iter()
-                .map(|b| serde_json::Value::Number((*b as i64).into()))
-                .collect(),
-        ),
-        fastnbt::Value::LongArray(a) => serde_json::Value::Array(
-            a.iter()
-                .map(|b| serde_json::Value::Number((*b).into()))
-                .collect(),
-        ),
-    }
-}
-
 fn nbt_str(compound: &HashMap<String, fastnbt::Value>, key: &str) -> Option<String> {
     match compound.get(key)? {
         fastnbt::Value::String(s) => Some(s.clone()),
@@ -130,13 +89,6 @@ fn nbt_i64(compound: &HashMap<String, fastnbt::Value>, key: &str) -> Option<i64>
         fastnbt::Value::Int(v) => Some(*v as i64),
         fastnbt::Value::Short(v) => Some(*v as i64),
         fastnbt::Value::Byte(v) => Some(*v as i64),
-        _ => None,
-    }
-}
-
-fn nbt_f32(compound: &HashMap<String, fastnbt::Value>, key: &str) -> Option<f32> {
-    match compound.get(key)? {
-        fastnbt::Value::Float(v) => Some(*v),
         _ => None,
     }
 }

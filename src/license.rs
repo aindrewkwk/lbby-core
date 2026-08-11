@@ -125,7 +125,6 @@ const ISSUER: &str = "lbby";
 const LICENSE_FILE: &str = "license.jwt";
 const REVOKED_URL: &str = "https://lbby-license-server.rstudio.workers.dev/revoked.json";
 const REVOKED_CACHE_FILE: &str = "revoked.json";
-const REVOKED_CACHE_MAX_AGE_SECS: u64 = 3600; // 1 hour
 
 /// Public key in PEM form, baked into the binary at compile time. The matching
 /// private key lives only on the License Server.

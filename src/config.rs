@@ -267,6 +267,8 @@ pub struct ProfileSummary {
     pub name: String,
     pub active: bool,
     pub minecraft_version: String,
+    /// Terraria game version — only set for terraria/tmodloader profiles.
+    pub terraria_version: String,
     pub server_type: ServerType,
     pub server_path: String,
     pub setup_complete: bool,
@@ -384,6 +386,7 @@ fn profile_summary(profile: &ServerProfile, active_id: &str) -> ProfileSummary {
         name: profile.name.clone(),
         active: profile.id == active_id,
         minecraft_version: profile.config.minecraft_version.clone(),
+        terraria_version: profile.config.terraria_version.clone(),
         server_type: profile.config.server_type.clone(),
         server_path: profile.config.server_path.clone(),
         setup_complete: profile.config.setup_complete,
