@@ -25,6 +25,17 @@ use crate::license;
 /// How often we retry after a failed heartbeat (shorter than normal interval).
 const RETRY_SECS: u64 = 60;
 
+/// Cadence while at least one local server is running/starting, so the
+/// dashboard reflects live stats almost in real time.
+const ACTIVE_INTERVAL_SECS: u64 = 30;
+
+/// True when any snapshot shows a server that is up or coming up.
+fn any_server_active(servers: &[AppServerSnapshot]) -> bool {
+    servers
+        .iter()
+        .any(|s| s.status == "running" || s.status == "starting")
+}
+
 /// Response shape from `POST /api/app/heartbeat`.
 #[derive(Debug, Deserialize, Default)]
 struct HeartbeatResponse {
@@ -88,9 +99,14 @@ pub async fn run(
             continue;
         }
 
-        let interval = tokio::time::Duration::from_secs(cfg.heartbeat_interval_secs.max(30));
-
         let servers = servers_provider.as_ref().map(|f| f()).unwrap_or_default();
+
+        // Adaptive cadence: fast while a server is active, idle otherwise.
+        let interval = if any_server_active(&servers) {
+            tokio::time::Duration::from_secs(ACTIVE_INTERVAL_SECS)
+        } else {
+            tokio::time::Duration::from_secs(cfg.heartbeat_interval_secs.max(30))
+        };
 
         match send_heartbeat(&cfg, servers).await {
             Ok(resp) => {
@@ -283,4 +299,42 @@ fn get_hostname() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(status: &str) -> AppServerSnapshot {
+        AppServerSnapshot {
+            local_id: "p1".into(),
+            name: "Test".into(),
+            server_type: "vanilla".into(),
+            minecraft_version: "1.21".into(),
+            status: status.into(),
+            player_count: 0,
+            max_players: 0,
+            tps: None,
+            memory_used_mb: None,
+            memory_max_mb: None,
+        }
+    }
+
+    #[test]
+    fn active_detection() {
+        assert!(!any_server_active(&[]));
+        assert!(!any_server_active(&[snapshot("stopped")]));
+        assert!(any_server_active(&[snapshot("stopped"), snapshot("running")]));
+        assert!(any_server_active(&[snapshot("starting")]));
+        assert!(!any_server_active(&[snapshot("stopping")]));
+    }
+
+    #[test]
+    fn snapshot_serializes_with_local_id_for_dashboard_keying() {
+        let v = serde_json::to_value(snapshot("running")).unwrap();
+        assert_eq!(v["local_id"], "p1");
+        assert_eq!(v["status"], "running");
+        // Optional fields omitted when empty
+        assert!(v.get("tps").is_none());
+    }
 }
