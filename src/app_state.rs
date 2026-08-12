@@ -3,6 +3,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
@@ -138,7 +139,7 @@ pub struct AppState {
     pub playit: Mutex<PlayitState>,
     pub stats: Mutex<ServerStats>,
     pub online_players: Mutex<HashSet<String>>,
-    pub console_buffer: Mutex<VecDeque<String>>,
+    pub console_buffer: StdMutex<VecDeque<String>>,
     pub recent_auto_restarts: Mutex<VecDeque<std::time::Instant>>,
     pub recent_players: Mutex<VecDeque<(String, String)>>,
     pub last_gametime_sample: Mutex<Option<(u64, std::time::Instant)>>,
@@ -158,7 +159,7 @@ impl AppState {
             playit: Mutex::new(PlayitState::default()),
             stats: Mutex::new(ServerStats::default()),
             online_players: Mutex::new(HashSet::new()),
-            console_buffer: Mutex::new(VecDeque::with_capacity(CONSOLE_BUFFER_CAP)),
+            console_buffer: StdMutex::new(VecDeque::with_capacity(CONSOLE_BUFFER_CAP)),
             recent_auto_restarts: Mutex::new(VecDeque::new()),
             recent_players: Mutex::new(VecDeque::new()),
             last_gametime_sample: Mutex::new(None),

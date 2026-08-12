@@ -322,11 +322,13 @@ pub async fn quarantine_client_only_mods(server_root: &Path) -> Result<Vec<Strin
     let mut moved = Vec::new();
     let mut client_mod_ids = HashSet::new();
 
-    // First pass: identify client-only mods
+    // Pre-compute client-only status for all jars (avoid repeated file I/O)
+    let mut client_only_cache = HashSet::new();
     for path in &jars {
         if jar_declares_client_only(path) {
             let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             client_mod_ids.insert(name);
+            client_only_cache.insert(path.clone());
         }
     }
 
@@ -334,7 +336,7 @@ pub async fn quarantine_client_only_mods(server_root: &Path) -> Result<Vec<Strin
     // Build a set of client mod IDs (not file names)
     let mut client_mod_ids_set = HashSet::new();
     for path in &jars {
-        if jar_declares_client_only(path) {
+        if client_only_cache.contains(path) {
             // Extract mod ID from fabric.mod.json
             if let Some(mod_id) = jar_get_mod_id(path) {
                 client_mod_ids_set.insert(mod_id);
@@ -362,7 +364,7 @@ pub async fn quarantine_client_only_mods(server_root: &Path) -> Result<Vec<Strin
 
     for path in jars {
         let should_move = !cached_safe_paths.contains(&path)
-            && (jar_declares_client_only(&path)
+            && (client_only_cache.contains(&path)
                 || hashes_by_path
                     .get(&path)
                     .is_some_and(|hash| remote_client_only.contains(hash))

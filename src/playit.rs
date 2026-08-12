@@ -89,8 +89,9 @@ pub fn read_secret() -> Option<String> {
         };
         for line in content.lines() {
             let l = line.trim();
-            if let Some(rest) = l.strip_prefix("secret_key") {
-                let after_eq = rest.split_once('=')?.1.trim();
+            // Match "secret_key" exactly (not "secret_key_regen" etc.)
+            if l.starts_with("secret_key") && l.get(11..12).map_or(true, |c| c == " " || c == "=") {
+                let after_eq = l.split_once('=')?.1.trim();
                 let key = after_eq.trim_matches(|c| c == '"' || c == '\'').to_string();
                 if !key.is_empty() {
                     return Some(key);

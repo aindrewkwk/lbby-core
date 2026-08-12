@@ -570,7 +570,7 @@ async fn remote_console_response(app: std::sync::Arc<crate::app_state::AppEventS
     let lines = state
         .console_buffer
         .lock()
-        .await
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .cloned()
         .collect::<Vec<_>>();
