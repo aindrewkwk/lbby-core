@@ -26,6 +26,9 @@ pub struct ServerStats {
     pub status: String,
     /// Active server profile/config name
     pub server_name: String,
+    /// Recent console lines for dashboard display (not persisted)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub console_lines: Vec<String>,
 }
 
 /// Polls one process tree by PID and computes deltas for disk I/O against the previous sample.
