@@ -208,6 +208,7 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
         srv.restart_generation = srv.restart_generation.wrapping_add(1);
     }
     app.emit("server-status", ServerStatus::Starting).ok();
+    app.state().push_console_line("[lbby] Initializing server...".to_string());
 
     let server_dir = PathBuf::from(&cfg.server_path);
 
@@ -506,6 +507,8 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
                 let mut srv = s.server.lock().await;
                 if srv.status == ServerStatus::Starting {
                     srv.status = ServerStatus::Running;
+                    drop(srv);
+                    s.push_console_line("[lbby] Server is ready!".to_string());
                     app3.emit("server-status", ServerStatus::Running).ok();
                 }
             }
@@ -603,6 +606,7 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
             srv.pid = None;
         }
         app3.emit("server-status", ServerStatus::Stopped).ok();
+        s.push_console_line("[lbby] Server stopped".to_string());
         // Use captured server_dir for PID cleanup (not active profile)
         if let Some(ref dir) = captured_server_dir {
             let _ = std::fs::remove_file(dir.join(".lbby-server.pid"));
@@ -892,6 +896,8 @@ async fn graceful_or_force_stop_server(
         return;
     }
 
+    state.push_console_line("[lbby] Server stopping...".to_string());
+
     // Phase 2: wait for the server to exit cleanly
     let max_iters = (grace_secs * 2).max(2);
     for _ in 0..max_iters {
@@ -943,6 +949,8 @@ async fn graceful_or_force_stop_server(
     srv.status = ServerStatus::Stopped;
     srv.stdin = None;
     srv.pid = None;
+    drop(srv);
+    state.push_console_line("[lbby] Server stopped".to_string());
     app.emit("server-status", ServerStatus::Stopped).ok();
 }
 
