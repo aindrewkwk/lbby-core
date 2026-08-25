@@ -472,16 +472,21 @@ async fn download_server_jar(
 
     match spec.distribution.as_str() {
         "paper" => {
-            // Resolve build number
-            let build = match &spec.loader_version {
-                Some(b) => b.clone(),
+            // PaperMC Downloads Service v3 (fill.papermc.io)
+            let url = match &spec.loader_version {
+                Some(build) => {
+                    format!(
+                        "https://fill.papermc.io/v3/projects/paper/versions/{}/builds/{}/downloads/server:default",
+                        spec.minecraft_version, build
+                    )
+                }
                 None => {
-                    // Fetch latest build
-                    let v: serde_json::Value = client
+                    let builds: serde_json::Value = client
                         .get(format!(
-                            "https://api.papermc.io/v2/projects/paper/versions/{}",
+                            "https://fill.papermc.io/v3/projects/paper/versions/{}/builds",
                             spec.minecraft_version
                         ))
+                        .header("User-Agent", "lbby-node/0.5 (https://github.com/aindrewkwk/lbby-node)")
                         .send()
                         .await
                         .map_err(|e| NodeApiError::DownloadFailed(e.to_string()))?
@@ -489,52 +494,42 @@ async fn download_server_jar(
                         .await
                         .map_err(|e| NodeApiError::DownloadFailed(e.to_string()))?;
 
-                    let builds = v["builds"].as_array().ok_or_else(|| {
+                    let arr = builds.as_array().ok_or_else(|| {
                         NodeApiError::DownloadFailed("No builds found".to_string())
                     })?;
-                    builds
-                        .last()
-                        .and_then(|b| b.as_u64())
-                        .ok_or_else(|| NodeApiError::DownloadFailed("No build number".to_string()))?
+                    let stable = arr.iter().rev().find(|b| {
+                        b["channel"].as_str() == Some("STABLE")
+                    });
+                    let build = stable.or_else(|| arr.last()).ok_or_else(|| {
+                        NodeApiError::DownloadFailed("No builds found".to_string())
+                    })?;
+                    build["downloads"]["server:default"]["url"]
+                        .as_str()
+                        .ok_or_else(|| NodeApiError::DownloadFailed("No download URL".to_string()))?
                         .to_string()
                 }
             };
-
-            // Get download filename
-            let info: serde_json::Value = client
-                .get(format!(
-                    "https://api.papermc.io/v2/projects/paper/versions/{}/builds/{}",
-                    spec.minecraft_version, build
-                ))
-                .send()
-                .await
-                .map_err(|e| NodeApiError::DownloadFailed(e.to_string()))?
-                .json()
-                .await
-                .map_err(|e| NodeApiError::DownloadFailed(e.to_string()))?;
-
-            let file_name = info["downloads"]["application"]["name"]
-                .as_str()
-                .ok_or_else(|| NodeApiError::DownloadFailed("No download name".to_string()))?;
-
-            let url = format!(
-                "https://api.papermc.io/v2/projects/paper/versions/{}/builds/{}/downloads/{}",
-                spec.minecraft_version, build, file_name
-            );
 
             crate::helpers::download_to_file(app, &url, &server_dir.join("server.jar"), "Paper")
                 .await
                 .map_err(NodeApiError::DownloadFailed)?;
         }
         "folia" => {
-            let build = match &spec.loader_version {
-                Some(b) => b.clone(),
+            // PaperMC Downloads Service v3 (fill.papermc.io)
+            let url = match &spec.loader_version {
+                Some(build) => {
+                    format!(
+                        "https://fill.papermc.io/v3/projects/folia/versions/{}/builds/{}/downloads/server:default",
+                        spec.minecraft_version, build
+                    )
+                }
                 None => {
-                    let v: serde_json::Value = client
+                    let builds: serde_json::Value = client
                         .get(format!(
-                            "https://api.papermc.io/v2/projects/folia/versions/{}",
+                            "https://fill.papermc.io/v3/projects/folia/versions/{}/builds",
                             spec.minecraft_version
                         ))
+                        .header("User-Agent", "lbby-node/0.5 (https://github.com/aindrewkwk/lbby-node)")
                         .send()
                         .await
                         .map_err(|e| NodeApiError::DownloadFailed(e.to_string()))?
@@ -542,37 +537,21 @@ async fn download_server_jar(
                         .await
                         .map_err(|e| NodeApiError::DownloadFailed(e.to_string()))?;
 
-                    let builds = v["builds"].as_array().ok_or_else(|| {
+                    let arr = builds.as_array().ok_or_else(|| {
                         NodeApiError::DownloadFailed("No builds found".to_string())
                     })?;
-                    builds
-                        .last()
-                        .and_then(|b| b.as_u64())
-                        .ok_or_else(|| NodeApiError::DownloadFailed("No build number".to_string()))?
+                    let stable = arr.iter().rev().find(|b| {
+                        b["channel"].as_str() == Some("STABLE")
+                    });
+                    let build = stable.or_else(|| arr.last()).ok_or_else(|| {
+                        NodeApiError::DownloadFailed("No builds found".to_string())
+                    })?;
+                    build["downloads"]["server:default"]["url"]
+                        .as_str()
+                        .ok_or_else(|| NodeApiError::DownloadFailed("No download URL".to_string()))?
                         .to_string()
                 }
             };
-
-            let info: serde_json::Value = client
-                .get(format!(
-                    "https://api.papermc.io/v2/projects/folia/versions/{}/builds/{}",
-                    spec.minecraft_version, build
-                ))
-                .send()
-                .await
-                .map_err(|e| NodeApiError::DownloadFailed(e.to_string()))?
-                .json()
-                .await
-                .map_err(|e| NodeApiError::DownloadFailed(e.to_string()))?;
-
-            let file_name = info["downloads"]["application"]["name"]
-                .as_str()
-                .ok_or_else(|| NodeApiError::DownloadFailed("No download name".to_string()))?;
-
-            let url = format!(
-                "https://api.papermc.io/v2/projects/folia/versions/{}/builds/{}/downloads/{}",
-                spec.minecraft_version, build, file_name
-            );
 
             crate::helpers::download_to_file(app, &url, &server_dir.join("server.jar"), "Folia")
                 .await
