@@ -29,8 +29,8 @@ pub fn required_java_for_mc_with_loader(mc_version: &str, server_type: Option<&s
         17 => 17,
         18 | 19 => 17,
         20 if patch <= 4 => 17,
-        20 => 21, // 1.20.5+
-        _ => 21,  // 1.21.x and beyond (including 26.x+)
+        20..=25 => 21, // 1.20.5+ through 1.25.x
+        _ => 25,       // 26.x+ (new MC versioning, compiled with Java 25)
     }
 }
 
