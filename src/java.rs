@@ -21,19 +21,8 @@ pub fn required_java_for_mc_with_loader(mc_version: &str, server_type: Option<&s
         }
     }
 
-    // Parse "1.X.Y" → minor = X
-    let minor = mc_version
-        .strip_prefix("1.")
-        .and_then(|rest| rest.split('.').next())
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(20);
-
-    // Minor patch (the .Y part) — needed to distinguish 1.20.4 from 1.20.5+
-    let patch = mc_version
-        .strip_prefix("1.")
-        .and_then(|rest| rest.split('.').nth(1))
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
+    // Parse MC version — supports both old "1.X.Y" and new "X.Y" (26.x+) formats
+    let (minor, patch) = parse_mc_version(mc_version);
 
     match minor {
         0..=16 => 8,
@@ -41,8 +30,26 @@ pub fn required_java_for_mc_with_loader(mc_version: &str, server_type: Option<&s
         18 | 19 => 17,
         20 if patch <= 4 => 17,
         20 => 21, // 1.20.5+
-        _ => 21,  // 1.21.x and beyond
+        _ => 21,  // 1.21.x and beyond (including 26.x+)
     }
+}
+
+/// Parse a Minecraft version string into (minor, patch).
+/// Handles both "1.X.Y" (classic) and "X.Y" (new format, 26.x+) styles.
+fn parse_mc_version(mc_version: &str) -> (u32, u32) {
+    // Try "1.X.Y" format first
+    if let Some(rest) = mc_version.strip_prefix("1.") {
+        let mut parts = rest.split('.');
+        let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(20);
+        let patch = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        return (minor, patch);
+    }
+
+    // New format "X.Y" (e.g., "26.2") — MC dropped the "1." prefix
+    let mut parts = mc_version.split('.');
+    let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let patch = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    (minor, patch)
 }
 
 fn push_unique(candidates: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
