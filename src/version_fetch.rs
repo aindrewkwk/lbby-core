@@ -38,13 +38,13 @@ struct ForgePromotions {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct PaperProject {
-    versions: Vec<String>,
+struct PaperProjectV3 {
+    versions: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct PaperVersion {
-    builds: Vec<u32>,
+struct PaperBuildV3 {
+    id: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -121,15 +121,17 @@ pub async fn fetch_paper_versions() -> Result<Vec<String>, String> {
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("failed to create HTTP client");
-    let proj: PaperProject = client
-        .get("https://api.papermc.io/v2/projects/paper")
+    let proj: PaperProjectV3 = client
+        .get("https://fill.papermc.io/v3/projects/paper")
         .send()
         .await
         .map_err(|e| e.to_string())?
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    let mut versions = proj.versions;
+    // v3 groups versions by major (e.g. "1.21": ["1.21.11", ...], "26.2": ["26.2", ...])
+    let mut versions: Vec<String> = proj.versions.into_values().flatten().collect();
+    versions.dedup();
     versions.reverse();
     Ok(versions.into_iter().take(40).collect())
 }
@@ -139,9 +141,9 @@ pub async fn fetch_paper_builds(mc_version: String) -> Result<Vec<LoaderVersion>
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("failed to create HTTP client");
-    let v: PaperVersion = client
+    let builds: Vec<PaperBuildV3> = client
         .get(format!(
-            "https://api.papermc.io/v2/projects/paper/versions/{}",
+            "https://fill.papermc.io/v3/projects/paper/versions/{}/builds",
             mc_version
         ))
         .send()
@@ -150,7 +152,7 @@ pub async fn fetch_paper_builds(mc_version: String) -> Result<Vec<LoaderVersion>
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    let latest = v.builds.last().copied().unwrap_or(0);
+    let latest = builds.last().map(|b| b.id).unwrap_or(0);
     Ok(vec![LoaderVersion {
         version: latest.to_string(),
         label: format!("{} (latest)", latest),
@@ -256,15 +258,16 @@ pub async fn fetch_folia_versions() -> Result<Vec<String>, String> {
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("failed to create HTTP client");
-    let proj: PaperProject = client
-        .get("https://api.papermc.io/v2/projects/folia")
+    let proj: PaperProjectV3 = client
+        .get("https://fill.papermc.io/v3/projects/folia")
         .send()
         .await
         .map_err(|e| e.to_string())?
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    let mut versions = proj.versions;
+    let mut versions: Vec<String> = proj.versions.into_values().flatten().collect();
+    versions.dedup();
     versions.reverse();
     Ok(versions.into_iter().take(40).collect())
 }
@@ -274,9 +277,9 @@ pub async fn fetch_folia_builds(mc_version: String) -> Result<Vec<LoaderVersion>
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("failed to create HTTP client");
-    let v: PaperVersion = client
+    let builds: Vec<PaperBuildV3> = client
         .get(format!(
-            "https://api.papermc.io/v2/projects/folia/versions/{}",
+            "https://fill.papermc.io/v3/projects/folia/versions/{}/builds",
             mc_version
         ))
         .send()
@@ -285,7 +288,7 @@ pub async fn fetch_folia_builds(mc_version: String) -> Result<Vec<LoaderVersion>
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    let latest = v.builds.last().copied().unwrap_or(0);
+    let latest = builds.last().map(|b| b.id).unwrap_or(0);
     Ok(vec![LoaderVersion {
         version: latest.to_string(),
         label: format!("{} (latest)", latest),
