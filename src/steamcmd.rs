@@ -321,7 +321,6 @@ pub async fn download_server(
         username,
         "+app_update",
         app_id,
-        "validate",
         "+quit",
     ];
 
