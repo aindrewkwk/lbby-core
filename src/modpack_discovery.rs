@@ -623,7 +623,7 @@ struct CfHash {
 
 fn curseforge_client() -> Result<reqwest::Client, String> {
     let api_key = crate::mod_services::CURSEFORGE_API_KEY;
-    
+
     reqwest::Client::builder()
         .user_agent("Lbby/0.1.0 (Minecraft server hosting app)")
         .timeout(std::time::Duration::from_secs(30))

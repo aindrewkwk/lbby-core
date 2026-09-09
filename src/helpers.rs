@@ -200,10 +200,9 @@ fn read_forge_mod_info<R: Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     file_name: &str,
 ) -> Option<crate::app_state::ModInfo> {
-    let text =
-        read_zip_text(zip, "META-INF/neoforge.mods.toml")
-            .or_else(|| read_zip_text(zip, "META-INF/mods.toml"))
-            .or_else(|| read_zip_text(zip, "mods.toml"))?;
+    let text = read_zip_text(zip, "META-INF/neoforge.mods.toml")
+        .or_else(|| read_zip_text(zip, "META-INF/mods.toml"))
+        .or_else(|| read_zip_text(zip, "mods.toml"))?;
     let value: toml::Value = text.parse().ok()?;
     let mods = value.get("mods")?.as_array()?;
     let first = mods.first()?;
@@ -266,11 +265,22 @@ pub fn read_forge_dependencies(path: &std::path::Path) -> Vec<(String, String)> 
         if let Some(arr) = dep_list.as_array() {
             for dep in arr {
                 let mod_id = dep.get("modId").and_then(|v| v.as_str()).unwrap_or("");
-                let version_range = dep.get("versionRange").and_then(|v| v.as_str()).unwrap_or("");
-                let mandatory = dep.get("mandatory").and_then(|v| v.as_bool()).unwrap_or(true);
+                let version_range = dep
+                    .get("versionRange")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let mandatory = dep
+                    .get("mandatory")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
                 let dep_type = dep.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 let is_required = mandatory || dep_type.eq_ignore_ascii_case("required");
-                if is_required && !mod_id.is_empty() && mod_id != "forge" && mod_id != "neoforge" && mod_id != "minecraft" {
+                if is_required
+                    && !mod_id.is_empty()
+                    && mod_id != "forge"
+                    && mod_id != "neoforge"
+                    && mod_id != "minecraft"
+                {
                     result.push((mod_id.to_string(), version_range.to_string()));
                 }
             }
@@ -674,14 +684,20 @@ displayName="Test Mod"
 
         let value: toml::Value = test_toml.parse().unwrap();
         let deps = value.get("dependencies").unwrap().as_table().unwrap();
-        
+
         let mut result = Vec::new();
         for (_key, dep_list) in deps {
             if let Some(arr) = dep_list.as_array() {
                 for dep in arr {
                     let mod_id = dep.get("modId").and_then(|v| v.as_str()).unwrap_or("");
-                    let version_range = dep.get("versionRange").and_then(|v| v.as_str()).unwrap_or("");
-                    let mandatory = dep.get("mandatory").and_then(|v| v.as_bool()).unwrap_or(true);
+                    let version_range = dep
+                        .get("versionRange")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let mandatory = dep
+                        .get("mandatory")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
                     let dep_type = dep.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     let is_required = mandatory || dep_type.eq_ignore_ascii_case("required");
                     if is_required && mod_id != "neoforge" && mod_id != "minecraft" {
@@ -690,10 +706,20 @@ displayName="Test Mod"
                 }
             }
         }
-        
-        assert_eq!(result.len(), 2, "Should find create and curios as dependencies");
-        assert!(result.iter().any(|(id, _)| id == "create"), "Should find create");
-        assert!(result.iter().any(|(id, _)| id == "curios"), "Should find curios");
+
+        assert_eq!(
+            result.len(),
+            2,
+            "Should find create and curios as dependencies"
+        );
+        assert!(
+            result.iter().any(|(id, _)| id == "create"),
+            "Should find create"
+        );
+        assert!(
+            result.iter().any(|(id, _)| id == "curios"),
+            "Should find curios"
+        );
     }
 }
 
@@ -707,7 +733,10 @@ fn test_real_jar_dependencies() {
     let deps = read_forge_dependencies(jar_path);
     println!("irons_jewelry deps: {:?}", deps);
     assert!(!deps.is_empty(), "Should find dependencies");
-    assert!(deps.iter().any(|(id, _)| id == "apothic_attributes"), "Should find apothic_attributes");
+    assert!(
+        deps.iter().any(|(id, _)| id == "apothic_attributes"),
+        "Should find apothic_attributes"
+    );
 }
 
 // ── Version Compatibility ─────────────────────────────────────────────────
@@ -779,9 +808,7 @@ pub fn version_matches_range(version: &str, range: &str) -> bool {
 
 /// Extract mod version from filename (e.g., "tacz-1.1.8-hotfix.jar" -> "1.1.8")
 pub fn extract_mod_version(filename: &str) -> Option<String> {
-    let stem = std::path::Path::new(filename)
-        .file_stem()?
-        .to_str()?;
+    let stem = std::path::Path::new(filename).file_stem()?.to_str()?;
 
     // Try to find version pattern: after last dash, before .jar
     // Common patterns: "modname-1.0.0.jar", "modname-1.0.0-beta.jar"
@@ -790,9 +817,11 @@ pub fn extract_mod_version(filename: &str) -> Option<String> {
         let version_part = parts[0];
         // Strip common suffixes
         let version = version_part
-            .split('+').next()
+            .split('+')
+            .next()
             .unwrap_or(version_part)
-            .split('_').next()
+            .split('_')
+            .next()
             .unwrap_or(version_part);
         return Some(version.to_string());
     }

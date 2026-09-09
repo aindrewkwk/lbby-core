@@ -298,7 +298,8 @@ fn parse_effects(effects: &[fastnbt::Value]) -> Vec<ActiveEffect> {
             let id = nbt_str(c, "Id").unwrap_or_else(|| "unknown".into());
             let amplifier = nbt_i32(c, "Amplifier").unwrap_or(0);
             let duration = nbt_i32(c, "Duration").unwrap_or(0);
-            let ambient = c.get("Ambient")
+            let ambient = c
+                .get("Ambient")
                 .and_then(|v| match v {
                     fastnbt::Value::Byte(b) => Some(*b != 0),
                     _ => None,

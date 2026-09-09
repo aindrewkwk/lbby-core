@@ -11,7 +11,7 @@ use tokio::process::ChildStdin;
 
 use crate::app_state::AppEventSender;
 use crate::config::{ServerConfig, ServerType};
-use crate::forge::{detect_modloader_launch, ModLoaderKind, ModLoaderLaunch};
+use crate::forge::{detect_modloader_launch, ModLoaderKind};
 use crate::helpers::{check_port_available, download_to_file, hide_child_window, InstallProgress};
 use crate::minecraft_properties::merge_server_properties;
 use crate::stats::ServerStats;
@@ -208,7 +208,8 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
         srv.restart_generation = srv.restart_generation.wrapping_add(1);
     }
     app.emit("server-status", ServerStatus::Starting).ok();
-    app.state().push_console_line("[lbby] Initializing server...".to_string());
+    app.state()
+        .push_console_line("[lbby] Initializing server...".to_string());
 
     let server_dir = PathBuf::from(&cfg.server_path);
 
@@ -292,7 +293,10 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
 
     // Pick the Java version that matches the Minecraft version
     let server_type_str = format!("{:?}", cfg.server_type);
-    let required_major = crate::java::required_java_for_mc_with_loader(&cfg.minecraft_version, Some(&server_type_str));
+    let required_major = crate::java::required_java_for_mc_with_loader(
+        &cfg.minecraft_version,
+        Some(&server_type_str),
+    );
     let resolved_java = crate::java::find_java_with_version(required_major);
     let (java_bin, actual_major) = match resolved_java {
         Some(p) => (p, Some(required_major)),
@@ -366,7 +370,7 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
         _ => {}
     }
 
-    let java_home = crate::java::java_home_from_bin(&java_bin);
+    let _java_home = crate::java::java_home_from_bin(&java_bin); // used by shared builder
     let banner = format!(
         "[lbby] Using Java {} at {}",
         actual_major.unwrap_or(required_major),
@@ -378,84 +382,18 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
     }
     app.emit("mc-line", &banner).ok();
 
-    let mut cmd = match cfg.server_type {
-        ServerType::Forge | ServerType::NeoForge => {
-            let (kind, version_key) = if cfg.server_type == ServerType::Forge {
-                (
-                    ModLoaderKind::Forge,
-                    format!(
-                        "{}-{}",
-                        cfg.minecraft_version,
-                        cfg.loader_version.as_deref().ok_or("No Forge version")?
-                    ),
-                )
-            } else {
-                (
-                    ModLoaderKind::NeoForge,
-                    cfg.loader_version
-                        .as_deref()
-                        .ok_or("No NeoForge version")?
-                        .to_string(),
-                )
-            };
-            match detect_modloader_launch(&server_dir, kind, &version_key)? {
-                ModLoaderLaunch::Script(_) => {
-                    #[cfg(target_os = "windows")]
-                    let mut c = {
-                        let mut c = tokio::process::Command::new("cmd");
-                        c.args(["/c", "run.bat", "nogui"]);
-                        c
-                    };
-                    #[cfg(not(target_os = "windows"))]
-                    let mut c = {
-                        let mut c = tokio::process::Command::new("/bin/bash");
-                        c.args(["-c", "./run.sh nogui"]);
-                        c
-                    };
-                    if let Some(jh) = &java_home {
-                        c.env("JAVA_HOME", jh);
-                        let bin_dir = jh.join("bin");
-                        let sep = if cfg!(windows) { ";" } else { ":" };
-                        let new_path = match std::env::var("PATH") {
-                            Ok(p) => format!("{}{}{}", bin_dir.display(), sep, p),
-                            Err(_) => bin_dir.display().to_string(),
-                        };
-                        c.env("PATH", new_path);
-                    }
-                    c
-                }
-                ModLoaderLaunch::LegacyJar(jar) => {
-                    let mut c = tokio::process::Command::new(&java_bin);
-                    c.arg(format!("-Xmx{}M", ram));
-                    c.arg(format!("-Xms{}M", (ram / 2).max(512)));
-                    if cfg.optimized_jvm_flags {
-                        c.args(optimized_jvm_flags());
-                    }
-                    c.args(["-jar", &jar.to_string_lossy(), "nogui"]);
-                    c
-                }
-            }
-        }
-        _ => {
-            let mut c = tokio::process::Command::new(&java_bin);
-            c.arg(format!("-Xmx{}M", ram));
-            c.arg(format!("-Xms{}M", (ram / 2).max(512)));
-            if cfg.optimized_jvm_flags {
-                c.args(optimized_jvm_flags());
-            }
-            c.args(["-jar", "server.jar", "nogui"]);
-            c
-        }
-    };
+    // Use shared launch builder — same code path as BootValidator.
+    let launch_cmd =
+        crate::server_launch::build_server_launch_command(&cfg, &server_dir, &java_bin)?;
 
-    cmd.env_remove("DYLD_LIBRARY_PATH");
-    cmd.env_remove("DYLD_FALLBACK_LIBRARY_PATH");
-    cmd.env_remove("DYLD_FRAMEWORK_PATH");
-    cmd.env_remove("DYLD_ROOT_PATH");
-    cmd.env_remove("DYLD_IMAGE_SUFFIX");
-    cmd.env_remove("DYLD_SHARED_FILE");
-    cmd.env_remove("DYLD_INSERT_LIBRARIES");
-    cmd.env_remove("DYLD_FORCE_FLAT_NAMESPACE");
+    let mut cmd = tokio::process::Command::new(&launch_cmd.executable);
+    cmd.args(&launch_cmd.args);
+    for (k, v) in &launch_cmd.env_set {
+        cmd.env(k, v);
+    }
+    for k in &launch_cmd.env_remove {
+        cmd.env_remove(k);
+    }
 
     cmd.current_dir(&server_dir)
         .stdin(Stdio::piped())
@@ -1795,7 +1733,10 @@ pub async fn do_install_server(
         // is sufficient — never silently use a too-old JVM (especially for
         // Forge/NeoForge which hang silently on version mismatch).
         let server_type_str = format!("{:?}", cfg.server_type);
-        let required_major = crate::java::required_java_for_mc_with_loader(&cfg.minecraft_version, Some(&server_type_str));
+        let required_major = crate::java::required_java_for_mc_with_loader(
+            &cfg.minecraft_version,
+            Some(&server_type_str),
+        );
         cfg.java_path = match crate::java::ensure_java(required_major, &app).await {
             Ok(path) => path.to_string_lossy().to_string(),
             Err(download_err) => {

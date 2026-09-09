@@ -37,6 +37,10 @@ pub struct MinecraftSpec {
     pub server_name: String,
     /// Game port (default 25565)
     pub game_port: u16,
+    /// Whether the user has explicitly accepted the Minecraft EULA.
+    /// Installation will write eula.txt ONLY when this is true.
+    #[serde(default)]
+    pub eula_accepted: bool,
 }
 
 impl Default for MinecraftSpec {
@@ -49,6 +53,7 @@ impl Default for MinecraftSpec {
             max_players: 20,
             server_name: "Lbby Server".to_string(),
             game_port: 25565,
+            eula_accepted: false,
         }
     }
 }
@@ -147,7 +152,10 @@ pub async fn prepare_minecraft(
     tokio::fs::create_dir_all(instance_dir).await?;
 
     // Resolve Java version
-    let required_major = crate::java::required_java_for_mc_with_loader(&spec.minecraft_version, Some(&spec.distribution));
+    let required_major = crate::java::required_java_for_mc_with_loader(
+        &spec.minecraft_version,
+        Some(&spec.distribution),
+    );
     let app = noop_event_sender();
 
     let java_bin = match crate::java::find_java_with_version(required_major) {
@@ -486,7 +494,10 @@ async fn download_server_jar(
                             "https://fill.papermc.io/v3/projects/paper/versions/{}/builds",
                             spec.minecraft_version
                         ))
-                        .header("User-Agent", "lbby-node/0.5 (https://github.com/aindrewkwk/lbby-node)")
+                        .header(
+                            "User-Agent",
+                            "lbby-node/0.5 (https://github.com/aindrewkwk/lbby-node)",
+                        )
                         .send()
                         .await
                         .map_err(|e| NodeApiError::DownloadFailed(e.to_string()))?
@@ -497,9 +508,10 @@ async fn download_server_jar(
                     let arr = builds.as_array().ok_or_else(|| {
                         NodeApiError::DownloadFailed("No builds found".to_string())
                     })?;
-                    let stable = arr.iter().rev().find(|b| {
-                        b["channel"].as_str() == Some("STABLE")
-                    });
+                    let stable = arr
+                        .iter()
+                        .rev()
+                        .find(|b| b["channel"].as_str() == Some("STABLE"));
                     let build = stable.or_else(|| arr.last()).ok_or_else(|| {
                         NodeApiError::DownloadFailed("No builds found".to_string())
                     })?;
@@ -529,7 +541,10 @@ async fn download_server_jar(
                             "https://fill.papermc.io/v3/projects/folia/versions/{}/builds",
                             spec.minecraft_version
                         ))
-                        .header("User-Agent", "lbby-node/0.5 (https://github.com/aindrewkwk/lbby-node)")
+                        .header(
+                            "User-Agent",
+                            "lbby-node/0.5 (https://github.com/aindrewkwk/lbby-node)",
+                        )
                         .send()
                         .await
                         .map_err(|e| NodeApiError::DownloadFailed(e.to_string()))?
@@ -540,9 +555,10 @@ async fn download_server_jar(
                     let arr = builds.as_array().ok_or_else(|| {
                         NodeApiError::DownloadFailed("No builds found".to_string())
                     })?;
-                    let stable = arr.iter().rev().find(|b| {
-                        b["channel"].as_str() == Some("STABLE")
-                    });
+                    let stable = arr
+                        .iter()
+                        .rev()
+                        .find(|b| b["channel"].as_str() == Some("STABLE"));
                     let build = stable.or_else(|| arr.last()).ok_or_else(|| {
                         NodeApiError::DownloadFailed("No builds found".to_string())
                     })?;

@@ -100,7 +100,13 @@ fn jar_get_mod_id(path: &Path) -> Option<String> {
             let mut contents = String::new();
             if entry.read_to_string(&mut contents).is_ok() {
                 if let Ok(value) = contents.parse::<toml::Value>() {
-                    if let Some(mod_id) = value.get("mods").and_then(|m| m.as_array()).and_then(|arr| arr.first()).and_then(|m| m.get("modId")).and_then(|v| v.as_str()) {
+                    if let Some(mod_id) = value
+                        .get("mods")
+                        .and_then(|m| m.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|m| m.get("modId"))
+                        .and_then(|v| v.as_str())
+                    {
                         return Some(mod_id.to_string());
                     }
                 }
@@ -326,7 +332,10 @@ pub async fn quarantine_client_only_mods(server_root: &Path) -> Result<Vec<Strin
     let mut client_only_cache = HashSet::new();
     for path in &jars {
         if jar_declares_client_only(path) {
-            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
             client_mod_ids.insert(name);
             client_only_cache.insert(path.clone());
         }
@@ -346,7 +355,10 @@ pub async fn quarantine_client_only_mods(server_root: &Path) -> Result<Vec<Strin
     eprintln!("[lbby] Client mod IDs: {:?}", client_mod_ids_set);
 
     for path in &jars {
-        let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
         if client_mod_ids.contains(&file_name) {
             continue;
         }
@@ -354,7 +366,10 @@ pub async fn quarantine_client_only_mods(server_root: &Path) -> Result<Vec<Strin
         if let Some(deps) = jar_get_dependencies(path) {
             for dep in &deps {
                 if client_mod_ids_set.contains(dep.as_str()) {
-                    eprintln!("[lbby] Removing {} because it depends on client mod {}", file_name, dep);
+                    eprintln!(
+                        "[lbby] Removing {} because it depends on client mod {}",
+                        file_name, dep
+                    );
                     client_mod_ids.insert(file_name.clone());
                     break;
                 }
@@ -368,7 +383,12 @@ pub async fn quarantine_client_only_mods(server_root: &Path) -> Result<Vec<Strin
                 || hashes_by_path
                     .get(&path)
                     .is_some_and(|hash| remote_client_only.contains(hash))
-                || client_mod_ids.contains(&path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()));
+                || client_mod_ids.contains(
+                    &path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                ));
         if !should_move {
             if let Some((name, signature)) = signatures.get(&path) {
                 if remote_complete || !hashes_by_path.contains_key(&path) {

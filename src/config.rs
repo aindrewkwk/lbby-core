@@ -234,6 +234,12 @@ pub struct ServerConfig {
     /// Heartbeat interval in seconds. 0 = disabled.
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_secs: u64,
+    /// Whether the user has explicitly accepted the Minecraft EULA.
+    /// Defaults to false. Installation writes eula=true ONLY when this is true.
+    /// Existing installs with eula.txt already present are grandfathered —
+    /// this field is checked only during new installs.
+    #[serde(default)]
+    pub eula_accepted: bool,
 }
 
 impl ServerConfig {

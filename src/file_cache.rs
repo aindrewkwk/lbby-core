@@ -34,7 +34,8 @@ impl<T: Clone> FileCache<T> {
         let val = load()?;
         if let Ok(meta) = std::fs::metadata(path) {
             if let Ok(modified) = meta.modified() {
-                *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = Some((val.clone(), modified));
+                *self.inner.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((val.clone(), modified));
             }
         }
         Ok(val)

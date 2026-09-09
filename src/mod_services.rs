@@ -141,7 +141,9 @@ struct CurseFileRef {
     required: bool,
 }
 
-fn default_required() -> bool { true }
+fn default_required() -> bool {
+    true
+}
 
 // ── CurseForge Search & API Types ──────────────────────────────────────────
 
@@ -167,6 +169,8 @@ pub struct CurseFileEntry {
     pub parent_project_file_id: Option<i64>,
     #[serde(default, rename = "gameVersions")]
     pub game_versions: Vec<String>,
+    #[serde(default)]
+    pub dependencies: Vec<crate::dependency_resolver::CurseDependency>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -267,7 +271,11 @@ pub fn validate_curseforge_file_for_profile(
     let declared_loaders: Vec<String> = file
         .game_versions
         .iter()
-        .filter(|value| known_loaders.iter().any(|loader| value.eq_ignore_ascii_case(loader)))
+        .filter(|value| {
+            known_loaders
+                .iter()
+                .any(|loader| value.eq_ignore_ascii_case(loader))
+        })
         .map(|value| value.to_ascii_lowercase())
         .collect();
     if !declared_loaders
@@ -345,7 +353,10 @@ fn murmur2_block(hash: &mut u32, block: [u8; 4]) {
     *hash = hash.wrapping_mul(M) ^ value;
 }
 
-pub fn curseforge_fingerprint_reader<R: Read>(mut reader: R, normalized_len: usize) -> Result<u32, String> {
+pub fn curseforge_fingerprint_reader<R: Read>(
+    mut reader: R,
+    normalized_len: usize,
+) -> Result<u32, String> {
     const M: u32 = 0x5bd1_e995;
     let normalized_len = u32::try_from(normalized_len)
         .map_err(|_| "CurseForge fingerprint input exceeds 4 GiB".to_string())?;
@@ -544,7 +555,9 @@ pub async fn prefer_curseforge_server_pack(
 
                         // Check if this mod's name contains "server" and is related to the original
                         if name.to_lowercase().contains("server")
-                            && (slug.to_lowercase().contains(&mod_name.to_lowercase().replace(" ", "-"))
+                            && (slug
+                                .to_lowercase()
+                                .contains(&mod_name.to_lowercase().replace(" ", "-"))
                                 || name.to_lowercase().contains(&mod_name.to_lowercase()))
                         {
                             if let Some(mod_id) = id {
@@ -560,15 +573,24 @@ pub async fn prefer_curseforge_server_pack(
                                     .send()
                                     .await
                                 {
-                                    if let Ok(files_data) = files_resp.json::<serde_json::Value>().await {
+                                    if let Ok(files_data) =
+                                        files_resp.json::<serde_json::Value>().await
+                                    {
                                         if let Some(files) = files_data["data"].as_array() {
                                             if let Some(file) = files.first() {
-                                                if let Ok(server_file) = serde_json::from_value::<CurseFileEntry>(file.clone()) {
+                                                if let Ok(server_file) =
+                                                    serde_json::from_value::<CurseFileEntry>(
+                                                        file.clone(),
+                                                    )
+                                                {
                                                     let _ = app.emit(
                                                         "mod-task-progress",
                                                         ModTaskProgress {
                                                             stage: "Found server pack".to_string(),
-                                                            message: format!("Using CurseForge server pack: {}", server_file.file_name),
+                                                            message: format!(
+                                                                "Using CurseForge server pack: {}",
+                                                                server_file.file_name
+                                                            ),
                                                             current: 1,
                                                             total: 1,
                                                             progress: 1.0,
@@ -664,10 +686,18 @@ pub async fn download_curseforge_file(
                 "mod-task-progress",
                 ModTaskProgress {
                     stage: "Downloading modpack".to_string(),
-                    message: format!("{} / {} MB", downloaded / 1024 / 1024, total_size / 1024 / 1024),
+                    message: format!(
+                        "{} / {} MB",
+                        downloaded / 1024 / 1024,
+                        total_size / 1024 / 1024
+                    ),
                     current: downloaded as u32,
                     total: total_size as u32,
-                    progress: if total_size > 0 { downloaded as f32 / total_size as f32 } else { 0.0 },
+                    progress: if total_size > 0 {
+                        downloaded as f32 / total_size as f32
+                    } else {
+                        0.0
+                    },
                 },
             );
             last_emit = std::time::Instant::now();
@@ -705,10 +735,17 @@ pub async fn search_curseforge_mods(
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("CurseForge search failed ({}): {}", status, response_preview(&text)));
+        return Err(format!(
+            "CurseForge search failed ({}): {}",
+            status,
+            response_preview(&text)
+        ));
     }
 
-    let data: serde_json::Value = resp.json().await.map_err(|e| format!("CurseForge parse error: {}", e))?;
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("CurseForge parse error: {}", e))?;
     let hits = data["data"]
         .as_array()
         .map(|arr| {
@@ -718,8 +755,12 @@ pub async fn search_curseforge_mods(
                     let name = m["name"].as_str()?.to_string();
                     let slug = m["slug"].as_str()?.to_string();
                     let desc = m["summary"].as_str().unwrap_or("").to_string();
-                    let icon = m.get("logo").and_then(|l| l["thumbnailUrl"].as_str()).map(|s| s.to_string());
-                    let versions: Vec<String> = m.get("latestFiles")
+                    let icon = m
+                        .get("logo")
+                        .and_then(|l| l["thumbnailUrl"].as_str())
+                        .map(|s| s.to_string());
+                    let versions: Vec<String> = m
+                        .get("latestFiles")
                         .and_then(|f| f.as_array())
                         .map(|arr| {
                             arr.iter()
@@ -727,7 +768,8 @@ pub async fn search_curseforge_mods(
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let loaders: Vec<String> = m.get("latestFiles")
+                    let loaders: Vec<String> = m
+                        .get("latestFiles")
                         .and_then(|f| f.as_array())
                         .and_then(|arr| arr.first())
                         .and_then(|f| f.get("gameVersion"))
@@ -784,15 +826,17 @@ fn emit_mod_progress(
 static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 
 pub(crate) fn client() -> Result<reqwest::Client, String> {
-    Ok(HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .user_agent("Lbby/0.1.0 (Minecraft server hosting app)")
-            .timeout(std::time::Duration::from_secs(60))
-            .pool_max_idle_per_host(20)
-            .tcp_keepalive(std::time::Duration::from_secs(30))
-            .build()
-            .expect("Failed to create HTTP client")
-    }).clone())
+    Ok(HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent("Lbby/0.1.0 (Minecraft server hosting app)")
+                .timeout(std::time::Duration::from_secs(60))
+                .pool_max_idle_per_host(20)
+                .tcp_keepalive(std::time::Duration::from_secs(30))
+                .build()
+                .expect("Failed to create HTTP client")
+        })
+        .clone())
 }
 
 fn curseforge_client() -> Result<reqwest::Client, String> {
@@ -952,18 +996,27 @@ async fn download_bytes_to_file(
             }
             Ok(resp) => {
                 last_err = format!("HTTP {}", resp.status());
-                eprintln!("[lbby] Download attempt {} failed: {} for {}", attempt, last_err, label);
+                eprintln!(
+                    "[lbby] Download attempt {} failed: {} for {}",
+                    attempt, last_err, label
+                );
             }
             Err(e) => {
                 last_err = e.to_string();
-                eprintln!("[lbby] Download attempt {} failed: {} for {}", attempt, last_err, label);
+                eprintln!(
+                    "[lbby] Download attempt {} failed: {} for {}",
+                    attempt, last_err, label
+                );
             }
         }
         if attempt < 3 {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }
-    Err(format!("Download failed after 3 attempts: {} for {}", last_err, label))
+    Err(format!(
+        "Download failed after 3 attempts: {} for {}",
+        last_err, label
+    ))
 }
 
 fn verify_sha512(path: &Path, expected: Option<&str>) -> Result<(), String> {
@@ -1677,11 +1730,17 @@ pub async fn install_modrinth_modpack(
             names.join(", ")
         );
         eprintln!("[lbby] {}", msg);
-        emit_mod_progress(&app, "Dependency check", &msg, missing.len() as u32, missing.len() as u32);
+        emit_mod_progress(
+            &app,
+            "Dependency check",
+            &msg,
+            missing.len() as u32,
+            missing.len() as u32,
+        );
         eprintln!("[lbby] Run 'Install Missing Dependencies' from the mods page to fix these.");
     }
 
-    emit_mod_progress(&app, "Finalizing", "Modpack is ready", 1, 1);
+    emit_mod_progress(&app, "Finalizing", "Modpack installation completed", 1, 1);
     Ok(cfg)
 }
 
@@ -1758,10 +1817,29 @@ pub async fn install_curseforge_modpack(
     let mut zip =
         zip::ZipArchive::new(file).map_err(|e| format!("Invalid CurseForge ZIP: {}", e))?;
     let manifest_result: Result<CurseManifest, String> = read_zip_json(&mut zip, "manifest.json");
+
+    // ── Phase 3D: Transactional staging ─────────────────────────────
+    let mut cfg = config::load_config();
+    if cfg.server_path.trim().is_empty() {
+        cfg.server_path = default_server_path_value(None);
+    }
+    let live_path = server_dir(&cfg)?;
+    let source = if manifest_result.is_err() {
+        "curseforge-server-pack"
+    } else {
+        "curseforge-manifest"
+    };
+    let txn = crate::install_transaction::InstallTransaction::begin(&live_path, source)?;
+    // Backup existing live server (secondary safety layer)
+    if live_path.exists() {
+        backup_modpack_targets(&live_path)?;
+    }
+    // Redirect all file operations to staging
+    cfg.server_path = txn.staging_path().to_string_lossy().to_string();
+
     if manifest_result.is_err() {
-        // No manifest.json = server pack. Extract directly to server directory.
+        // No manifest.json = server pack. Extract directly to staging directory.
         eprintln!("[lbby] No manifest.json found — treating as server pack, extracting directly");
-        let mut cfg = config::load_config();
 
         // Detect Minecraft version and loader from server pack contents
         // by scanning for Fabric/Forge libraries or config files
@@ -1776,12 +1854,17 @@ pub async fn install_curseforge_modpack(
                         if cfg.loader_version.is_none() {
                             cfg.loader_version = Some(loader_ver);
                             cfg.server_type = ServerType::Fabric;
-                            eprintln!("[lbby] Detected Fabric loader: {}", cfg.loader_version.as_deref().unwrap_or("?"));
+                            eprintln!(
+                                "[lbby] Detected Fabric loader: {}",
+                                cfg.loader_version.as_deref().unwrap_or("?")
+                            );
                         }
                     }
                 }
                 // Forge: libraries/net/minecraftforge/...
-                if name.starts_with("libraries/net/minecraftforge/") && cfg.server_type == ServerType::Vanilla {
+                if name.starts_with("libraries/net/minecraftforge/")
+                    && cfg.server_type == ServerType::Vanilla
+                {
                     cfg.server_type = ServerType::Forge;
                     eprintln!("[lbby] Detected Forge server");
                 }
@@ -1792,13 +1875,14 @@ pub async fn install_curseforge_modpack(
             // Common pattern: config files reference MC version
             // Or we can use a default based on the modpack name
             // For now, keep the existing version from profile
-            eprintln!("[lbby] Using existing MC version: {}", cfg.minecraft_version);
+            eprintln!(
+                "[lbby] Using existing MC version: {}",
+                cfg.minecraft_version
+            );
         }
 
-        if let Ok(root) = server_dir(&cfg) {
-            backup_modpack_targets(&root)?;
-        }
-        let cfg2 = prepare_modpack_server(&app, cfg).await?;
+        // backup done in transaction setup above
+        let mut cfg2 = prepare_modpack_server(&app, cfg).await?;
         let root = server_dir(&cfg2)?;
         let total = zip.len() as u32;
         for i in 0..zip.len() {
@@ -1810,7 +1894,10 @@ pub async fn install_curseforge_modpack(
                 Err(_) => std::path::PathBuf::from(&entry_name),
             };
             // Block path traversal
-            if relative.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            if relative
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
                 continue;
             }
             let outpath = root.join(&relative);
@@ -1824,51 +1911,144 @@ pub async fn install_curseforge_modpack(
                 std::io::copy(&mut entry, &mut outfile).map_err(|e| e.to_string())?;
             }
             if i % 50 == 0 || i + 1 == total as usize {
-                emit_mod_progress(&app, "Extracting server pack", &format!("{}/{} files", i + 1, total), (i + 1) as u32, total);
+                emit_mod_progress(
+                    &app,
+                    "Extracting server pack",
+                    &format!("{}/{} files", i + 1, total),
+                    (i + 1) as u32,
+                    total,
+                );
             }
         }
-        eprintln!("[lbby] Server pack extracted {} files to {}", total, root.display());
+        eprintln!(
+            "[lbby] Server pack extracted {} files to {}",
+            total,
+            root.display()
+        );
         // Filter client-only mods after extraction
-        let quarantined = crate::mod_side::quarantine_client_only_mods(&root).await.unwrap_or_default();
+        let quarantined = crate::mod_side::quarantine_client_only_mods(&root)
+            .await
+            .unwrap_or_default();
         if !quarantined.is_empty() {
             eprintln!("[lbby] Quarantined {} client-only mods", quarantined.len());
-            emit_mod_progress(&app, "Filtering client-only mods", &format!("Removed {} client-only mods", quarantined.len()), quarantined.len() as u32, quarantined.len() as u32);
+            emit_mod_progress(
+                &app,
+                "Filtering client-only mods",
+                &format!("Removed {} client-only mods", quarantined.len()),
+                quarantined.len() as u32,
+                quarantined.len() as u32,
+            );
         }
         // Ensure server loader is installed (Fabric/Forge)
         // do_install_server handles this but server packs skip it
         // So we need to install the loader manually
         let server_jar = root.join("server.jar");
-        if !server_jar.exists() || std::fs::metadata(&server_jar).map(|m| m.len() < 1_000_000).unwrap_or(true) {
+        if !server_jar.exists()
+            || std::fs::metadata(&server_jar)
+                .map(|m| m.len() < 1_000_000)
+                .unwrap_or(true)
+        {
             // Detect loader from extracted files
             let has_fabric = root.join("fabric-server-launch.jar").exists()
                 || root.join("libraries/net/fabricmc").exists();
             let has_forge = root.join("libraries/net/minecraftforge").exists();
             if has_fabric {
                 eprintln!("[lbby] Detected Fabric server — installing Fabric loader");
-                emit_mod_progress(&app, "Installing Fabric loader", "Downloading Fabric server", 0, 1);
+                emit_mod_progress(
+                    &app,
+                    "Installing Fabric loader",
+                    "Downloading Fabric server",
+                    0,
+                    1,
+                );
                 let loader = cfg2.loader_version.as_deref().unwrap_or("0.19.3");
                 let mc = &cfg2.minecraft_version;
-                let url = format!("https://meta.fabricmc.net/v2/versions/loader/{}/{}/1.0.1/server/jar", mc, loader);
-                download_bytes_to_file(&app, &url, &server_jar, "Fabric server", "server.jar", 1, 1).await?;
+                let url = format!(
+                    "https://meta.fabricmc.net/v2/versions/loader/{}/{}/1.0.1/server/jar",
+                    mc, loader
+                );
+                download_bytes_to_file(
+                    &app,
+                    &url,
+                    &server_jar,
+                    "Fabric server",
+                    "server.jar",
+                    1,
+                    1,
+                )
+                .await?;
             } else if has_forge {
                 eprintln!("[lbby] Detected Forge server — Forge installer should be present");
             }
         }
-        return Ok(cfg2);
+        // Copy persistent state from live → staging
+        txn.copy_persistent_state()?;
+        // Boot validation: verify the staged server actually starts
+        let validator = crate::boot_validator::BootValidator::new();
+        let boot_result = validator.validate(&cfg2, txn.staging_path()).await;
+        match boot_result {
+            crate::boot_validator::BootResult::Success(ref s) => {
+                eprintln!(
+                    "[lbby] Boot validation passed in {:.1}s",
+                    s.elapsed.as_secs_f32()
+                );
+                // Pre-commit invariant: no validation artifacts in staging
+                if let Err(residue_err) =
+                    crate::boot_validator::verify_validation_cleanup(txn.staging_path())
+                {
+                    eprintln!("[lbby] Pre-commit residue check failed: {}", residue_err);
+                    crate::boot_validator::save_validation_diagnostics(
+                        txn.staging_path(),
+                        &txn.meta().server_id,
+                        &txn.meta().transaction_id,
+                        &boot_result,
+                    );
+                    txn.rollback()?;
+                    return Err(format!("Pre-commit residue check failed: {}", residue_err));
+                }
+                let meta = txn.commit()?;
+                cfg2.server_path = meta.live_path.to_string_lossy().to_string();
+                config::save_config(&cfg2)?;
+                return Ok(cfg2);
+            }
+            crate::boot_validator::BootResult::Failed(ref f) => {
+                let err = format!("Boot validation failed ({}): {}", f.reason, f.log_tail);
+                crate::boot_validator::save_validation_diagnostics(
+                    txn.staging_path(),
+                    &txn.meta().server_id,
+                    &txn.meta().transaction_id,
+                    &boot_result,
+                );
+                txn.rollback()?;
+                return Err(err);
+            }
+            crate::boot_validator::BootResult::Timeout(ref t) => {
+                let err = format!(
+                    "Boot validation timed out after {}s: {}",
+                    t.waited.as_secs(),
+                    t.log_tail
+                );
+                crate::boot_validator::save_validation_diagnostics(
+                    txn.staging_path(),
+                    &txn.meta().server_id,
+                    &txn.meta().transaction_id,
+                    &boot_result,
+                );
+                txn.rollback()?;
+                return Err(err);
+            }
+        }
     }
     let manifest = manifest_result.unwrap();
     let (server_type, loader_version) = loader_from_curse(&manifest.minecraft.mod_loaders)?;
-    let mut cfg = config::load_config();
-    if let Ok(root) = server_dir(&cfg) {
-        backup_modpack_targets(&root)?;
-    }
+    // cfg and backup already handled in transaction setup above
     cfg.minecraft_version = manifest.minecraft.version;
     cfg.server_type = server_type;
     cfg.loader_version = loader_version;
     if let Some(name) = manifest.name.clone().filter(|n| !n.trim().is_empty()) {
         cfg.server_name = name;
     }
-    let cfg = prepare_modpack_server(&app, cfg).await?;
+    let mut cfg = prepare_modpack_server(&app, cfg).await?;
     let root = server_dir(&cfg)?;
     let target_dir = mods_dir(&cfg)?;
     tokio::fs::create_dir_all(&target_dir)
@@ -1877,7 +2057,9 @@ pub async fn install_curseforge_modpack(
     let total = manifest.files.iter().filter(|f| f.required).count() as u32;
     let cf = curseforge_client()?;
     let concurrency: usize = 20;
-    let files: Vec<(u64, u64)> = manifest.files.iter()
+    let files: Vec<(u64, u64)> = manifest
+        .files
+        .iter()
         .filter(|f| f.required)
         .map(|f| (f.project_id, f.file_id))
         .collect();
@@ -1898,7 +2080,9 @@ pub async fn install_curseforge_modpack(
             match resp {
                 Ok(r) if r.status().is_success() => {
                     #[derive(serde::Deserialize)]
-                    struct D { data: String }
+                    struct D {
+                        data: String,
+                    }
                     r.json::<D>().await.map(|d| d.data).ok()
                 }
                 _ => None,
@@ -1930,21 +2114,29 @@ pub async fn install_curseforge_modpack(
                 downloads.push((cdn_url, file_name));
             }
             Ok(None) => {
-                eprintln!("[lbby] Failed to resolve download URL for file_id {}", file_id);
+                eprintln!(
+                    "[lbby] Failed to resolve download URL for file_id {}",
+                    file_id
+                );
                 url_failures.push(*file_id);
             }
             Err(e) => {
-                eprintln!("[lbby] Task error resolving URL for file_id {}: {}", file_id, e);
+                eprintln!(
+                    "[lbby] Task error resolving URL for file_id {}: {}",
+                    file_id, e
+                );
                 url_failures.push(*file_id);
             }
         }
     }
     if !url_failures.is_empty() {
-        eprintln!("[lbby] WARNING: {} mod(s) could not be resolved from CurseForge API", url_failures.len());
+        eprintln!(
+            "[lbby] WARNING: {} mod(s) could not be resolved from CurseForge API",
+            url_failures.len()
+        );
     }
 
-    // Download in parallel batches, skip client-only mods
-    let mut client_skipped = 0u32;
+    // Download all candidate mods — compatibility analysis runs after all downloads complete.
     let mut download_failures: Vec<String> = Vec::new();
     for chunk in downloads.chunks(concurrency) {
         let mut handles = Vec::new();
@@ -1974,19 +2166,19 @@ pub async fn install_curseforge_modpack(
                         &file_name_for_task,
                         current,
                         total,
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(()) => {
-                            // Check if client-only
-                            if crate::mod_side::jar_declares_client_only(&temp_dest) {
-                                eprintln!("[lbby] Skipping client-only mod: {}", file_name_for_task);
-                                let _ = std::fs::remove_file(&temp_dest);
-                                return Ok(true); // true = client-only, skipped
-                            }
-                            // Move to mods folder
+                            // Move to mods folder — all mods downloaded first,
+                            // compatibility analysis runs after all downloads complete.
                             if let Err(e) = std::fs::rename(&temp_dest, &dest) {
-                                return Err(format!("Failed to move {}: {}", file_name_for_task, e));
+                                return Err(format!(
+                                    "Failed to move {}: {}",
+                                    file_name_for_task, e
+                                ));
                             }
-                            return Ok(false); // false = server mod, installed
+                            return Ok(());
                         }
                         Err(e) => {
                             last_err = e;
@@ -1999,8 +2191,7 @@ pub async fn install_curseforge_modpack(
         }
         for (file_name, handle) in handles {
             match handle.await {
-                Ok(Ok(true)) => client_skipped += 1,
-                Ok(Ok(false)) => {}
+                Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     eprintln!("[lbby] Download error: {}", e);
                     download_failures.push(file_name);
@@ -2012,10 +2203,8 @@ pub async fn install_curseforge_modpack(
             }
         }
     }
-    if client_skipped > 0 {
-        eprintln!("[lbby] Skipped {} client-only mods", client_skipped);
-        emit_mod_progress(&app, "Client mods filtered", &format!("Skipped {} client-only mods", client_skipped), client_skipped, client_skipped);
-    }
+    // Compatibility analysis and quarantine happen after all downloads complete.
+    // See the Phase 3C pipeline below.
     if !download_failures.is_empty() {
         let msg = format!(
             "WARNING: {} mod(s) failed to download: {}",
@@ -2023,12 +2212,22 @@ pub async fn install_curseforge_modpack(
             download_failures.join(", ")
         );
         eprintln!("[lbby] {}", msg);
-        emit_mod_progress(&app, "Download failures", &msg, download_failures.len() as u32, download_failures.len() as u32);
+        emit_mod_progress(
+            &app,
+            "Download failures",
+            &msg,
+            download_failures.len() as u32,
+            download_failures.len() as u32,
+        );
     }
     // Verify we got a reasonable number of mods
     let expected_count = files.len();
     let actual_count = std::fs::read_dir(&target_dir)
-        .map(|d| d.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|ext| ext == "jar")).count())
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "jar"))
+                .count()
+        })
         .unwrap_or(0);
     if actual_count == 0 && expected_count > 0 {
         return Err(format!(
@@ -2049,16 +2248,506 @@ pub async fn install_curseforge_modpack(
         );
         safe_extract_prefix(&mut zip, overrides, &root)?;
     }
-    let quarantined = crate::mod_side::quarantine_client_only_mods(&root).await?;
-    if !quarantined.is_empty() {
+    // -- Phase 3C: Compatibility pipeline --------------------------------
+    // Download → analyze → dependency graph → exclusion plan → apply plan
+    //
+    // This replaces the legacy quarantine_client_only_mods() call for
+    // CurseForge installs only. Modrinth path unchanged.
+    let mods_dir = root.join("mods");
+    let quarantine_dir = root.join(".lbby-client-only-mods");
+
+    // Step 1: Collect all downloaded JARs and classify each one.
+    let mut analysis: Vec<(std::path::PathBuf, crate::mod_compat::ModCompatibility)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&mods_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "jar") {
+                let compat = crate::mod_compat::classify_mod_local(&path);
+                analysis.push((path, compat));
+            }
+        }
+    }
+
+    let total_mods = analysis.len();
+
+    // Step 2: Build dependency graph and create exclusion plan.
+    let graph = crate::dependency_graph::DependencyGraph::build(&analysis);
+    let plan = graph.create_plan();
+
+    // Count classification buckets for logging.
+    let mut count_server_ok = 0u32;
+    let mut count_universal = 0u32;
+    let mut count_unknown = 0u32;
+    let mut count_client_only = 0u32;
+    for (_, compat) in &analysis {
+        use crate::mod_compat::{CompatibilityConfidence, ServerCompatibility};
+        match (&compat.compatibility, &compat.confidence) {
+            (ServerCompatibility::ServerOk, _) => count_server_ok += 1,
+            (ServerCompatibility::Both, _) => count_universal += 1,
+            (ServerCompatibility::ClientOnly, CompatibilityConfidence::Explicit) => {
+                count_client_only += 1
+            }
+            _ => count_unknown += 1,
+        }
+    }
+
+    // Step 3: Apply exclusion plan — move excluded JARs to quarantine.
+    // Only exclude ClientOnly/Explicit. Never hard-delete.
+    let mut quarantined_count = 0u32;
+    for path in &plan.exclude {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        if let Err(e) = std::fs::create_dir_all(&quarantine_dir) {
+            eprintln!("[CF] WARNING: Failed to create quarantine dir: {}", e);
+            // Do NOT delete source on quarantine failure.
+            continue;
+        }
+        let dest = quarantine_dir.join(file_name);
+        if let Err(e) = std::fs::rename(path, &dest) {
+            eprintln!("[CF] WARNING: Failed to quarantine {}: {}", file_name, e);
+            // Do NOT delete source on quarantine failure.
+            continue;
+        }
+        let source_label = analysis
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, c)| format!("{:?}", c.source))
+            .unwrap_or_else(|| "Unknown".to_string());
+        let reason_label = analysis
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, c)| c.reason.clone())
+            .unwrap_or_else(|| "no detail".to_string());
+        eprintln!(
+            "[CF] Quarantined client-only mod: {}\n     source={}\n     reason={}",
+            file_name, source_label, reason_label,
+        );
+        quarantined_count += 1;
+    }
+
+    // Step 4: Structured summary logging.
+    eprintln!(
+        "[CF] Compatibility analysis complete\n\
+         [CF] Total mods: {}\n\
+         [CF] Server-compatible: {}\n\
+         [CF] Universal: {}\n\
+         [CF] Unknown: {}\n\
+         [CF] Confirmed client-only: {}\n\
+         [CF] Quarantined: {}\n\
+         [CF] Dependency conflicts: {}\n\
+         [CF] Missing dependencies: {}\n\
+         [CF] Ambiguous providers: {}",
+        total_mods,
+        count_server_ok,
+        count_universal,
+        count_unknown,
+        count_client_only,
+        quarantined_count,
+        plan.conflicts.len(),
+        plan.missing.len(),
+        plan.ambiguous.len(),
+    );
+
+    if quarantined_count > 0 {
         emit_mod_progress(
             &app,
             "Filtering client-only mods",
-            &format!("Quarantined {} client-only mod(s)", quarantined.len()),
-            quarantined.len() as u32,
-            quarantined.len() as u32,
+            &format!("Quarantined {} client-only mod(s)", quarantined_count),
+            quarantined_count,
+            quarantined_count,
         );
     }
+
+    // Report conflicts and ambiguous deps as warnings.
+    for conflict in &plan.conflicts {
+        eprintln!(
+            "[CF] Dependency conflict: {} requires {} which was quarantined",
+            conflict.dependent_mod_id.as_deref().unwrap_or("(unknown)"),
+            conflict.dependency_mod_id,
+        );
+    }
+    for amb in &plan.ambiguous {
+        eprintln!(
+            "[CF] Ambiguous dependency: {} requires {} ({} providers)",
+            amb.dependent_mod_id.as_deref().unwrap_or("(unknown)"),
+            amb.dependency_mod_id,
+            amb.provider_paths.len(),
+        );
+    }
+    for miss in &plan.missing {
+        eprintln!(
+            "[CF] Missing dependency: {} requires {}",
+            miss.dependent_mod_id.as_deref().unwrap_or("(unknown)"),
+            miss.dependency_mod_id,
+        );
+    }
+
+    // ── Phase 3F-A: Deterministic missing dependency repair ────────────
+    // Runs ONLY when missing deps exist. Up to MAX_REPAIR_ROUNDS iterations.
+    // Each round: resolve → download → rebuild graph → re-check.
+    let mut repair_records: Vec<crate::dependency_resolver::RepairRecord> = Vec::new();
+    let mut current_plan = plan;
+
+    if !current_plan.missing.is_empty() {
+        use crate::dependency_resolver::{
+            DependencyResolution, DependencyResolver, MAX_REPAIR_ROUNDS,
+        };
+        use std::collections::HashSet;
+
+        let loader_str = match &cfg.server_type {
+            ServerType::Forge => "forge",
+            ServerType::Fabric => "fabric",
+            ServerType::NeoForge => "neoforge",
+            _ => "",
+        };
+
+        let mc_version = cfg.minecraft_version.clone();
+        let mut resolver = DependencyResolver::new(cf.clone(), CURSEFORGE_API_KEY.to_string());
+
+        // Build authoritative project→mod_ids bridge from manifest + downloaded JARs.
+        // For each manifest entry, find the corresponding downloaded JAR and read its mod_ids.
+        for (project_id, file_id) in &files {
+            // Find the downloaded file for this manifest entry by querying CF API for file_name
+            match curseforge_file_by_id(&cf, CURSEFORGE_API_KEY, *file_id as i64).await {
+                Ok(file_entry) => {
+                    let jar_path = mods_dir.join(&file_entry.file_name);
+                    if jar_path.exists() {
+                        let metadata = crate::jar_metadata::read_jar_mod_metadata(&jar_path);
+                        if !metadata.mod_ids.is_empty() {
+                            resolver.register_project(*project_id, metadata.mod_ids);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[CF] Could not fetch file metadata for file_id {}: {}",
+                        file_id, e
+                    );
+                }
+            }
+        }
+
+        // Repair loop
+        for round in 0..MAX_REPAIR_ROUNDS {
+            if current_plan.missing.is_empty() {
+                break;
+            }
+
+            eprintln!(
+                "[CF] Dependency repair round {}/{}: {} missing deps",
+                round + 1,
+                MAX_REPAIR_ROUNDS,
+                current_plan.missing.len()
+            );
+
+            emit_mod_progress(
+                &app,
+                "Resolving dependencies",
+                &format!(
+                    "Repair round {}/{}: resolving {} missing dependency(s)",
+                    round + 1,
+                    MAX_REPAIR_ROUNDS,
+                    current_plan.missing.len()
+                ),
+                round as u32 + 1,
+                MAX_REPAIR_ROUNDS as u32,
+            );
+
+            let mut any_downloaded = false;
+            let mut newly_installed_projects: HashSet<u64> = HashSet::new();
+
+            for miss in &current_plan.missing {
+                let resolution = resolver.resolve(miss, &mc_version, loader_str).await;
+
+                match resolution {
+                    DependencyResolution::Resolved(ref resolved) => {
+                        eprintln!(
+                            "[CF] Resolved missing dep '{}': project={}, file={}, reason={:?}",
+                            miss.dependency_mod_id,
+                            resolved.project_id,
+                            resolved.file_id,
+                            resolved.reason
+                        );
+
+                        // Download the resolved dependency into staging mods dir
+                        match crate::dependency_resolver::download_resolved_dependency(
+                            &app, &cf, resolved, &mods_dir,
+                        )
+                        .await
+                        {
+                            Ok(jar_path) => {
+                                eprintln!(
+                                    "[CF] Downloaded resolved dependency: {}",
+                                    jar_path.display()
+                                );
+
+                                // SAFETY: Mandatory post-download identity verification.
+                                // Check that the downloaded JAR actually provides the expected mod_id.
+                                match crate::dependency_resolver::verify_download_identity(
+                                    &jar_path,
+                                    &miss.dependency_mod_id,
+                                ) {
+                                    Ok(()) => {
+                                        // Identity verified — register and mark success.
+                                        let metadata = crate::jar_metadata::read_jar_mod_metadata(&jar_path);
+                                        resolver.register_project(resolved.project_id, metadata.mod_ids);
+                                        newly_installed_projects.insert(resolved.project_id);
+                                        any_downloaded = true;
+
+                                        repair_records.push(crate::dependency_resolver::RepairRecord {
+                                            round: round + 1,
+                                            requesting_mod: miss.dependent_mod_id.clone(),
+                                            dependency_mod_id: miss.dependency_mod_id.clone(),
+                                            project_id: Some(resolved.project_id),
+                                            file_id: Some(resolved.file_id),
+                                            action: crate::dependency_resolver::RepairAction::IdentityVerified,
+                                            result: crate::dependency_resolver::RepairResult::Success(
+                                                format!("Identity verified: {} provides '{}'", resolved.file_name, miss.dependency_mod_id),
+                                            ),
+                                        });
+                                    }
+                                    Err(crate::dependency_resolver::DependencyResolution::IdentityMismatch { expected_mod_id, actual_mod_ids }) => {
+                                        // SAFETY: Downloaded JAR does NOT provide the expected mod_id.
+                                        // Reject and remove from staging.
+                                        eprintln!(
+                                            "[CF] Identity mismatch for '{}': expected '{}', got {:?}. Removing from staging.",
+                                            miss.dependency_mod_id, expected_mod_id, actual_mod_ids
+                                        );
+                                        crate::dependency_resolver::remove_rejected_artifact(&jar_path);
+
+                                        repair_records.push(crate::dependency_resolver::RepairRecord {
+                                            round: round + 1,
+                                            requesting_mod: miss.dependent_mod_id.clone(),
+                                            dependency_mod_id: miss.dependency_mod_id.clone(),
+                                            project_id: Some(resolved.project_id),
+                                            file_id: Some(resolved.file_id),
+                                            action: crate::dependency_resolver::RepairAction::IdentityRejected,
+                                            result: crate::dependency_resolver::RepairResult::Failed(
+                                                format!("Identity mismatch: expected '{}', got {:?}", expected_mod_id, actual_mod_ids),
+                                            ),
+                                        });
+                                    }
+                                    Err(crate::dependency_resolver::DependencyResolution::IdentityUnverifiable) => {
+                                        // SAFETY: Downloaded JAR has no mod metadata.
+                                        // Identity cannot be verified — reject.
+                                        eprintln!(
+                                            "[CF] Identity unverifiable for '{}': JAR has no mod_ids. Removing from staging.",
+                                            miss.dependency_mod_id
+                                        );
+                                        crate::dependency_resolver::remove_rejected_artifact(&jar_path);
+
+                                        repair_records.push(crate::dependency_resolver::RepairRecord {
+                                            round: round + 1,
+                                            requesting_mod: miss.dependent_mod_id.clone(),
+                                            dependency_mod_id: miss.dependency_mod_id.clone(),
+                                            project_id: Some(resolved.project_id),
+                                            file_id: Some(resolved.file_id),
+                                            action: crate::dependency_resolver::RepairAction::IdentityRejected,
+                                            result: crate::dependency_resolver::RepairResult::Failed(
+                                                "Identity unverifiable: JAR has no mod metadata".to_string(),
+                                            ),
+                                        });
+                                    }
+                                    Err(_) => {
+                                        // Unexpected resolution type from verify_download_identity.
+                                        // Should never happen — defensive reject.
+                                        crate::dependency_resolver::remove_rejected_artifact(&jar_path);
+                                        repair_records.push(crate::dependency_resolver::RepairRecord {
+                                            round: round + 1,
+                                            requesting_mod: miss.dependent_mod_id.clone(),
+                                            dependency_mod_id: miss.dependency_mod_id.clone(),
+                                            project_id: Some(resolved.project_id),
+                                            file_id: Some(resolved.file_id),
+                                            action: crate::dependency_resolver::RepairAction::IdentityRejected,
+                                            result: crate::dependency_resolver::RepairResult::Failed(
+                                                "Unexpected identity verification error".to_string(),
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[CF] Failed to download resolved dep '{}': {}",
+                                    miss.dependency_mod_id, e
+                                );
+                                repair_records.push(crate::dependency_resolver::RepairRecord {
+                                    round: round + 1,
+                                    requesting_mod: miss.dependent_mod_id.clone(),
+                                    dependency_mod_id: miss.dependency_mod_id.clone(),
+                                    project_id: Some(resolved.project_id),
+                                    file_id: Some(resolved.file_id),
+                                    action: crate::dependency_resolver::RepairAction::Downloaded,
+                                    result: crate::dependency_resolver::RepairResult::Failed(e),
+                                });
+                            }
+                        }
+                    }
+                    DependencyResolution::Ambiguous(ref candidates) => {
+                        let msg = format!(
+                            "Ambiguous: {} candidates for '{}'",
+                            candidates.len(),
+                            miss.dependency_mod_id
+                        );
+                        eprintln!("[CF] {}", msg);
+                        repair_records.push(crate::dependency_resolver::RepairRecord {
+                            round: round + 1,
+                            requesting_mod: miss.dependent_mod_id.clone(),
+                            dependency_mod_id: miss.dependency_mod_id.clone(),
+                            project_id: candidates.first().map(|c| c.project_id),
+                            file_id: None,
+                            action: crate::dependency_resolver::RepairAction::Skipped,
+                            result: crate::dependency_resolver::RepairResult::Skipped(msg),
+                        });
+                    }
+                    DependencyResolution::NotFound => {
+                        repair_records.push(crate::dependency_resolver::RepairRecord {
+                            round: round + 1,
+                            requesting_mod: miss.dependent_mod_id.clone(),
+                            dependency_mod_id: miss.dependency_mod_id.clone(),
+                            project_id: None,
+                            file_id: None,
+                            action: crate::dependency_resolver::RepairAction::Skipped,
+                            result: crate::dependency_resolver::RepairResult::Skipped(
+                                "Not found on CurseForge".to_string(),
+                            ),
+                        });
+                    }
+                    DependencyResolution::Incompatible(_) => {
+                        repair_records.push(crate::dependency_resolver::RepairRecord {
+                            round: round + 1,
+                            requesting_mod: miss.dependent_mod_id.clone(),
+                            dependency_mod_id: miss.dependency_mod_id.clone(),
+                            project_id: None,
+                            file_id: None,
+                            action: crate::dependency_resolver::RepairAction::Skipped,
+                            result: crate::dependency_resolver::RepairResult::Skipped(
+                                "No compatible version found".to_string(),
+                            ),
+                        });
+                    }
+                    DependencyResolution::Unsupported(ref reason) => {
+                        repair_records.push(crate::dependency_resolver::RepairRecord {
+                            round: round + 1,
+                            requesting_mod: miss.dependent_mod_id.clone(),
+                            dependency_mod_id: miss.dependency_mod_id.clone(),
+                            project_id: None,
+                            file_id: None,
+                            action: crate::dependency_resolver::RepairAction::Skipped,
+                            result: crate::dependency_resolver::RepairResult::Skipped(
+                                reason.clone(),
+                            ),
+                        });
+                    }
+                    DependencyResolution::ResolvedDependencyIsClientOnly => {
+                        repair_records.push(crate::dependency_resolver::RepairRecord {
+                            round: round + 1,
+                            requesting_mod: miss.dependent_mod_id.clone(),
+                            dependency_mod_id: miss.dependency_mod_id.clone(),
+                            project_id: None,
+                            file_id: None,
+                            action: crate::dependency_resolver::RepairAction::Skipped,
+                            result: crate::dependency_resolver::RepairResult::Skipped(
+                                "Resolved dependency is client-only".to_string(),
+                            ),
+                        });
+                    }
+                    DependencyResolution::AlreadyProvided => {
+                        // Cycle or already resolved — skip silently
+                    }
+                    DependencyResolution::IdentityMismatch {
+                        ref expected_mod_id,
+                        ref actual_mod_ids,
+                    } => {
+                        // This should not happen in resolve() — it's handled post-download.
+                        // But handle defensively.
+                        eprintln!(
+                            "[CF] Identity mismatch for '{}': expected '{}', got {:?}",
+                            miss.dependency_mod_id, expected_mod_id, actual_mod_ids
+                        );
+                    }
+                    DependencyResolution::IdentityUnverifiable => {
+                        // This should not happen in resolve() — it's handled post-download.
+                        // But handle defensively.
+                        eprintln!(
+                            "[CF] Identity unverifiable for '{}'",
+                            miss.dependency_mod_id
+                        );
+                    }
+                }
+
+                // Merge resolver records into our audit trail
+                repair_records.extend(resolver.records.drain(..));
+            }
+
+            if !any_downloaded {
+                eprintln!(
+                    "[CF] No new deps downloaded in round {} — stopping repair",
+                    round + 1
+                );
+                break;
+            }
+
+            // Rebuild graph after downloading new deps
+            let mut new_analysis: Vec<(std::path::PathBuf, crate::mod_compat::ModCompatibility)> =
+                Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&mods_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "jar") {
+                        let compat = crate::mod_compat::classify_mod_local(&path);
+                        new_analysis.push((path, compat));
+                    }
+                }
+            }
+            let new_graph = crate::dependency_graph::DependencyGraph::build(&new_analysis);
+            current_plan = new_graph.create_plan();
+
+            eprintln!(
+                "[CF] After repair round {}: {} missing, {} ambiguous",
+                round + 1,
+                current_plan.missing.len(),
+                current_plan.ambiguous.len()
+            );
+        }
+
+        // Final summary
+        let repaired_count = repair_records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.action,
+                    crate::dependency_resolver::RepairAction::Downloaded
+                )
+            })
+            .count();
+        let skipped_count = repair_records
+            .iter()
+            .filter(|r| matches!(r.action, crate::dependency_resolver::RepairAction::Skipped))
+            .count();
+
+        if repaired_count > 0 || skipped_count > 0 {
+            eprintln!(
+                "[CF] Dependency repair complete: {} downloaded, {} skipped, {} still missing",
+                repaired_count,
+                skipped_count,
+                current_plan.missing.len()
+            );
+            emit_mod_progress(
+                &app,
+                "Dependency repair",
+                &format!(
+                    "Repaired {} missing dependency(s), {} skipped",
+                    repaired_count, skipped_count
+                ),
+                repaired_count as u32,
+                (repaired_count + skipped_count) as u32,
+            );
+        }
+    }
+
     ensure_server_properties(&root, &cfg.server_name)?;
 
     // Auto-enable require-resource-pack if the modpack included resource packs
@@ -2088,12 +2777,80 @@ pub async fn install_curseforge_modpack(
             names.join(", ")
         );
         eprintln!("[lbby] {}", msg);
-        emit_mod_progress(&app, "Dependency check", &msg, missing.len() as u32, missing.len() as u32);
+        emit_mod_progress(
+            &app,
+            "Dependency check",
+            &msg,
+            missing.len() as u32,
+            missing.len() as u32,
+        );
         eprintln!("[lbby] Run 'Install Missing Dependencies' from the mods page to fix these.");
     }
 
-    emit_mod_progress(&app, "Finalizing", "CurseForge modpack is ready", 1, 1);
-    Ok(cfg)
+    emit_mod_progress(
+        &app,
+        "Finalizing",
+        "CurseForge modpack installation completed",
+        1,
+        1,
+    );
+    // Copy persistent state from live → staging
+    txn.copy_persistent_state()?;
+    // Boot validation: verify the staged server actually starts
+    let validator = crate::boot_validator::BootValidator::new();
+    let boot_result = validator.validate(&cfg, txn.staging_path()).await;
+    match boot_result {
+        crate::boot_validator::BootResult::Success(ref s) => {
+            eprintln!(
+                "[lbby] Boot validation passed in {:.1}s",
+                s.elapsed.as_secs_f32()
+            );
+            // Pre-commit invariant: no validation artifacts in staging
+            if let Err(residue_err) =
+                crate::boot_validator::verify_validation_cleanup(txn.staging_path())
+            {
+                eprintln!("[lbby] Pre-commit residue check failed: {}", residue_err);
+                crate::boot_validator::save_validation_diagnostics(
+                    txn.staging_path(),
+                    &txn.meta().server_id,
+                    &txn.meta().transaction_id,
+                    &boot_result,
+                );
+                txn.rollback()?;
+                return Err(format!("Pre-commit residue check failed: {}", residue_err));
+            }
+            let meta = txn.commit()?;
+            cfg.server_path = meta.live_path.to_string_lossy().to_string();
+            config::save_config(&cfg)?;
+            Ok(cfg)
+        }
+        crate::boot_validator::BootResult::Failed(ref f) => {
+            let err = format!("Boot validation failed ({}): {}", f.reason, f.log_tail);
+            crate::boot_validator::save_validation_diagnostics(
+                txn.staging_path(),
+                &txn.meta().server_id,
+                &txn.meta().transaction_id,
+                &boot_result,
+            );
+            txn.rollback()?;
+            Err(err)
+        }
+        crate::boot_validator::BootResult::Timeout(ref t) => {
+            let err = format!(
+                "Boot validation timed out after {}s: {}",
+                t.waited.as_secs(),
+                t.log_tail
+            );
+            crate::boot_validator::save_validation_diagnostics(
+                txn.staging_path(),
+                &txn.meta().server_id,
+                &txn.meta().transaction_id,
+                &boot_result,
+            );
+            txn.rollback()?;
+            Err(err)
+        }
+    }
 }
 
 fn ensure_server_properties(root: &Path, server_name: &str) -> Result<(), String> {
@@ -2389,7 +3146,10 @@ fn parse_curseforge_url(url: &str) -> Result<(String, Option<u64>), String> {
 fn curseforge_cdn_url(file_id: u64, filename: &str) -> String {
     let digits = file_id.to_string();
     if digits.len() <= 4 {
-        return format!("https://edge.forgecdn.net/files/{}/{}/{}", digits, "0", filename);
+        return format!(
+            "https://edge.forgecdn.net/files/{}/{}/{}",
+            digits, "0", filename
+        );
     }
     let (prefix, suffix) = digits.split_at(4);
     let suffix = suffix.trim_start_matches('0');
@@ -2452,17 +3212,8 @@ pub async fn install_curseforge_modpack_link(
     let file = cfwidget_find_file(&project, file_id)?;
     let cdn_url = curseforge_cdn_url(file.id, &file.name);
 
-    emit_mod_progress(
-        &app,
-        "Downloading CurseForge pack",
-        &file.name,
-        0,
-        1,
-    );
-    let tmp = std::env::temp_dir().join(format!(
-        "lbby-cf-{}.zip",
-        uuid::Uuid::new_v4().simple()
-    ));
+    emit_mod_progress(&app, "Downloading CurseForge pack", &file.name, 0, 1);
+    let tmp = std::env::temp_dir().join(format!("lbby-cf-{}.zip", uuid::Uuid::new_v4().simple()));
     download_bytes_to_file(
         &app,
         &cdn_url,
@@ -2623,7 +3374,10 @@ pub struct MissingDependency {
 /// Scan installed mods for missing or incompatible dependencies.
 /// File that stores names of mods removed as client-only (so we don't re-install them).
 fn client_removed_file() -> std::path::PathBuf {
-    crate::config::config_path().parent().unwrap_or(std::path::Path::new(".")).join("client_removed_mods.txt")
+    crate::config::config_path()
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("client_removed_mods.txt")
 }
 
 /// Load list of previously removed client-only mod names.
@@ -2646,13 +3400,20 @@ pub fn save_client_removed_mods(names: &[String]) {
             existing.push(name.clone());
         }
     }
-    let _ = std::fs::write(path, existing.join("
-"));
+    let _ = std::fs::write(
+        path,
+        existing.join(
+            "
+",
+        ),
+    );
 }
 
 /// Scan mods directory for client-only mods and remove them.
 /// Returns list of removed mod names.
-pub fn remove_client_only_mods(app: &std::sync::Arc<crate::app_state::AppEventSender>) -> Vec<String> {
+pub fn remove_client_only_mods(
+    app: &std::sync::Arc<crate::app_state::AppEventSender>,
+) -> Vec<String> {
     let cfg = config::load_config();
     let Ok(target_dir) = mods_dir(&cfg) else {
         return Vec::new();
@@ -2664,7 +3425,8 @@ pub fn remove_client_only_mods(app: &std::sync::Arc<crate::app_state::AppEventSe
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "jar") {
                 if crate::helpers::is_client_only_mod(&path) {
-                    let name = path.file_stem()
+                    let name = path
+                        .file_stem()
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_else(|| path.display().to_string());
                     eprintln!("[lbby] Removing client-only mod: {}", name);
@@ -2682,8 +3444,13 @@ pub fn remove_client_only_mods(app: &std::sync::Arc<crate::app_state::AppEventSe
         emit_mod_progress(
             app,
             "Client mods removed",
-            &format!("Removed {} client-only mods: {}", removed.len(), removed.join(", ")),
-            1, 1,
+            &format!(
+                "Removed {} client-only mods: {}",
+                removed.len(),
+                removed.join(", ")
+            ),
+            1,
+            1,
         );
     }
 
@@ -2710,7 +3477,8 @@ pub fn scan_missing_dependencies() -> Vec<MissingDependency> {
     // Build map of installed mods: id -> version
     for path in &installed_files {
         let info = crate::helpers::read_mod_info(path);
-        let file_stem = path.file_stem()
+        let file_stem = path
+            .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         let version = crate::helpers::extract_mod_version(&file_stem).unwrap_or_default();
@@ -2741,7 +3509,9 @@ pub fn scan_missing_dependencies() -> Vec<MissingDependency> {
         for (mod_id, version_range) in deps {
             if let Some(installed_ver) = installed_mods.get(&mod_id.to_lowercase()) {
                 // Mod exists - check version compatibility
-                if !version_range.is_empty() && !crate::helpers::version_matches_range(installed_ver, &version_range) {
+                if !version_range.is_empty()
+                    && !crate::helpers::version_matches_range(installed_ver, &version_range)
+                {
                     issues.push(MissingDependency {
                         mod_id,
                         version_range,
@@ -2767,7 +3537,9 @@ pub fn scan_missing_dependencies() -> Vec<MissingDependency> {
         for (mod_id, version_range) in deps {
             if let Some(installed_ver) = installed_mods.get(&mod_id.to_lowercase()) {
                 // Mod exists - check version compatibility
-                if !version_range.is_empty() && !crate::helpers::version_matches_range(installed_ver, &version_range) {
+                if !version_range.is_empty()
+                    && !crate::helpers::version_matches_range(installed_ver, &version_range)
+                {
                     issues.push(MissingDependency {
                         mod_id,
                         version_range,
@@ -2791,10 +3563,14 @@ pub fn scan_missing_dependencies() -> Vec<MissingDependency> {
 
     issues.sort_by(|a, b| a.mod_id.cmp(&b.mod_id));
     issues.dedup_by(|a, b| a.mod_id == b.mod_id);
-    eprintln!("[lbby] scan_missing_dependencies: found {} issues (missing: {}, incompatible: {})",
+    eprintln!(
+        "[lbby] scan_missing_dependencies: found {} issues (missing: {}, incompatible: {})",
         issues.len(),
         issues.iter().filter(|i| i.issue_type == "missing").count(),
-        issues.iter().filter(|i| i.issue_type == "incompatible").count()
+        issues
+            .iter()
+            .filter(|i| i.issue_type == "incompatible")
+            .count()
     );
     issues
 }
@@ -2819,34 +3595,61 @@ pub async fn install_missing_dependencies(
 
     // Load list of mods removed as client-only (don't re-install them)
     let client_removed = load_client_removed_mods();
-    let client_removed_lower: Vec<String> = client_removed.iter().map(|s| s.to_lowercase()).collect();
+    let client_removed_lower: Vec<String> =
+        client_removed.iter().map(|s| s.to_lowercase()).collect();
 
     for (i, mod_id) in mod_ids.iter().enumerate() {
         // Skip mods that were removed as client-only
         let mod_id_lower = mod_id.to_lowercase();
-        if client_removed_lower.iter().any(|removed| {
-            mod_id_lower.contains(removed) || removed.contains(&mod_id_lower)
-        }) {
+        if client_removed_lower
+            .iter()
+            .any(|removed| mod_id_lower.contains(removed) || removed.contains(&mod_id_lower))
+        {
             eprintln!("[lbby] Skipping {} (was removed as client-only)", mod_id);
             continue;
         }
 
-        emit_mod_progress(&app, "Installing dependencies", &format!("{}/{}: {}", i + 1, total, mod_id), (i + 1) as u32, total as u32);
+        emit_mod_progress(
+            &app,
+            "Installing dependencies",
+            &format!("{}/{}: {}", i + 1, total, mod_id),
+            (i + 1) as u32,
+            total as u32,
+        );
 
         let search_url = format!(
             "https://api.modrinth.com/v2/search?query={}",
             urlencoding::encode(mod_id)
         );
-        eprintln!("[lbby] install_missing_deps: searching Modrinth for '{}' url='{}'", mod_id, search_url);
-        let resp = client.get(&search_url).timeout(std::time::Duration::from_secs(15)).send().await;
+        eprintln!(
+            "[lbby] install_missing_deps: searching Modrinth for '{}' url='{}'",
+            mod_id, search_url
+        );
+        let resp = client
+            .get(&search_url)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await;
         let Ok(resp) = resp else {
-            eprintln!("[lbby] install_missing_deps: search request failed for {}", mod_id);
+            eprintln!(
+                "[lbby] install_missing_deps: search request failed for {}",
+                mod_id
+            );
             continue;
         };
         let body = resp.text().await.unwrap_or_default();
-        eprintln!("[lbby] install_missing_deps: search response for {}: {} chars | first 200: {}", mod_id, body.len(), &body[..body.len().min(200)]);
+        eprintln!(
+            "[lbby] install_missing_deps: search response for {}: {} chars | first 200: {}",
+            mod_id,
+            body.len(),
+            &body[..body.len().min(200)]
+        );
         let Ok(data) = serde_json::from_str::<serde_json::Value>(&body) else {
-            eprintln!("[lbby] install_missing_deps: JSON parse failed for {} (first 200: {})", mod_id, &body[..body.len().min(200)]);
+            eprintln!(
+                "[lbby] install_missing_deps: JSON parse failed for {} (first 200: {})",
+                mod_id,
+                &body[..body.len().min(200)]
+            );
             continue;
         };
 
@@ -2854,10 +3657,17 @@ pub async fn install_missing_dependencies(
             eprintln!("[lbby] install_missing_deps: no hits array for {}", mod_id);
             continue;
         };
-        eprintln!("[lbby] install_missing_deps: found {} hits for {}", hits.len(), mod_id);
+        eprintln!(
+            "[lbby] install_missing_deps: found {} hits for {}",
+            hits.len(),
+            mod_id
+        );
         // Flexible matching: remove all separators and compare
         let normalized_id = mod_id.replace('_', "-").to_lowercase();
-        let strip_seps = |s: &str| s.replace(|c: char| c == '-' || c == '_' || c == ' ', "").to_lowercase();
+        let strip_seps = |s: &str| {
+            s.replace(|c: char| c == '-' || c == '_' || c == ' ', "")
+                .to_lowercase()
+        };
         let mid_clean = strip_seps(mod_id);
         let matching = if hits.len() == 1 {
             // Only 1 result from search = likely the right mod
@@ -2878,11 +3688,16 @@ pub async fn install_missing_dependencies(
             })
         };
         let Some(hit) = matching else {
-            eprintln!("[lbby] install_missing_deps: no match for {} (tried slug, normalized, title)", mod_id);
+            eprintln!(
+                "[lbby] install_missing_deps: no match for {} (tried slug, normalized, title)",
+                mod_id
+            );
             continue;
         };
         let project_id = hit["project_id"].as_str().unwrap_or("");
-        if project_id.is_empty() { continue; }
+        if project_id.is_empty() {
+            continue;
+        }
 
         let game_versions = format!("[\"{}\"]", mc_version);
         let loaders = format!("[\"{}\"]", loader);
@@ -2890,27 +3705,62 @@ pub async fn install_missing_dependencies(
             "https://api.modrinth.com/v2/project/{}/version?game_versions={}&loaders={}",
             project_id, game_versions, loaders
         );
-        let versions_resp = client.get(&versions_url).timeout(std::time::Duration::from_secs(15)).send().await;
-        let Ok(versions_resp) = versions_resp else { continue; };
+        let versions_resp = client
+            .get(&versions_url)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await;
+        let Ok(versions_resp) = versions_resp else {
+            continue;
+        };
         let versions_body = versions_resp.text().await.unwrap_or_default();
-        let Ok(versions) = serde_json::from_str::<serde_json::Value>(&versions_body) else { continue; };
-        let Some(version_list) = versions.as_array() else { continue; };
-        let Some(version) = version_list.first() else { continue; };
+        let Ok(versions) = serde_json::from_str::<serde_json::Value>(&versions_body) else {
+            continue;
+        };
+        let Some(version_list) = versions.as_array() else {
+            continue;
+        };
+        let Some(version) = version_list.first() else {
+            continue;
+        };
 
-        let Some(files) = version["files"].as_array() else { continue; };
-        let Some(file) = files.first() else { continue; };
+        let Some(files) = version["files"].as_array() else {
+            continue;
+        };
+        let Some(file) = files.first() else {
+            continue;
+        };
         let download_url = file["url"].as_str().unwrap_or("");
         let default_name = format!("{}.jar", mod_id);
         let file_name = file["filename"].as_str().unwrap_or(&default_name);
-        if download_url.is_empty() { continue; }
+        if download_url.is_empty() {
+            continue;
+        }
 
         let dest = target_dir.join(file_name);
-        if download_bytes_to_file(&app, download_url, &dest, "Installing dependencies", file_name, (i + 1) as u32, total as u32).await.is_ok() {
+        if download_bytes_to_file(
+            &app,
+            download_url,
+            &dest,
+            "Installing dependencies",
+            file_name,
+            (i + 1) as u32,
+            total as u32,
+        )
+        .await
+        .is_ok()
+        {
             installed += 1;
         }
     }
 
-    emit_mod_progress(&app, "Done", &format!("Installed {} dependencies", installed), total as u32, total as u32);
+    emit_mod_progress(
+        &app,
+        "Done",
+        &format!("Installed {} dependencies", installed),
+        total as u32,
+        total as u32,
+    );
     Ok(installed)
 }
 
@@ -2920,9 +3770,15 @@ pub async fn auto_fix_dependencies(
 ) -> Result<u32, String> {
     eprintln!("[lbby] auto_fix_dependencies: scanning...");
     let issues = scan_missing_dependencies();
-    eprintln!("[lbby] auto_fix_dependencies: found {} issues", issues.len());
+    eprintln!(
+        "[lbby] auto_fix_dependencies: found {} issues",
+        issues.len()
+    );
     for issue in &issues {
-        eprintln!("  - {} ({}) for {}", issue.mod_id, issue.issue_type, issue.source_mod);
+        eprintln!(
+            "  - {} ({}) for {}",
+            issue.mod_id, issue.issue_type, issue.source_mod
+        );
     }
     if issues.is_empty() {
         return Ok(0);
@@ -2944,11 +3800,21 @@ pub async fn auto_fix_dependencies(
 
     for (i, issue) in issues.iter().enumerate() {
         let action = if issue.issue_type == "incompatible" {
-            format!("Fixing {} (have {})", issue.mod_id, issue.installed_version.as_deref().unwrap_or("?"))
+            format!(
+                "Fixing {} (have {})",
+                issue.mod_id,
+                issue.installed_version.as_deref().unwrap_or("?")
+            )
         } else {
             format!("Installing {}", issue.mod_id)
         };
-        emit_mod_progress(&app, "Fixing dependencies", &format!("{}/{}: {}", i + 1, total, action), (i + 1) as u32, total as u32);
+        emit_mod_progress(
+            &app,
+            "Fixing dependencies",
+            &format!("{}/{}: {}", i + 1, total, action),
+            (i + 1) as u32,
+            total as u32,
+        );
 
         // Search Modrinth for the mod
         let search_url = format!(
@@ -2956,11 +3822,21 @@ pub async fn auto_fix_dependencies(
             urlencoding::encode(&issue.mod_id)
         );
 
-        let resp = client.get(&search_url).timeout(std::time::Duration::from_secs(15)).send().await;
-        let Ok(resp) = resp else { continue; };
+        let resp = client
+            .get(&search_url)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await;
+        let Ok(resp) = resp else {
+            continue;
+        };
         let body = resp.text().await.unwrap_or_default();
-        let Ok(data) = serde_json::from_str::<serde_json::Value>(&body) else { continue; };
-        let Some(hits) = data["hits"].as_array() else { continue; };
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let Some(hits) = data["hits"].as_array() else {
+            continue;
+        };
 
         // Find matching mod
         let normalized_id = issue.mod_id.replace('_', "-").to_lowercase();
@@ -2971,9 +3847,13 @@ pub async fn auto_fix_dependencies(
             slug == mid || slug == normalized_id || title.contains(&mid) || mid.contains(&slug)
         });
 
-        let Some(hit) = matching else { continue; };
+        let Some(hit) = matching else {
+            continue;
+        };
         let project_id = hit["project_id"].as_str().unwrap_or("");
-        if project_id.is_empty() { continue; }
+        if project_id.is_empty() {
+            continue;
+        }
 
         // Get versions with compatible game version and loader
         let game_versions = format!("[\"{}\"]", mc_version);
@@ -2982,32 +3862,52 @@ pub async fn auto_fix_dependencies(
             "https://api.modrinth.com/v2/project/{}/version?game_versions={}&loaders={}",
             project_id, game_versions, loaders
         );
-        let versions_resp = client.get(&versions_url).timeout(std::time::Duration::from_secs(15)).send().await;
-        let Ok(versions_resp) = versions_resp else { continue; };
-        let versions_body = versions_resp.text().await.unwrap_or_default();
-        let Ok(versions) = serde_json::from_str::<serde_json::Value>(&versions_body) else { continue; };
-        let Some(version_list) = versions.as_array() else { continue; };
-
-        // For incompatible versions, try to find a version that matches the range
-        let compatible_version = if issue.issue_type == "incompatible" && !issue.version_range.is_empty() {
-            version_list.iter().find(|v| {
-                let ver_num = v["version_number"].as_str().unwrap_or("");
-                crate::helpers::version_matches_range(ver_num, &issue.version_range)
-            })
-        } else {
-            version_list.first()
+        let versions_resp = client
+            .get(&versions_url)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await;
+        let Ok(versions_resp) = versions_resp else {
+            continue;
         };
-
-        let Some(version) = compatible_version else {
-            eprintln!("[lbby] auto_fix: no compatible version found for {} (need {})", issue.mod_id, issue.version_range);
+        let versions_body = versions_resp.text().await.unwrap_or_default();
+        let Ok(versions) = serde_json::from_str::<serde_json::Value>(&versions_body) else {
+            continue;
+        };
+        let Some(version_list) = versions.as_array() else {
             continue;
         };
 
-        let Some(files) = version["files"].as_array() else { continue; };
-        let Some(file) = files.first() else { continue; };
+        // For incompatible versions, try to find a version that matches the range
+        let compatible_version =
+            if issue.issue_type == "incompatible" && !issue.version_range.is_empty() {
+                version_list.iter().find(|v| {
+                    let ver_num = v["version_number"].as_str().unwrap_or("");
+                    crate::helpers::version_matches_range(ver_num, &issue.version_range)
+                })
+            } else {
+                version_list.first()
+            };
+
+        let Some(version) = compatible_version else {
+            eprintln!(
+                "[lbby] auto_fix: no compatible version found for {} (need {})",
+                issue.mod_id, issue.version_range
+            );
+            continue;
+        };
+
+        let Some(files) = version["files"].as_array() else {
+            continue;
+        };
+        let Some(file) = files.first() else {
+            continue;
+        };
         let download_url = file["url"].as_str().unwrap_or("");
         let file_name = file["filename"].as_str().unwrap_or(&issue.mod_id);
-        if download_url.is_empty() { continue; }
+        if download_url.is_empty() {
+            continue;
+        }
 
         let dest = target_dir.join(file_name);
 
@@ -3018,25 +3918,46 @@ pub async fn auto_fix_dependencies(
             }
         }
 
-        if download_bytes_to_file(&app, download_url, &dest, "Fixing dependencies", file_name, (i + 1) as u32, total as u32).await.is_ok() {
+        if download_bytes_to_file(
+            &app,
+            download_url,
+            &dest,
+            "Fixing dependencies",
+            file_name,
+            (i + 1) as u32,
+            total as u32,
+        )
+        .await
+        .is_ok()
+        {
             fixed += 1;
-            eprintln!("[lbby] auto_fix: installed {} v{}", issue.mod_id, version["version_number"].as_str().unwrap_or("?"));
+            eprintln!(
+                "[lbby] auto_fix: installed {} v{}",
+                issue.mod_id,
+                version["version_number"].as_str().unwrap_or("?")
+            );
         }
     }
 
-    emit_mod_progress(&app, "Done", &format!("Fixed {} dependency issues", fixed), total as u32, total as u32);
+    emit_mod_progress(
+        &app,
+        "Done",
+        &format!("Fixed {} dependency issues", fixed),
+        total as u32,
+        total as u32,
+    );
     Ok(fixed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::apply_mrpack_overrides;
-    use crate::config::{ServerConfig, ServerType};
-    use std::io::{Cursor, Write};
     use super::{
         curseforge_cdn_parts, curseforge_fingerprint_reader, official_server_pack_id,
         parse_curseforge_source, validate_curseforge_file_for_profile, CurseFilesResponse,
     };
+    use crate::config::{ServerConfig, ServerType};
+    use std::io::{Cursor, Write};
 
     #[test]
     fn parses_file_id_from_curseforge_url() {
@@ -3098,8 +4019,8 @@ mod tests {
     fn fingerprint_ignores_curseforge_whitespace() {
         let with_whitespace = b"Curse Forge\n test\tdata";
         let compact = b"CurseForgetestdata";
-        let first = curseforge_fingerprint_reader(Cursor::new(with_whitespace), compact.len())
-            .unwrap();
+        let first =
+            curseforge_fingerprint_reader(Cursor::new(with_whitespace), compact.len()).unwrap();
         let second = curseforge_fingerprint_reader(Cursor::new(compact), compact.len()).unwrap();
         assert_eq!(first, second);
         assert_eq!(first, 2_704_042_519);
@@ -3121,14 +4042,15 @@ mod tests {
         );
     }
 
-
     #[test]
     fn mrpack_applies_server_overrides_and_ignores_client_overrides() {
         let mut bytes = Cursor::new(Vec::new());
         {
             let mut writer = zip::ZipWriter::new(&mut bytes);
             let options = zip::write::SimpleFileOptions::default();
-            writer.start_file("overrides/config/common.txt", options).unwrap();
+            writer
+                .start_file("overrides/config/common.txt", options)
+                .unwrap();
             writer.write_all(b"common").unwrap();
             writer
                 .start_file("server-overrides/config/side.txt", options)
@@ -3149,8 +4071,14 @@ mod tests {
 
         apply_mrpack_overrides(&mut archive, &dest).unwrap();
 
-        assert_eq!(std::fs::read(dest.join("config/common.txt")).unwrap(), b"common");
-        assert_eq!(std::fs::read(dest.join("config/side.txt")).unwrap(), b"server");
+        assert_eq!(
+            std::fs::read(dest.join("config/common.txt")).unwrap(),
+            b"common"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("config/side.txt")).unwrap(),
+            b"server"
+        );
         assert!(!dest.join("config/client.txt").exists());
         std::fs::remove_dir_all(dest).unwrap();
     }

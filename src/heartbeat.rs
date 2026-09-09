@@ -185,7 +185,9 @@ async fn send_heartbeat(
     if !cfg.app_token.is_empty() {
         req = req.header("Authorization", format!("Bearer {}", cfg.app_token));
     }
-    let resp = req.send().await
+    let resp = req
+        .send()
+        .await
         .map_err(|e| format!("Request failed: {}", e))?;
 
     if !resp.status().is_success() {
@@ -324,7 +326,10 @@ mod tests {
     fn active_detection() {
         assert!(!any_server_active(&[]));
         assert!(!any_server_active(&[snapshot("stopped")]));
-        assert!(any_server_active(&[snapshot("stopped"), snapshot("running")]));
+        assert!(any_server_active(&[
+            snapshot("stopped"),
+            snapshot("running")
+        ]));
         assert!(any_server_active(&[snapshot("starting")]));
         assert!(!any_server_active(&[snapshot("stopping")]));
     }
