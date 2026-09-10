@@ -189,6 +189,10 @@ pub enum ValidationOutcome {
     Validated(ValidationSuccess),
     /// Server failed validation after exhausting all allowed repairs.
     Failed(ValidationFailure),
+    /// High-confidence crash attribution found; user action requested.
+    /// The transaction should be paused (not rolled back) until the user
+    /// approves or rejects the recommended recovery action.
+    UserActionRequired(UserActionRequest),
 }
 
 /// Success details.
@@ -215,6 +219,29 @@ pub struct ValidationFailure {
     pub loader_report: Option<crate::loader_compat_advisor::LoaderCompatibilityReport>,
     /// Crash attribution report, if attribution was attempted.
     pub crash_report: Option<crate::crash_attribution::CrashAttributionReport>,
+}
+
+/// User action request — produced when High-confidence crash attribution
+/// identifies a unique culprit and a reversible recovery action is available.
+///
+/// The caller must pause the transaction (not roll back) and present this
+/// to the user. If the user approves, call `execute_approved_recovery`.
+#[derive(Debug)]
+pub struct UserActionRequest {
+    /// The crash attribution report that triggered this request.
+    pub crash_report: crate::crash_attribution::CrashAttributionReport,
+    /// The recovery action availability (should be Available).
+    pub availability: crate::recovery_actions::RecoveryActionAvailability,
+    /// Deterministic fingerprint for approval validation.
+    pub fingerprint: String,
+    /// Transaction metadata for pause/resume.
+    pub transaction_id: String,
+    /// The staging mods directory.
+    pub staging_mods: PathBuf,
+    /// Current boot attempt number.
+    pub boot_attempt: u8,
+    /// Full audit trail up to this point.
+    pub history: ValidationHistory,
 }
 
 /// Structured failure reason — never reduced to plain strings internally.
@@ -565,6 +592,53 @@ impl ValidationRepairOrchestrator {
                                 "[CF][crash] Attribution: {:?} ({:?}) — {}",
                                 crash_report.status, crash_report.confidence, crash_report.summary
                             );
+
+                            // Check if user-approved recovery is available
+                            let staging_mods = ctx.staging_path.join("mods");
+                            let jar_to_mod_ids =
+                                crate::recovery_actions::build_jar_to_mod_ids(&staging_mods);
+                            let availability = crate::recovery_actions::check_action_availability(
+                                &crash_report,
+                                &jar_to_mod_ids,
+                            );
+
+                            if matches!(
+                                availability,
+                                crate::recovery_actions::RecoveryActionAvailability::Available
+                            ) {
+                                // Compute fingerprint for approval validation
+                                let fingerprint =
+                                    if let Some(primary) = &crash_report.primary_candidate {
+                                        let evidence_ids: Vec<String> = primary
+                                            .evidence
+                                            .iter()
+                                            .map(|e| format!("{:?}", e.source))
+                                            .collect();
+                                        crate::recovery_actions::compute_fingerprint(
+                                            "", // transaction_id not available here
+                                            primary.mod_id.as_deref().unwrap_or("unknown"),
+                                            primary.jar_path.as_deref().unwrap_or(Path::new("")),
+                                            attempt,
+                                            &evidence_ids,
+                                        )
+                                    } else {
+                                        String::new()
+                                    };
+
+                                eprintln!(
+                                    "[CF][recovery] User action available — pausing for approval"
+                                );
+
+                                return ValidationOutcome::UserActionRequired(UserActionRequest {
+                                    crash_report,
+                                    availability,
+                                    fingerprint,
+                                    transaction_id: String::new(),
+                                    staging_mods,
+                                    boot_attempt: attempt,
+                                    history: std::mem::take(&mut self.history),
+                                });
+                            }
 
                             return ValidationOutcome::Failed(ValidationFailure {
                                 final_boot_result: boot_result,
@@ -1368,6 +1442,7 @@ mod tests {
         match outcome {
             ValidationOutcome::Validated(s) => &s.history,
             ValidationOutcome::Failed(f) => &f.history,
+            ValidationOutcome::UserActionRequired(r) => &r.history,
         }
     }
 

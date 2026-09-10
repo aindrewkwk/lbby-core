@@ -2027,6 +2027,18 @@ pub async fn install_curseforge_modpack(
                 txn.rollback()?;
                 return Err(err);
             }
+            crate::validation_orchestrator::ValidationOutcome::UserActionRequired(req) => {
+                // Phase 3K: orchestrator found a High-confidence recovery action.
+                // TODO: pause transaction and present to user instead of rolling back.
+                // For now, log diagnostics and fail with attribution info.
+                let err = format!(
+                    "Boot validation requires user action: recovery available for '{}' (confidence: {:?})",
+                    req.crash_report.summary, req.crash_report.confidence
+                );
+                eprintln!("[CF][recovery] {}", err);
+                txn.rollback()?;
+                return Err(err);
+            }
         }
     }
     let manifest = manifest_result.unwrap();
@@ -2856,6 +2868,17 @@ pub async fn install_curseforge_modpack(
                 &txn.meta().transaction_id,
                 &failure.final_boot_result,
             );
+            txn.rollback()?;
+            return Err(err);
+        }
+        crate::validation_orchestrator::ValidationOutcome::UserActionRequired(req) => {
+            // Phase 3K: orchestrator found a High-confidence recovery action.
+            // TODO: pause transaction and present to user instead of rolling back.
+            let err = format!(
+                "Boot validation requires user action: recovery available for '{}' (confidence: {:?})",
+                req.crash_report.summary, req.crash_report.confidence
+            );
+            eprintln!("[CF][recovery] {}", err);
             txn.rollback()?;
             return Err(err);
         }

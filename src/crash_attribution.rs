@@ -8,6 +8,7 @@
 
 use crate::jar_metadata::read_jar_mod_metadata;
 use crate::mod_compat::{classify_mod_local, ModCompatibility, ServerCompatibility};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -19,7 +20,7 @@ const MAX_SNIPPET_LEN: usize = 200;
 
 // ── Public types ──────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CrashAttributionStatus {
     /// A mod was identified with sufficient confidence.
     Attributed,
@@ -29,14 +30,14 @@ pub enum CrashAttributionStatus {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CrashAttributionConfidence {
     High,
     Medium,
     Low,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CrashEvidenceSource {
     /// Loader explicitly names a mod_id as failing.
     LoaderDiagnostic,
@@ -54,7 +55,7 @@ pub enum CrashEvidenceSource {
     DependencyContext,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrashEvidence {
     pub source: CrashEvidenceSource,
     pub matched_text: String,
@@ -63,7 +64,7 @@ pub struct CrashEvidence {
     pub associated_jar: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrashCandidate {
     pub mod_id: Option<String>,
     pub jar_path: Option<PathBuf>,
@@ -75,7 +76,7 @@ pub struct CrashCandidate {
     pub is_unknown_compat: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CrashRecommendation {
     /// Review a specific mod manually.
     ReviewMod {
@@ -95,7 +96,7 @@ pub enum CrashRecommendation {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrashAttributionReport {
     pub status: CrashAttributionStatus,
     pub confidence: CrashAttributionConfidence,
@@ -117,7 +118,7 @@ pub struct CrashAttributionContext<'a> {
     pub installed_registry: Option<&'a crate::boot_failure_analyzer::InstalledFileRegistry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoaderFamily {
     Forge,
     NeoForge,

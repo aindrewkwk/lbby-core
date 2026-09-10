@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TransactionPhase {
     Building,
+    PendingUserAction,
     Committing,
     Committed,
 }
@@ -303,7 +304,9 @@ impl InstallTransaction {
                 if let Ok(content) = std::fs::read_to_string(&marker) {
                     if let Ok(meta) = serde_json::from_str::<TransactionMeta>(&content) {
                         match meta.phase {
-                            TransactionPhase::Building | TransactionPhase::Committing => {
+                            TransactionPhase::Building
+                            | TransactionPhase::Committing
+                            | TransactionPhase::PendingUserAction => {
                                 stale.push(meta);
                             }
                             TransactionPhase::Committed => {
@@ -351,11 +354,52 @@ impl InstallTransaction {
             let _ = std::fs::remove_file(&live_marker);
         }
     }
+
+    /// Pause the transaction for user action. Saves metadata to disk and
+    /// consumes the transaction handle without rolling back.
+    ///
+    /// The staging directory remains valid. The caller holds the `TransactionMeta`
+    /// and can later resume with `InstallTransaction::resume(meta)`.
+    ///
+    /// If the app crashes while paused, `find_stale()` will detect the
+    /// `PendingUserAction` phase marker on next startup.
+    pub fn pause(mut self) -> TransactionMeta {
+        self.meta.phase = TransactionPhase::PendingUserAction;
+        let _ = self.meta.save(); // best-effort; marker already exists
+        let meta = self.meta.clone();
+        eprintln!(
+            "[CF] Transaction {} paused for user action",
+            meta.transaction_id
+        );
+        // Prevent Drop from rolling back — we consumed the phase
+        std::mem::forget(self);
+        meta
+    }
+
+    /// Resume a paused transaction from its saved metadata.
+    ///
+    /// Returns `Err` if the staging directory or marker no longer exists.
+    pub fn resume(meta: TransactionMeta) -> Result<Self, String> {
+        if meta.phase != TransactionPhase::PendingUserAction {
+            return Err(format!(
+                "Cannot resume transaction in {:?} phase",
+                meta.phase
+            ));
+        }
+        if !meta.staging_path.exists() {
+            return Err("Staging directory no longer exists".to_string());
+        }
+        if !meta.marker_path().exists() {
+            return Err("Transaction marker no longer exists".to_string());
+        }
+        eprintln!(
+            "[CF] Resumed transaction {} from PendingUserAction",
+            meta.transaction_id
+        );
+        Ok(Self { meta })
+    }
 }
 
-/// Auto-rollback on drop if the transaction was never committed.
-/// This handles the case where an error propagates via `?` and the
-/// transaction is dropped without explicit rollback.
 impl Drop for InstallTransaction {
     fn drop(&mut self) {
         if self.meta.phase == TransactionPhase::Building {

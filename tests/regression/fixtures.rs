@@ -223,5 +223,6 @@ pub fn outcome_history(
     match outcome {
         ValidationOutcome::Validated(s) => &s.history,
         ValidationOutcome::Failed(f) => &f.history,
+        ValidationOutcome::UserActionRequired(r) => &r.history,
     }
 }
