@@ -11,8 +11,7 @@
 //   - Does NOT delete mods, quarantine, change MC/loader versions.
 //   - Ephemeral config override first, persist only after successful validation.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::config::ServerConfig;
 
@@ -134,86 +133,17 @@ pub enum RuntimeRepairStatus {
 }
 
 // ── Validation retry state ──────────────────────────────────────────────
+//
+// Phase 3G: ValidationRetryState is now owned by validation_orchestrator.rs.
+// Re-exported here for backward compatibility with existing callers.
 
-/// Tracks retry state across all repair systems to prevent loops.
-/// Independent loops (dependency, runtime) share this state so they
-/// never lose context of what was already attempted.
-#[derive(Debug)]
-pub struct ValidationRetryState {
-    /// Total actual Java server launches.
-    pub total_boot_attempts: u8,
-    /// Number of dependency repair rounds executed.
-    pub dependency_repairs: u8,
-    /// Number of runtime repair rounds executed.
-    pub runtime_repairs: u8,
-    /// Missing mods already attempted by 3F-B.
-    pub attempted_missing_mods: HashSet<String>,
-    /// Java executable paths already attempted by 3F-C.
-    pub attempted_java_paths: HashSet<PathBuf>,
-    /// Memory values already attempted by 3F-C.
-    pub attempted_memory_values: HashSet<u32>,
-    /// Java major versions already attempted.
-    pub attempted_java_majors: HashSet<u8>,
-}
-
-impl ValidationRetryState {
-    pub fn new() -> Self {
-        Self {
-            total_boot_attempts: 0,
-            dependency_repairs: 0,
-            runtime_repairs: 0,
-            attempted_missing_mods: HashSet::new(),
-            attempted_java_paths: HashSet::new(),
-            attempted_memory_values: HashSet::new(),
-            attempted_java_majors: HashSet::new(),
-        }
-    }
-
-    /// Check if we can attempt another boot.
-    pub fn can_attempt_boot(&self) -> bool {
-        self.total_boot_attempts < MAX_TOTAL_BOOT_ATTEMPTS
-    }
-
-    /// Check if we can attempt another runtime remediation round.
-    pub fn can_attempt_runtime_repair(&self) -> bool {
-        self.runtime_repairs < MAX_RUNTIME_REMEDIATION_ROUNDS
-    }
-
-    /// Record a boot attempt.
-    pub fn record_boot_attempt(&mut self) {
-        self.total_boot_attempts += 1;
-    }
-
-    /// Record a runtime repair attempt.
-    pub fn record_runtime_repair(&mut self) {
-        self.runtime_repairs += 1;
-    }
-
-    /// Check if a Java path was already attempted.
-    pub fn has_attempted_java_path(&self, path: &Path) -> bool {
-        self.attempted_java_paths.contains(path)
-    }
-
-    /// Check if a Java major was already attempted.
-    pub fn has_attempted_java_major(&self, major: u8) -> bool {
-        self.attempted_java_majors.contains(&major)
-    }
-
-    /// Record a Java path attempt.
-    pub fn record_java_attempt(&mut self, path: PathBuf, major: u8) {
-        self.attempted_java_paths.insert(path);
-        self.attempted_java_majors.insert(major);
-    }
-}
+pub use crate::validation_orchestrator::ValidationRetryState;
 
 // ── Analyzer (side-effect free) ─────────────────────────────────────────
 
 /// Analyze a boot failure and identify the runtime issue.
 /// This is deterministic and side-effect free — no mutations.
-pub fn analyze_runtime_issue(
-    log_tail: &str,
-    cfg: &ServerConfig,
-) -> RuntimeIssue {
+pub fn analyze_runtime_issue(log_tail: &str, cfg: &ServerConfig) -> RuntimeIssue {
     // Priority order: Java executable failure → Wrong Java → OOM → Loader mismatch → Unknown
     // (per spec §18)
 
@@ -294,11 +224,9 @@ pub async fn remediate(
                 loader_issue.loader_type, loader_issue.required, loader_issue.current
             ))
         }
-        RuntimeIssue::Unsupported => {
-            RuntimeRemediationResult::NotRepairable(
-                "Could not determine specific runtime issue.".to_string()
-            )
-        }
+        RuntimeIssue::Unsupported => RuntimeRemediationResult::NotRepairable(
+            "Could not determine specific runtime issue.".to_string(),
+        ),
     }
 }
 
@@ -333,7 +261,9 @@ async fn remediate_java_version(
                 Some(other) => {
                     return RuntimeRemediationResult::Failed(format!(
                         "Candidate {} reports Java {} but {} is required",
-                        path.display(), other, required_major
+                        path.display(),
+                        other,
+                        required_major
                     ));
                 }
                 None => {
@@ -403,34 +333,32 @@ async fn remediate_java_unavailable(
 
     let candidate = crate::java::find_java_with_version(required_major);
     let java_bin = match candidate {
-        Some(path) => {
-            match crate::java::detect_java_major(&path) {
-                Some(major) if major == required_major => path,
-                Some(other) => {
-                    return RuntimeRemediationResult::Failed(format!(
-                        "Candidate {} reports Java {} but {} is required",
-                        path.display(), other, required_major
-                    ));
-                }
-                None => {
-                    return RuntimeRemediationResult::Failed(format!(
-                        "Candidate {} failed java -version check",
-                        path.display()
-                    ));
-                }
+        Some(path) => match crate::java::detect_java_major(&path) {
+            Some(major) if major == required_major => path,
+            Some(other) => {
+                return RuntimeRemediationResult::Failed(format!(
+                    "Candidate {} reports Java {} but {} is required",
+                    path.display(),
+                    other,
+                    required_major
+                ));
             }
-        }
-        None => {
-            match crate::java::ensure_java(required_major, app).await {
-                Ok(path) => path,
-                Err(e) => {
-                    return RuntimeRemediationResult::NotRepairable(format!(
-                        "Java {} not available: {}",
-                        required_major, e
-                    ));
-                }
+            None => {
+                return RuntimeRemediationResult::Failed(format!(
+                    "Candidate {} failed java -version check",
+                    path.display()
+                ));
             }
-        }
+        },
+        None => match crate::java::ensure_java(required_major, app).await {
+            Ok(path) => path,
+            Err(e) => {
+                return RuntimeRemediationResult::NotRepairable(format!(
+                    "Java {} not available: {}",
+                    required_major, e
+                ));
+            }
+        },
     };
 
     if retry_state.has_attempted_java_path(&java_bin) {
@@ -483,8 +411,7 @@ fn remediate_memory(
     // Without an authoritative memory floor, we report diagnostic-only.
     // The HEAVY_MODPACK_SAFE_FLOOR_MB is a heuristic, not authoritative.
     if current < HEAVY_MODPACK_SAFE_FLOOR_MB {
-        let new_value = (current + MAX_MEMORY_INCREASE_STEP_MB)
-            .min(HEAVY_MODPACK_SAFE_FLOOR_MB);
+        let new_value = (current + MAX_MEMORY_INCREASE_STEP_MB).min(HEAVY_MODPACK_SAFE_FLOOR_MB);
 
         if new_value > current && (new_value - current) <= MAX_MEMORY_INCREASE_STEP_MB {
             let old_value = cfg.ram_mb;
@@ -521,10 +448,7 @@ fn extract_class_file_major_version(log: &str) -> Option<u8> {
     // Try "class file version NN.0"
     if let Some(pos) = lower.find("class file version ") {
         let after = &log[pos + "class file version ".len()..];
-        let version_str: String = after
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
+        let version_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
         if let Ok(class_version) = version_str.parse::<u8>() {
             return Some(class_file_to_java_major(class_version));
         }
@@ -536,10 +460,7 @@ fn extract_class_file_major_version(log: &str) -> Option<u8> {
         let nearby = &log[pos..];
         if let Some(pos2) = nearby.find("class file version ") {
             let after = &nearby[pos2 + "class file version ".len()..];
-            let version_str: String = after
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
+            let version_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
             if let Ok(class_version) = version_str.parse::<u8>() {
                 return Some(class_file_to_java_major(class_version));
             }
@@ -610,7 +531,7 @@ fn classify_oom_type(log: &str) -> String {
 }
 
 /// Detect loader version mismatch from log (detection only).
-fn detect_loader_version_mismatch(log: &str, cfg: &ServerConfig) -> Option<LoaderVersionIssue> {
+pub fn detect_loader_version_mismatch(log: &str, cfg: &ServerConfig) -> Option<LoaderVersionIssue> {
     let lower = log.to_lowercase();
 
     // Pattern: "requires forge XX.X.XX or newer" / "requires forge >= XX.X.XX"
@@ -632,7 +553,11 @@ fn detect_loader_version_mismatch(log: &str, cfg: &ServerConfig) -> Option<Loade
 }
 
 /// Parse Forge version requirement from log.
-fn parse_forge_requirement(lower: &str, log: &str, cfg: &ServerConfig) -> Option<LoaderVersionIssue> {
+fn parse_forge_requirement(
+    lower: &str,
+    log: &str,
+    cfg: &ServerConfig,
+) -> Option<LoaderVersionIssue> {
     // Look for patterns like "requires forge 47.2.0 or newer" or "requires forge >= 47.2.0"
     if !lower.contains("forge") {
         return None;
@@ -668,7 +593,11 @@ fn parse_forge_requirement(lower: &str, log: &str, cfg: &ServerConfig) -> Option
 }
 
 /// Parse NeoForge version requirement from log.
-fn parse_neoforge_requirement(lower: &str, log: &str, cfg: &ServerConfig) -> Option<LoaderVersionIssue> {
+fn parse_neoforge_requirement(
+    lower: &str,
+    log: &str,
+    cfg: &ServerConfig,
+) -> Option<LoaderVersionIssue> {
     if !lower.contains("neoforge") {
         return None;
     }
@@ -714,7 +643,8 @@ impl std::fmt::Display for RuntimeIssue {
                     f,
                     "Wrong Java version: required {}, current {}",
                     issue.required_major,
-                    issue.current_major
+                    issue
+                        .current_major
                         .map(|m| m.to_string())
                         .unwrap_or_else(|| "unknown".to_string())
                 )
@@ -727,7 +657,11 @@ impl std::fmt::Display for RuntimeIssue {
                 )
             }
             Self::OutOfMemory(issue) => {
-                write!(f, "OutOfMemory ({}) with {}MB", issue.oom_type, issue.current_mb)
+                write!(
+                    f,
+                    "OutOfMemory ({}) with {}MB",
+                    issue.oom_type, issue.current_mb
+                )
             }
             Self::LoaderVersionMismatch(issue) => {
                 write!(
@@ -875,8 +809,8 @@ mod tests {
         assert!(state.can_attempt_boot());
         assert!(state.can_attempt_runtime_repair());
 
-        state.record_boot_attempt();
-        state.record_boot_attempt();
+        let _ = state.consume_boot_attempt();
+        let _ = state.consume_boot_attempt();
         assert!(state.can_attempt_boot()); // 2 < 6
         assert!(state.can_attempt_runtime_repair());
 
@@ -902,7 +836,7 @@ mod tests {
         let mut state = ValidationRetryState::new();
         for _ in 0..6 {
             assert!(state.can_attempt_boot());
-            state.record_boot_attempt();
+            let _ = state.consume_boot_attempt();
         }
         assert!(!state.can_attempt_boot());
     }

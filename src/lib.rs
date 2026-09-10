@@ -23,7 +23,6 @@ pub mod license;
 pub mod minecraft_properties;
 pub mod mod_compat;
 pub mod mod_services;
-pub mod runtime_remediator;
 pub mod mod_side;
 pub mod modpack_discovery;
 pub mod node_api;
@@ -32,12 +31,14 @@ pub mod player_actions;
 pub mod player_stats;
 pub mod playit;
 pub mod remote;
+pub mod runtime_remediator;
 pub mod server;
 pub mod server_launch;
 pub mod stats;
 pub mod steamcmd;
 pub mod terraria_config;
 pub mod tmod_services;
+pub mod validation_orchestrator;
 pub mod version_fetch;
 
 // Re-export commonly used types for convenience
