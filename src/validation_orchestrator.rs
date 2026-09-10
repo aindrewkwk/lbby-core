@@ -213,6 +213,8 @@ pub struct ValidationFailure {
     pub history: ValidationHistory,
     /// Loader compatibility report, if a loader mismatch was detected.
     pub loader_report: Option<crate::loader_compat_advisor::LoaderCompatibilityReport>,
+    /// Crash attribution report, if attribution was attempted.
+    pub crash_report: Option<crate::crash_attribution::CrashAttributionReport>,
 }
 
 /// Structured failure reason — never reduced to plain strings internally.
@@ -421,6 +423,7 @@ impl ValidationRepairOrchestrator {
                         reason: ValidationFailureReason::RetryLimitReached,
                         history: std::mem::take(&mut self.history),
                         loader_report: None,
+                        crash_report: None,
                     });
                 }
             }
@@ -449,6 +452,7 @@ impl ValidationRepairOrchestrator {
                             reason: ValidationFailureReason::ValidationCleanupFailed(e),
                             history: std::mem::take(&mut self.history),
                             loader_report: None,
+                            crash_report: None,
                         });
                     }
 
@@ -483,6 +487,7 @@ impl ValidationRepairOrchestrator {
                         reason: ValidationFailureReason::NonRepairableFailure,
                         history: std::mem::take(&mut self.history),
                         loader_report: None,
+                        crash_report: None,
                     });
                 }
                 BootResult::Failed(ref f) => {
@@ -530,14 +535,43 @@ impl ValidationRepairOrchestrator {
                                     reason: ValidationFailureReason::LoaderMismatchDetected,
                                     history: std::mem::take(&mut self.history),
                                     loader_report: Some(report),
+                                    crash_report: None,
                                 });
                             }
+
+                            // Run crash attribution for non-repairable failures
+                            let staging_mods = ctx.staging_path.join("mods");
+                            let loader_family = match ctx.cfg.server_type {
+                                crate::config::ServerType::Forge => {
+                                    crate::crash_attribution::LoaderFamily::Forge
+                                }
+                                crate::config::ServerType::NeoForge => {
+                                    crate::crash_attribution::LoaderFamily::NeoForge
+                                }
+                                crate::config::ServerType::Fabric => {
+                                    crate::crash_attribution::LoaderFamily::Fabric
+                                }
+                                _ => crate::crash_attribution::LoaderFamily::Vanilla,
+                            };
+                            let crash_ctx = crate::crash_attribution::CrashAttributionContext {
+                                staging_mods: &staging_mods,
+                                loader_family,
+                                recently_repaired: &[],
+                                installed_registry: None,
+                            };
+                            let crash_report =
+                                crate::crash_attribution::analyze_crash(&f.log_tail, &crash_ctx);
+                            eprintln!(
+                                "[CF][crash] Attribution: {:?} ({:?}) — {}",
+                                crash_report.status, crash_report.confidence, crash_report.summary
+                            );
 
                             return ValidationOutcome::Failed(ValidationFailure {
                                 final_boot_result: boot_result,
                                 reason: ValidationFailureReason::NonRepairableFailure,
                                 history: std::mem::take(&mut self.history),
                                 loader_report: None,
+                                crash_report: Some(crash_report),
                             });
                         }
                         RepairAction::BootDependency(dep_decision) => {
@@ -561,6 +595,7 @@ impl ValidationRepairOrchestrator {
                                         reason: ValidationFailureReason::NonRepairableFailure,
                                         history: std::mem::take(&mut self.history),
                                         loader_report: None,
+                                        crash_report: None,
                                     });
                                 }
                             }
@@ -585,6 +620,7 @@ impl ValidationRepairOrchestrator {
                                         reason: ValidationFailureReason::RuntimeRepairFailed,
                                         history: std::mem::take(&mut self.history),
                                         loader_report: None,
+                                        crash_report: None,
                                     });
                                 }
                             }

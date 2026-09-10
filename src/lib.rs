@@ -8,6 +8,7 @@ pub mod boot_failure_analyzer;
 pub mod boot_validator;
 pub mod cloudflare;
 pub mod config;
+pub mod crash_attribution;
 pub mod debug_report;
 pub mod dependency_graph;
 pub mod dependency_resolver;
