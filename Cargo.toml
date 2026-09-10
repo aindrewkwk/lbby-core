@@ -7,6 +7,7 @@ description = "Shared core library for Lbby agent and app — server management,
 [features]
 default = ["sqlite"]
 sqlite = ["rusqlite"]
+testing = []
 
 [dependencies]
 urlencoding = "2.1"

@@ -21,6 +21,61 @@ fn smoke_server_jar() -> &'static str {
     "/tmp/smoke-test/server.jar"
 }
 
+/// Returns Ok(()) if the test's prerequisites are met, or Err with a skip message.
+fn require_server_jar() -> Result<(), String> {
+    let path = smoke_server_jar();
+    if !Path::new(path).exists() {
+        return Err(format!("SKIPPED: {} not found", path));
+    }
+    Ok(())
+}
+
+/// Check that the Java version is compatible with MC 1.21.4 (needs Java 17–25).
+/// Java 26+ causes the server to exit before reaching "Done".
+fn require_compatible_java() -> Result<(), String> {
+    let output = std::process::Command::new("java")
+        .args(["-version"])
+        .output()
+        .map_err(|e| format!("SKIPPED: cannot run java: {}", e))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Parse "version \"21.0.x\"" or "version \"17.x\"" etc.
+    if let Some(start) = stderr.find("version \"") {
+        let rest = &stderr[start + 9..];
+        if let Some(end) = rest.find('"') {
+            let version_str = &rest[..end];
+            let major: u32 = version_str
+                .split('.')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if major > 25 {
+                return Err(format!(
+                    "SKIPPED: Java {} too new for MC 1.21.4 (needs 17–25)",
+                    major
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns Ok(()) if CF_API_KEY is set, or Err with skip message.
+fn require_cf_api_key() -> Result<(), String> {
+    if std::env::var("CF_API_KEY").is_err() {
+        return Err("SKIPPED: CF_API_KEY not set".to_string());
+    }
+    Ok(())
+}
+
+/// Returns Ok(()) if the CurseForge smoke pack ZIP exists, or Err with skip message.
+fn require_cf_smoke_pack() -> Result<(), String> {
+    let path = PathBuf::from("/tmp/lbby-smoke-pack/smoke-test-pack.zip");
+    if !path.exists() {
+        return Err(format!("SKIPPED: {} not found", path.display()));
+    }
+    Ok(())
+}
+
 fn make_test_config(server_path: &str) -> ServerConfig {
     ServerConfig {
         server_path: server_path.to_string(),
@@ -96,6 +151,14 @@ fn restore_profiles(original: &[u8]) {
 #[tokio::test]
 #[ignore]
 async fn smoke_a_vanilla_production_parity() {
+    if let Err(msg) = require_server_jar() {
+        eprintln!("{}", msg);
+        return;
+    }
+    if let Err(msg) = require_compatible_java() {
+        eprintln!("{}", msg);
+        return;
+    }
     let staging = PathBuf::from("/tmp/smoke-a-staging");
     let live = PathBuf::from("/tmp/smoke-a-live");
     cleanup_dir(&staging);
@@ -233,6 +296,14 @@ async fn smoke_a_vanilla_production_parity() {
 #[tokio::test]
 #[ignore]
 async fn smoke_b_curseforge_forge_manifest_fallback() {
+    if let Err(msg) = require_cf_api_key() {
+        eprintln!("{}", msg);
+        return;
+    }
+    if let Err(msg) = require_cf_smoke_pack() {
+        eprintln!("{}", msg);
+        return;
+    }
     let live = PathBuf::from("/tmp/smoke-b-live");
     cleanup_dir(&live);
 

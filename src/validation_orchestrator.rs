@@ -348,7 +348,7 @@ pub struct ValidationRepairOrchestrator {
     state: ValidationRetryState,
     history: ValidationHistory,
     config_changed: bool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     test_repair_overrides: Option<std::collections::VecDeque<ActionResult>>,
 }
 
@@ -358,13 +358,13 @@ impl ValidationRepairOrchestrator {
             state: ValidationRetryState::new(),
             history: ValidationHistory::default(),
             config_changed: false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             test_repair_overrides: None,
         }
     }
 
     /// Test-only constructor that injects deterministic repair results.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn new_with_repair_overrides(overrides: Vec<ActionResult>) -> Self {
         Self {
             state: ValidationRetryState::new(),
@@ -611,7 +611,7 @@ impl ValidationRepairOrchestrator {
         }
 
         // Test override: return pre-configured result without network calls
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         if let Some(ref mut overrides) = self.test_repair_overrides {
             if let Some(result) = overrides.pop_front() {
                 self.state.record_dep_repair();
@@ -707,7 +707,7 @@ impl ValidationRepairOrchestrator {
         }
 
         // Test override: return pre-configured result without network calls
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         if let Some(ref mut overrides) = self.test_repair_overrides {
             if let Some(result) = overrides.pop_front() {
                 self.state.record_runtime_repair();
