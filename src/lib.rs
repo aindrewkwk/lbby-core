@@ -20,6 +20,7 @@ pub mod install_transaction;
 pub mod jar_metadata;
 pub mod java;
 pub mod license;
+pub mod loader_compat_advisor;
 pub mod minecraft_properties;
 pub mod mod_compat;
 pub mod mod_services;

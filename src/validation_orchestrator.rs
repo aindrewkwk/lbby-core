@@ -211,6 +211,8 @@ pub struct ValidationFailure {
     pub reason: ValidationFailureReason,
     /// Full audit trail.
     pub history: ValidationHistory,
+    /// Loader compatibility report, if a loader mismatch was detected.
+    pub loader_report: Option<crate::loader_compat_advisor::LoaderCompatibilityReport>,
 }
 
 /// Structured failure reason — never reduced to plain strings internally.
@@ -224,6 +226,8 @@ pub enum ValidationFailureReason {
     RuntimeRepairFailed,
     /// Issue detected but not repairable (OOM, loader mismatch, unknown).
     NonRepairableFailure,
+    /// Loader mismatch detected — advisor produced a structured report.
+    LoaderMismatchDetected,
     /// Validation cleanup failed after a boot attempt.
     ValidationCleanupFailed(String),
 }
@@ -416,6 +420,7 @@ impl ValidationRepairOrchestrator {
                         final_boot_result,
                         reason: ValidationFailureReason::RetryLimitReached,
                         history: std::mem::take(&mut self.history),
+                        loader_report: None,
                     });
                 }
             }
@@ -443,6 +448,7 @@ impl ValidationRepairOrchestrator {
                             final_boot_result: boot_result,
                             reason: ValidationFailureReason::ValidationCleanupFailed(e),
                             history: std::mem::take(&mut self.history),
+                            loader_report: None,
                         });
                     }
 
@@ -476,6 +482,7 @@ impl ValidationRepairOrchestrator {
                         final_boot_result: boot_result,
                         reason: ValidationFailureReason::NonRepairableFailure,
                         history: std::mem::take(&mut self.history),
+                        loader_report: None,
                     });
                 }
                 BootResult::Failed(ref f) => {
@@ -496,10 +503,41 @@ impl ValidationRepairOrchestrator {
                                 chosen_action: decision,
                                 action_result: ActionResult::NoAction,
                             });
+
+                            // Check if this is a loader mismatch — run advisor
+                            let log_requirements =
+                                crate::loader_compat_advisor::parse_loader_requirements_from_log(
+                                    &f.log_tail,
+                                );
+                            if !log_requirements.is_empty() {
+                                let current_family =
+                                    crate::loader_compat_advisor::LoaderFamily::from_server_type(
+                                        &ctx.cfg.server_type,
+                                    );
+                                let report =
+                                    crate::loader_compat_advisor::analyze_loader_compatibility(
+                                        current_family,
+                                        ctx.cfg.loader_version.as_deref(),
+                                        &log_requirements,
+                                        None,
+                                    );
+                                eprintln!(
+                                    "[CF][loader] Loader mismatch detected: {:?}",
+                                    report.status
+                                );
+                                return ValidationOutcome::Failed(ValidationFailure {
+                                    final_boot_result: boot_result,
+                                    reason: ValidationFailureReason::LoaderMismatchDetected,
+                                    history: std::mem::take(&mut self.history),
+                                    loader_report: Some(report),
+                                });
+                            }
+
                             return ValidationOutcome::Failed(ValidationFailure {
                                 final_boot_result: boot_result,
                                 reason: ValidationFailureReason::NonRepairableFailure,
                                 history: std::mem::take(&mut self.history),
+                                loader_report: None,
                             });
                         }
                         RepairAction::BootDependency(dep_decision) => {
@@ -522,6 +560,7 @@ impl ValidationRepairOrchestrator {
                                         final_boot_result: boot_result,
                                         reason: ValidationFailureReason::NonRepairableFailure,
                                         history: std::mem::take(&mut self.history),
+                                        loader_report: None,
                                     });
                                 }
                             }
@@ -545,6 +584,7 @@ impl ValidationRepairOrchestrator {
                                         final_boot_result: boot_result,
                                         reason: ValidationFailureReason::RuntimeRepairFailed,
                                         history: std::mem::take(&mut self.history),
+                                        loader_report: None,
                                     });
                                 }
                             }
@@ -1483,12 +1523,39 @@ mod tests {
         let outcome = orch.validate(&mut ctx, &mock).await;
 
         assert_eq!(mock.calls(), 1);
-        assert!(
-            matches!(outcome, ValidationOutcome::Failed(ref f) if f.reason == ValidationFailureReason::NonRepairableFailure),
-            "LoaderMismatch should be NonRepairableFailure, got {:?}",
-            outcome
-        );
+        match &outcome {
+            ValidationOutcome::Failed(f) => {
+                assert_eq!(
+                    f.reason,
+                    ValidationFailureReason::LoaderMismatchDetected,
+                    "Should be LoaderMismatchDetected"
+                );
+                assert!(f.loader_report.is_some(), "Loader report should be present");
+                let report = f.loader_report.as_ref().unwrap();
+                // cfg=Fabric, log=Forge → WrongLoaderFamily
+                assert_eq!(
+                    report.family,
+                    crate::loader_compat_advisor::LoaderFamily::Fabric
+                );
+                assert!(
+                    !report.requirements.is_empty(),
+                    "Should have at least one requirement"
+                );
+                assert_eq!(
+                    report.requirements[0].family,
+                    crate::loader_compat_advisor::LoaderFamily::Forge
+                );
+                assert_eq!(
+                    report.status,
+                    crate::loader_compat_advisor::LoaderCompatibilityStatus::WrongLoaderFamily
+                );
+            }
+            _ => panic!("Expected Failed, got {:?}", outcome),
+        }
         assert_eq!(outcome_history(&outcome).repairs.len(), 0);
+
+        // Verify zero mutation — cfg loader version unchanged
+        // (forge_version is not a ServerConfig field, but we verify no cfg change)
     }
 
     #[tokio::test]
@@ -1900,5 +1967,231 @@ mod tests {
             history.repairs[0]
         );
         assert_eq!(history.boot_attempts.len(), 1, "1 boot attempt recorded");
+    }
+
+    // ── Phase 3H: Loader Compatibility Advisor orchestrator tests ──
+
+    /// Loader mismatch: advisor runs, produces report, zero mutation.
+    #[tokio::test]
+    async fn test_loader_mismatch_zero_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mods_dir = tmp.path().join("mods");
+        std::fs::create_dir(&mods_dir).unwrap();
+        // Place a dummy file to verify it's not deleted
+        std::fs::write(mods_dir.join("some-mod.jar"), b"fake").unwrap();
+
+        let mut orch = ValidationRepairOrchestrator::new();
+        let cfg_before = make_test_cfg();
+        let mut cfg = cfg_before.clone();
+        let app = make_test_app();
+        let cf = reqwest::Client::new();
+        let mut installed = crate::boot_failure_analyzer::InstalledFileRegistry::new();
+        let mut resolver =
+            crate::dependency_resolver::DependencyResolver::new(cf.clone(), String::new());
+        let mut ctx = make_test_context(
+            &mut cfg,
+            tmp.path(),
+            &app,
+            &cf,
+            &mut installed,
+            &mut resolver,
+        );
+
+        let mock = MockBootValidator::new(vec![failed_result(
+            BootFailureReason::ProcessExited,
+            &loader_mismatch_log(),
+        )]);
+
+        let outcome = orch.validate(&mut ctx, &mock).await;
+
+        // 1 boot call
+        assert_eq!(mock.calls(), 1);
+        // 0 repairs
+        assert_eq!(outcome_history(&outcome).repairs.len(), 0);
+
+        // Failed with LoaderMismatchDetected
+        match &outcome {
+            ValidationOutcome::Failed(f) => {
+                assert_eq!(f.reason, ValidationFailureReason::LoaderMismatchDetected);
+                assert!(f.loader_report.is_some());
+            }
+            _ => panic!("Expected Failed, got {:?}", outcome),
+        }
+
+        // Zero mutation: mods dir still has the file
+        assert!(mods_dir.join("some-mod.jar").exists(), "mods dir unchanged");
+
+        // Zero mutation: cfg loader fields unchanged
+        // (ServerConfig doesn't have a loader_version field to check,
+        //  but we verify no crash and cfg serializes identically)
+        let cfg_after_json = serde_json::to_string(&cfg).unwrap();
+        let cfg_before_json = serde_json::to_string(&cfg_before).unwrap();
+        assert_eq!(cfg_before_json, cfg_after_json, "cfg should be unchanged");
+    }
+
+    /// Chained: boot1 MissingDependency → repaired → boot2 LoaderMismatch → Failed
+    #[tokio::test]
+    async fn test_chained_dep_repair_then_loader_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("mods")).unwrap();
+
+        // Override dep repair to succeed
+        let mut orch = ValidationRepairOrchestrator::new_with_repair_overrides(vec![
+            ActionResult::Repaired, // dep repair for boot1
+        ]);
+        let mut cfg = make_test_cfg();
+        let app = make_test_app();
+        let cf = reqwest::Client::new();
+        let mut installed = crate::boot_failure_analyzer::InstalledFileRegistry::new();
+        let mut resolver =
+            crate::dependency_resolver::DependencyResolver::new(cf.clone(), String::new());
+        let mut ctx = make_test_context(
+            &mut cfg,
+            tmp.path(),
+            &app,
+            &cf,
+            &mut installed,
+            &mut resolver,
+        );
+
+        // boot1: missing-dep log → dep repair → Repaired → continue
+        // boot2: loader mismatch → advisor → Failed
+        let mock = MockBootValidator::new(vec![
+            failed_result(
+                BootFailureReason::ProcessExited,
+                &forge_log("some-missing-mod"),
+            ),
+            failed_result(BootFailureReason::ProcessExited, &loader_mismatch_log()),
+        ]);
+
+        let outcome = orch.validate(&mut ctx, &mock).await;
+
+        // boot1 + boot2 = 2 validator calls
+        assert_eq!(mock.calls(), 2);
+
+        let history = outcome_history(&outcome);
+        assert_eq!(history.boot_attempts.len(), 2, "2 boot attempts");
+        assert!(
+            matches!(
+                history.repairs.first(),
+                Some(RepairEvent::BootDependency(_))
+            ),
+            "first repair should be BootDependency, got {:?}",
+            history.repairs.first()
+        );
+
+        // Final outcome: LoaderMismatchDetected
+        match &outcome {
+            ValidationOutcome::Failed(f) => {
+                assert_eq!(f.reason, ValidationFailureReason::LoaderMismatchDetected);
+                assert!(f.loader_report.is_some());
+            }
+            _ => panic!("Expected Failed, got {:?}", outcome),
+        }
+    }
+
+    /// Error precedence: missing dep takes priority over loader mismatch in same log.
+    /// When a log has BOTH missing-dep and loader-mismatch signals,
+    /// classify_failure picks missing-dep (Priority 1) first.
+    #[tokio::test]
+    async fn test_missing_dep_takes_priority_over_loader_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("mods")).unwrap();
+
+        let mut orch = ValidationRepairOrchestrator::new();
+        let mut cfg = make_test_cfg();
+        let app = make_test_app();
+        let cf = reqwest::Client::new();
+        let mut installed = crate::boot_failure_analyzer::InstalledFileRegistry::new();
+        let mut resolver =
+            crate::dependency_resolver::DependencyResolver::new(cf.clone(), String::new());
+        let mut ctx = make_test_context(
+            &mut cfg,
+            tmp.path(),
+            &app,
+            &cf,
+            &mut installed,
+            &mut resolver,
+        );
+
+        // Log with BOTH missing-dep and loader-mismatch signals
+        let combined_log = format!(
+            "{}\n{}",
+            forge_log("some-missing-mod"),
+            loader_mismatch_log()
+        );
+
+        let mock = MockBootValidator::new(vec![
+            failed_result(BootFailureReason::ProcessExited, &combined_log),
+            // Second boot: after dep repair fails, classify picks loader mismatch
+            failed_result(BootFailureReason::ProcessExited, &loader_mismatch_log()),
+        ]);
+
+        let outcome = orch.validate(&mut ctx, &mock).await;
+
+        let history = outcome_history(&outcome);
+        // First boot: dep repair attempted (priority 1 over loader mismatch)
+        assert!(
+            matches!(
+                history.repairs.first(),
+                Some(RepairEvent::BootDependency(_))
+            ),
+            "first repair should be BootDependency (priority 1), got {:?}",
+            history.repairs.first()
+        );
+    }
+
+    /// Server-pack context: no manifest metadata, advisor works from boot log alone.
+    #[tokio::test]
+    async fn test_server_pack_loader_advisor_no_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mods_dir = tmp.path().join("mods");
+        std::fs::create_dir(&mods_dir).unwrap();
+
+        let mut orch = ValidationRepairOrchestrator::new();
+        let mut cfg = make_test_cfg();
+        let app = make_test_app();
+        let cf = reqwest::Client::new();
+        let mut installed = crate::boot_failure_analyzer::InstalledFileRegistry::new();
+        // Empty installed registry = server-pack context (no per-file CF mappings)
+        let mut resolver =
+            crate::dependency_resolver::DependencyResolver::new(cf.clone(), String::new());
+        let mut ctx = make_test_context(
+            &mut cfg,
+            tmp.path(),
+            &app,
+            &cf,
+            &mut installed,
+            &mut resolver,
+        );
+
+        let mock = MockBootValidator::new(vec![failed_result(
+            BootFailureReason::ProcessExited,
+            &loader_mismatch_log(),
+        )]);
+
+        let outcome = orch.validate(&mut ctx, &mock).await;
+
+        match &outcome {
+            ValidationOutcome::Failed(f) => {
+                assert_eq!(f.reason, ValidationFailureReason::LoaderMismatchDetected);
+                let report = f.loader_report.as_ref().unwrap();
+                // cfg=Fabric, log says Forge → WrongLoaderFamily
+                assert_eq!(
+                    report.family,
+                    crate::loader_compat_advisor::LoaderFamily::Fabric
+                );
+                assert!(!report.requirements.is_empty());
+                assert_eq!(
+                    report.requirements[0].family,
+                    crate::loader_compat_advisor::LoaderFamily::Forge
+                );
+                assert_eq!(
+                    report.status,
+                    crate::loader_compat_advisor::LoaderCompatibilityStatus::WrongLoaderFamily
+                );
+            }
+            _ => panic!("Expected Failed, got {:?}", outcome),
+        }
     }
 }

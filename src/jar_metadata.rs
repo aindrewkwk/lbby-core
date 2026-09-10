@@ -49,6 +49,15 @@ pub struct EnvironmentFinding {
     pub detail: String,
 }
 
+/// A loader-level version requirement extracted from mod metadata.
+/// These are separate from mod-to-mod dependencies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoaderVersionRequirement {
+    pub loader: LoaderMetadataKind,
+    pub version_requirement: Option<String>,
+    pub mandatory: bool,
+}
+
 /// Normalized metadata extracted from a single JAR file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JarModMetadata {
@@ -56,6 +65,9 @@ pub struct JarModMetadata {
     pub mod_ids: Vec<String>,
     pub environment_findings: Vec<EnvironmentFinding>,
     pub dependencies: Vec<NormalizedDependency>,
+    /// Loader-level requirements (e.g., fabric-loader >=0.15.0, forge >=47.2.0).
+    /// Captured from platform IDs that are normally skipped as mod deps.
+    pub loader_requirements: Vec<LoaderVersionRequirement>,
 }
 
 /// Read normalized metadata from a JAR file.
@@ -95,7 +107,11 @@ pub fn read_jar_mod_metadata(path: &Path) -> JarModMetadata {
                 }
             }
 
-            parse_fabric_deps(&value, &mut metadata.dependencies);
+            parse_fabric_deps(
+                &value,
+                &mut metadata.dependencies,
+                &mut metadata.loader_requirements,
+            );
         }
     }
 
@@ -130,7 +146,11 @@ pub fn read_jar_mod_metadata(path: &Path) -> JarModMetadata {
                 }
             }
 
-            parse_quilt_deps(&value, &mut metadata.dependencies);
+            parse_quilt_deps(
+                &value,
+                &mut metadata.dependencies,
+                &mut metadata.loader_requirements,
+            );
         }
     }
 
@@ -169,7 +189,11 @@ pub fn read_jar_mod_metadata(path: &Path) -> JarModMetadata {
                     });
                 }
 
-                parse_forge_deps(&value, &mut metadata.dependencies);
+                parse_forge_deps(
+                    &value,
+                    &mut metadata.dependencies,
+                    &mut metadata.loader_requirements,
+                );
             }
         }
     }
@@ -194,6 +218,7 @@ fn empty_metadata() -> JarModMetadata {
         mod_ids: Vec::new(),
         environment_findings: Vec::new(),
         dependencies: Vec::new(),
+        loader_requirements: Vec::new(),
     }
 }
 
@@ -213,10 +238,31 @@ fn parse_fabric_environment(s: &str) -> Option<DeclaredEnvironment> {
     }
 }
 
-fn parse_fabric_deps(value: &serde_json::Value, out: &mut Vec<NormalizedDependency>) {
+fn platform_id_to_loader_kind(mod_id: &str) -> Option<LoaderMetadataKind> {
+    match mod_id {
+        "forge" => Some(LoaderMetadataKind::Forge),
+        "neoforge" => Some(LoaderMetadataKind::NeoForge),
+        "fabricloader" | "fabric" => Some(LoaderMetadataKind::Fabric),
+        "quilt_loader" => Some(LoaderMetadataKind::Quilt),
+        _ => None,
+    }
+}
+
+fn parse_fabric_deps(
+    value: &serde_json::Value,
+    out: &mut Vec<NormalizedDependency>,
+    loader_reqs: &mut Vec<LoaderVersionRequirement>,
+) {
     if let Some(depends) = value.get("depends").and_then(|d| d.as_object()) {
         for (mod_id, version) in depends {
             if is_platform_id(mod_id) {
+                if let Some(loader_kind) = platform_id_to_loader_kind(mod_id) {
+                    loader_reqs.push(LoaderVersionRequirement {
+                        loader: loader_kind,
+                        version_requirement: version.as_str().map(|s| s.to_string()),
+                        mandatory: true,
+                    });
+                }
                 continue;
             }
             out.push(NormalizedDependency {
@@ -229,6 +275,13 @@ fn parse_fabric_deps(value: &serde_json::Value, out: &mut Vec<NormalizedDependen
     if let Some(suggests) = value.get("suggests").and_then(|d| d.as_object()) {
         for (mod_id, version) in suggests {
             if is_platform_id(mod_id) {
+                if let Some(loader_kind) = platform_id_to_loader_kind(mod_id) {
+                    loader_reqs.push(LoaderVersionRequirement {
+                        loader: loader_kind,
+                        version_requirement: version.as_str().map(|s| s.to_string()),
+                        mandatory: false,
+                    });
+                }
                 continue;
             }
             out.push(NormalizedDependency {
@@ -240,7 +293,11 @@ fn parse_fabric_deps(value: &serde_json::Value, out: &mut Vec<NormalizedDependen
     }
 }
 
-fn parse_quilt_deps(value: &serde_json::Value, out: &mut Vec<NormalizedDependency>) {
+fn parse_quilt_deps(
+    value: &serde_json::Value,
+    out: &mut Vec<NormalizedDependency>,
+    loader_reqs: &mut Vec<LoaderVersionRequirement>,
+) {
     let depends = value
         .pointer("/quilt_loader/depends")
         .or_else(|| value.pointer("/quilt_loader/metadata/depends"));
@@ -251,6 +308,13 @@ fn parse_quilt_deps(value: &serde_json::Value, out: &mut Vec<NormalizedDependenc
     if let Some(depends) = depends.and_then(|d| d.as_object()) {
         for (mod_id, version) in depends {
             if is_platform_id(mod_id) {
+                if let Some(loader_kind) = platform_id_to_loader_kind(mod_id) {
+                    loader_reqs.push(LoaderVersionRequirement {
+                        loader: loader_kind,
+                        version_requirement: quilt_version_string(version),
+                        mandatory: true,
+                    });
+                }
                 continue;
             }
             out.push(NormalizedDependency {
@@ -263,6 +327,13 @@ fn parse_quilt_deps(value: &serde_json::Value, out: &mut Vec<NormalizedDependenc
     if let Some(suggests) = suggests.and_then(|d| d.as_object()) {
         for (mod_id, version) in suggests {
             if is_platform_id(mod_id) {
+                if let Some(loader_kind) = platform_id_to_loader_kind(mod_id) {
+                    loader_reqs.push(LoaderVersionRequirement {
+                        loader: loader_kind,
+                        version_requirement: quilt_version_string(version),
+                        mandatory: false,
+                    });
+                }
                 continue;
             }
             out.push(NormalizedDependency {
@@ -285,7 +356,11 @@ fn quilt_version_string(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn parse_forge_deps(value: &toml::Value, out: &mut Vec<NormalizedDependency>) {
+fn parse_forge_deps(
+    value: &toml::Value,
+    out: &mut Vec<NormalizedDependency>,
+    loader_reqs: &mut Vec<LoaderVersionRequirement>,
+) {
     let Some(deps_table) = value.get("dependencies").and_then(|d| d.as_table()) else {
         return;
     };
@@ -295,7 +370,7 @@ fn parse_forge_deps(value: &toml::Value, out: &mut Vec<NormalizedDependency>) {
         };
         for dep in arr {
             let mod_id = dep.get("modId").and_then(|v| v.as_str()).unwrap_or("");
-            if mod_id.is_empty() || is_platform_id(mod_id) {
+            if mod_id.is_empty() {
                 continue;
             }
             let version_range = dep
@@ -308,6 +383,17 @@ fn parse_forge_deps(value: &toml::Value, out: &mut Vec<NormalizedDependency>) {
                 .unwrap_or(true);
             let dep_type = dep.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let is_required = mandatory || dep_type.eq_ignore_ascii_case("required");
+
+            if is_platform_id(mod_id) {
+                if let Some(loader_kind) = platform_id_to_loader_kind(mod_id) {
+                    loader_reqs.push(LoaderVersionRequirement {
+                        loader: loader_kind,
+                        version_requirement: version_range,
+                        mandatory: is_required,
+                    });
+                }
+                continue;
+            }
 
             out.push(NormalizedDependency {
                 mod_id: mod_id.to_string(),
