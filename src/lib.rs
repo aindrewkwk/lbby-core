@@ -4,6 +4,7 @@
 pub mod app_state;
 pub mod automodpack;
 pub mod backup;
+pub mod boot_failure_analyzer;
 pub mod boot_validator;
 pub mod cloudflare;
 pub mod config;

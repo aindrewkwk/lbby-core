@@ -75,6 +75,17 @@ pub enum DependencyResolution {
     },
     /// Downloaded JAR has no mod metadata — identity cannot be verified.
     IdentityUnverifiable,
+    /// Runtime-only resolution: candidate downloaded and identity verified.
+    /// Carries the already-downloaded jar_path to avoid double-download.
+    RuntimeResolved(RuntimeResolvedDependency),
+}
+
+/// A runtime-only resolved dependency that has already been downloaded and verified.
+/// Returned by try_runtime_only_resolution to avoid double-download.
+#[derive(Debug, Clone)]
+pub struct RuntimeResolvedDependency {
+    pub resolved: ResolvedDependency,
+    pub jar_path: std::path::PathBuf,
 }
 
 /// A resolved dependency ready to download.
@@ -243,6 +254,11 @@ impl DependencyResolver {
         self.project_map.register(project_id, mod_ids);
     }
 
+    /// Get a reference to the project map (for boot repair verification).
+    pub fn project_map(&self) -> &ProjectModMapping {
+        &self.project_map
+    }
+
     /// Resolve a single missing dependency using CurseForge metadata.
     ///
     /// SAFETY RULES:
@@ -322,7 +338,10 @@ impl DependencyResolver {
     }
 
     /// Resolve a dependency given a known CF project ID.
-    async fn resolve_from_project(
+    /// Public for Phase 3F-B runtime-only dependency resolution where
+    /// the project ID comes from the requesting mod's CF file dependencies
+    /// rather than from a project mapping.
+    pub async fn resolve_from_project(
         &mut self,
         project_id: u64,
         dep_mod_id: &str,
