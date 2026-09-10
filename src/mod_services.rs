@@ -2831,10 +2831,11 @@ pub async fn install_curseforge_modpack(
             }
         }
     }
-    let mut boot_attempt = 0u8;
+    let mut retry_state = crate::runtime_remediator::ValidationRetryState::new();
     loop {
         let validator = crate::boot_validator::BootValidator::new();
         let boot_result = validator.validate(&cfg, txn.staging_path()).await;
+        retry_state.record_boot_attempt();
         match boot_result {
             crate::boot_validator::BootResult::Success(ref s) => {
                 eprintln!(
@@ -2861,12 +2862,11 @@ pub async fn install_curseforge_modpack(
                 return Ok(cfg);
             }
             crate::boot_validator::BootResult::Failed(ref f) => {
-                // Phase 3F-B: attempt boot-time repair before rolling back
-                boot_attempt += 1;
-                if boot_attempt > crate::boot_failure_analyzer::MAX_BOOT_REPAIR_ROUNDS {
+                // Phase 3F-B + 3F-C: attempt boot-time repair before rolling back
+                if !retry_state.can_attempt_boot() {
                     eprintln!(
-                        "[CF] Boot repair exhausted after {} attempts",
-                        boot_attempt - 1
+                        "[CF] Global boot attempt ceiling ({}) reached — stopping",
+                        crate::runtime_remediator::MAX_TOTAL_BOOT_ATTEMPTS
                     );
                     let err = format!("Boot validation failed ({}): {}", f.reason, f.log_tail);
                     crate::boot_validator::save_validation_diagnostics(
@@ -2929,7 +2929,7 @@ pub async fn install_curseforge_modpack(
 
                         eprintln!(
                             "[CF] Boot attempt {}: missing dependency '{}' — verified by {:?}",
-                            boot_attempt, attr.missing_mod_id, verification
+                            retry_state.total_boot_attempts, attr.missing_mod_id, verification
                         );
 
                         // Use the existing resolver (already has project mappings from manifest)
@@ -2954,9 +2954,10 @@ pub async fn install_curseforge_modpack(
                         .await;
 
                         if boot_outcome.repaired {
+                            retry_state.dependency_repairs += 1;
                             eprintln!(
                                 "[CF] Boot repair succeeded on attempt {} — retrying boot validation",
-                                boot_attempt
+                                retry_state.total_boot_attempts
                             );
                             // Clean up boot validation artifacts before retry
                             let _ = crate::boot_validator::verify_validation_cleanup(
@@ -2966,7 +2967,7 @@ pub async fn install_curseforge_modpack(
                         } else {
                             eprintln!(
                                 "[CF] Boot repair failed on attempt {}: {:?}",
-                                boot_attempt, boot_outcome.records
+                                retry_state.total_boot_attempts, boot_outcome.records
                             );
                             crate::boot_validator::save_validation_diagnostics(
                                 txn.staging_path(),
@@ -2982,17 +2983,78 @@ pub async fn install_curseforge_modpack(
                         }
                     }
                     _ => {
-                        // Not a missing dependency or not High confidence — no repair
-                        eprintln!("[CF] Boot failure not repairable: {:?}", attribution);
-                        let err = format!("Boot validation failed ({}): {}", f.reason, f.log_tail);
-                        crate::boot_validator::save_validation_diagnostics(
-                            txn.staging_path(),
-                            &txn.meta().server_id,
-                            &txn.meta().transaction_id,
-                            &boot_result,
+                        // Phase 3F-C: attempt deterministic runtime remediation
+                        let runtime_issue = crate::runtime_remediator::analyze_runtime_issue(
+                            &f.log_tail, &cfg
                         );
-                        txn.rollback()?;
-                        return Err(err);
+                        eprintln!("[CF] Runtime issue detected: {:?}", runtime_issue);
+
+                        if runtime_issue == crate::runtime_remediator::RuntimeIssue::Unsupported {
+                            eprintln!("[CF] Unsupported runtime issue — no remediation");
+                            let err = format!("Boot validation failed ({}): {}", f.reason, f.log_tail);
+                            crate::boot_validator::save_validation_diagnostics(
+                                txn.staging_path(), &txn.meta().server_id,
+                                &txn.meta().transaction_id, &boot_result,
+                            );
+                            txn.rollback()?;
+                            return Err(err);
+                        }
+
+                        if !retry_state.can_attempt_runtime_repair() {
+                            eprintln!("[CF] Runtime repair budget exhausted — stopping");
+                            let err = format!("Boot validation failed ({}): {}", f.reason, f.log_tail);
+                            crate::boot_validator::save_validation_diagnostics(
+                                txn.staging_path(), &txn.meta().server_id,
+                                &txn.meta().transaction_id, &boot_result,
+                            );
+                            txn.rollback()?;
+                            return Err(err);
+                        }
+
+                        let round = retry_state.runtime_repairs + 1;
+                        let rem_result = crate::runtime_remediator::remediate(
+                            &runtime_issue, &mut cfg, &mut retry_state, &app, round
+                        ).await;
+
+                        match rem_result {
+                            crate::runtime_remediator::RuntimeRemediationResult::Repaired(record) => {
+                                eprintln!("[CF] Runtime remediation succeeded: {:?}", record);
+                                retry_state.runtime_repairs += 1;
+                                // cfg already mutated by remediate() — clean up and retry
+                                let _ = crate::boot_validator::verify_validation_cleanup(txn.staging_path());
+                                continue;
+                            }
+                            crate::runtime_remediator::RuntimeRemediationResult::NotRepairable(reason) => {
+                                eprintln!("[CF] Runtime issue not repairable: {}", reason);
+                                let err = format!("Boot validation failed ({}): {}", f.reason, f.log_tail);
+                                crate::boot_validator::save_validation_diagnostics(
+                                    txn.staging_path(), &txn.meta().server_id,
+                                    &txn.meta().transaction_id, &boot_result,
+                                );
+                                txn.rollback()?;
+                                return Err(err);
+                            }
+                            crate::runtime_remediator::RuntimeRemediationResult::Ambiguous(msg) => {
+                                eprintln!("[CF] Runtime remediation ambiguous: {}", msg);
+                                let err = format!("Boot validation failed ({}): {}", f.reason, f.log_tail);
+                                crate::boot_validator::save_validation_diagnostics(
+                                    txn.staging_path(), &txn.meta().server_id,
+                                    &txn.meta().transaction_id, &boot_result,
+                                );
+                                txn.rollback()?;
+                                return Err(err);
+                            }
+                            crate::runtime_remediator::RuntimeRemediationResult::Failed(msg) => {
+                                eprintln!("[CF] Runtime remediation failed: {}", msg);
+                                let err = format!("Boot validation failed ({}): {}", f.reason, f.log_tail);
+                                crate::boot_validator::save_validation_diagnostics(
+                                    txn.staging_path(), &txn.meta().server_id,
+                                    &txn.meta().transaction_id, &boot_result,
+                                );
+                                txn.rollback()?;
+                                return Err(err);
+                            }
+                        }
                     }
                 }
             }
