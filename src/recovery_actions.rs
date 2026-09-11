@@ -145,7 +145,7 @@ pub struct UserRecoveryRecord {
 /// Compute a deterministic fingerprint from stable attribution fields.
 ///
 /// The fingerprint binds: transaction_id + mod_id + canonical jar path +
-/// boot attempt number + crash evidence identifiers.
+/// boot attempt number + crash evidence identifiers + JAR SHA-256.
 /// Used to detect stale approvals.
 pub fn compute_fingerprint(
     transaction_id: &str,
@@ -153,6 +153,7 @@ pub fn compute_fingerprint(
     jar_path: &Path,
     boot_attempt: u8,
     evidence_ids: &[String],
+    jar_sha256: &str,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(transaction_id.as_bytes());
@@ -167,6 +168,8 @@ pub fn compute_fingerprint(
         hasher.update(eid.as_bytes());
         hasher.update(b",");
     }
+    hasher.update(b"|");
+    hasher.update(jar_sha256.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -177,6 +180,7 @@ pub fn verify_fingerprint(
     transaction_id: &str,
     jar_path: &Path,
     boot_attempt: u8,
+    jar_sha256: &str,
 ) -> Result<(), String> {
     // Use primary_candidate if available, else first candidate
     let candidate = report
@@ -198,6 +202,7 @@ pub fn verify_fingerprint(
         jar_path,
         boot_attempt,
         &evidence_ids,
+        jar_sha256,
     );
 
     if approval.attribution_fingerprint == expected {
@@ -547,6 +552,535 @@ pub fn check_dependency_impact(
     }
 }
 
+// ── Domain-specific approval API ──────────────────────────────────────
+
+/// Result of a recovery approval attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ApprovalResult {
+    /// Recovery applied successfully. JAR quarantined, ready for re-validation.
+    Applied {
+        quarantine_path: PathBuf,
+        sha256: String,
+        recovery_actions_used: u8,
+    },
+    /// Approval rejected — transaction rolled back, live unchanged.
+    Rejected(String),
+    /// Fingerprint no longer matches — JAR bytes or attribution changed.
+    Invalidated(String),
+    /// Recovery action budget exhausted.
+    RecoveryLimitReached { used: u8, max: u8 },
+    /// Dependency preflight failed — would break required dependents.
+    DependencyImpact(Vec<String>),
+    /// Transaction not found or already completed.
+    TransactionNotFound(String),
+    /// Metadata corruption or inconsistency.
+    InvalidState(String),
+    /// Internal failure during quarantine.
+    Failed(String),
+}
+
+/// Find all pending recovery transactions for a server.
+///
+/// Scans the staging root for transactions in `PendingUserAction` phase
+/// that have a `pending_recovery.json` file.
+pub fn find_pending_recoveries(live_path: &Path) -> Vec<PendingRecoveryInfo> {
+    use crate::install_transaction::{PendingRecoveryMetadata, TransactionMeta, TransactionPhase};
+
+    let parent = match live_path.parent() {
+        Some(p) => p,
+        None => return vec![],
+    };
+    let staging_root = parent.join(".lbby-staging");
+    let mut results = vec![];
+
+    if let Ok(entries) = std::fs::read_dir(&staging_root) {
+        for entry in entries.flatten() {
+            let staging_path = entry.path();
+            let marker = staging_path.join("transaction.json");
+            if !marker.exists() {
+                continue;
+            }
+            // Load transaction marker to check phase
+            if let Ok(content) = std::fs::read_to_string(&marker) {
+                if let Ok(meta) = serde_json::from_str::<TransactionMeta>(&content) {
+                    if meta.phase == TransactionPhase::PendingUserAction {
+                        let recovery_path = meta.pending_recovery_path();
+                        if recovery_path.exists() {
+                            if let Ok(recovery) = PendingRecoveryMetadata::load(&recovery_path) {
+                                results.push(PendingRecoveryInfo {
+                                    server_id: recovery.server_id.clone(),
+                                    transaction_id: recovery.transaction_id.clone(),
+                                    staging_path: staging_path.clone(),
+                                    recovery,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Information about a pending recovery transaction (for UI discovery).
+#[derive(Debug, Clone)]
+pub struct PendingRecoveryInfo {
+    pub server_id: String,
+    pub transaction_id: String,
+    pub staging_path: PathBuf,
+    pub recovery: crate::install_transaction::PendingRecoveryMetadata,
+}
+
+/// Domain-specific approval entry point.
+///
+/// The frontend sends only stable identifiers: server_id, transaction_id, fingerprint.
+/// The backend resolves everything else from persisted recovery metadata.
+///
+/// Flow:
+/// 1. Find pending transaction by server_id + transaction_id
+/// 2. Load and validate PendingRecoveryMetadata
+/// 3. Verify fingerprint matches
+/// 4. Enforce recovery action budget (MAX_USER_RECOVERY_ACTIONS)
+/// 5. Revalidate JAR (exists, containment, SHA-256, metadata)
+/// 6. Dependency impact preflight
+/// 7. Quarantine JAR (move, not delete)
+/// 8. Mark metadata as applied
+/// 9. Return Applied with quarantine info
+/// Core approval logic with explicit live_path (testable without config).
+fn approve_crash_recovery_inner(
+    server_id: &str,
+    transaction_id: &str,
+    fingerprint: &str,
+    live_path: &Path,
+) -> ApprovalResult {
+    use crate::install_transaction::{PendingRecoveryMetadata, TransactionMeta};
+
+    let live_path = live_path.to_path_buf();
+
+    let parent = match live_path.parent() {
+        Some(p) => p,
+        None => return ApprovalResult::InvalidState("Live path has no parent".to_string()),
+    };
+    let staging_root = parent.join(".lbby-staging");
+
+    // Find the specific transaction
+    let mut found_staging: Option<PathBuf> = None;
+    if let Ok(entries) = std::fs::read_dir(&staging_root) {
+        for entry in entries.flatten() {
+            let staging_path = entry.path();
+            let marker = staging_path.join("transaction.json");
+            if !marker.exists() {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&marker) {
+                if let Ok(meta) = serde_json::from_str::<TransactionMeta>(&content) {
+                    if meta.transaction_id == transaction_id && meta.server_id == server_id {
+                        found_staging = Some(staging_path);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let staging_path = match found_staging {
+        Some(p) => p,
+        None => {
+            return ApprovalResult::TransactionNotFound(format!(
+                "Transaction {} not found for server {}",
+                transaction_id, server_id
+            ))
+        }
+    };
+
+    // 2. Load PendingRecoveryMetadata
+    let recovery_path = staging_path.join("pending_recovery.json");
+    let recovery = match PendingRecoveryMetadata::load(&recovery_path) {
+        Ok(r) => r,
+        Err(e) => {
+            return ApprovalResult::InvalidState(format!("Cannot load recovery metadata: {}", e))
+        }
+    };
+
+    // Already applied? (idempotency guard)
+    if recovery.applied {
+        return ApprovalResult::Invalidated("Recovery already applied".to_string());
+    }
+
+    // Verify server + transaction match
+    if recovery.server_id != server_id || recovery.transaction_id != transaction_id {
+        return ApprovalResult::Invalidated(
+            "Server/transaction mismatch in persisted metadata".to_string(),
+        );
+    }
+
+    // 3. Verify fingerprint
+    if recovery.attribution_fingerprint != fingerprint {
+        return ApprovalResult::Invalidated(
+            "Fingerprint mismatch — attribution state changed since approval".to_string(),
+        );
+    }
+
+    // 4. Enforce recovery action budget
+    if recovery.recovery_actions_used >= MAX_USER_RECOVERY_ACTIONS {
+        return ApprovalResult::RecoveryLimitReached {
+            used: recovery.recovery_actions_used,
+            max: MAX_USER_RECOVERY_ACTIONS,
+        };
+    }
+
+    // 5. Revalidate JAR
+    let jar_path = &recovery.target_jar_path;
+    let staging_mods = &recovery.staging_mods;
+
+    // 5a. JAR exists
+    if !jar_path.exists() {
+        return ApprovalResult::Invalidated("Target JAR no longer exists".to_string());
+    }
+
+    // 5b. Canonical containment
+    let canonical_jar = match validate_jar_containment(jar_path, staging_mods) {
+        Ok(p) => p,
+        Err(e) => return ApprovalResult::Invalidated(format!("Containment check failed: {}", e)),
+    };
+
+    // 5c. SHA-256 matches
+    let current_sha256 = match compute_file_sha256(&canonical_jar) {
+        Ok(h) => h,
+        Err(e) => return ApprovalResult::Invalidated(format!("Cannot compute SHA-256: {}", e)),
+    };
+    if current_sha256 != recovery.target_jar_sha256 {
+        return ApprovalResult::Invalidated(
+            "JAR bytes changed since attribution — SHA-256 mismatch".to_string(),
+        );
+    }
+
+    // 5d. JAR metadata still declares expected mod_id
+    if let Err(e) = revalidate_before_move(&canonical_jar, &recovery.target_mod_id, staging_mods) {
+        return ApprovalResult::Invalidated(format!("Pre-move revalidation failed: {}", e));
+    }
+
+    // 5e. Not protected
+    if is_protected_component(&recovery.target_mod_id) {
+        return ApprovalResult::Invalidated("Target is a protected component".to_string());
+    }
+
+    // 5f. Not multi-mod (check jar_to_mod_ids)
+    let jar_to_mod_ids = build_jar_to_mod_ids(staging_mods);
+    if let Some(mod_ids) = jar_to_mod_ids.get(&canonical_jar) {
+        if mod_ids.len() > 1 {
+            let others: Vec<String> = mod_ids
+                .iter()
+                .filter(|id| **id != recovery.target_mod_id)
+                .cloned()
+                .collect();
+            if !others.is_empty() {
+                return ApprovalResult::Invalidated(format!(
+                    "JAR contains multiple mods: {:?}",
+                    others
+                ));
+            }
+        }
+    }
+
+    // 6. Dependency-impact preflight — ALWAYS build from staging to ensure freshness.
+    // The caller-supplied graph (if any) is ignored; the backend owns this safety check.
+    {
+        use crate::mod_compat::classify_mod_local;
+        let mut entries = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(staging_mods) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.extension().map_or(false, |e| e == "jar") {
+                    let compat = classify_mod_local(&p);
+                    entries.push((p, compat));
+                }
+            }
+        }
+        let fresh_graph = DependencyGraph::build(&entries);
+        if let Err(broken) = check_dependency_impact(&recovery.target_mod_id, &fresh_graph) {
+            return ApprovalResult::DependencyImpact(broken);
+        }
+    }
+
+    // 7. Quarantine JAR
+    let quarantine_dir = staging_mods
+        .parent()
+        .unwrap_or(staging_mods)
+        .join(".lbby-quarantine")
+        .join("mods");
+
+    let quarantine_path = match quarantine_jar(&canonical_jar, staging_mods, &quarantine_dir) {
+        Ok(p) => p,
+        Err(e) => return ApprovalResult::Failed(e),
+    };
+
+    // 8. Mark metadata as applied (idempotency)
+    let mut updated_recovery = recovery.clone();
+    updated_recovery.applied = true;
+    if let Err(e) = updated_recovery.save(&recovery_path) {
+        // Non-fatal — quarantine already happened. Log and continue.
+        eprintln!(
+            "[RECOVERY] Warning: failed to mark recovery as applied: {}",
+            e
+        );
+    }
+
+    eprintln!(
+        "[RECOVERY] Approved recovery for '{}' in transaction {} — quarantined to {}",
+        recovery.target_mod_id,
+        transaction_id,
+        quarantine_path.display()
+    );
+
+    ApprovalResult::Applied {
+        quarantine_path,
+        sha256: current_sha256,
+        recovery_actions_used: recovery.recovery_actions_used + 1,
+    }
+}
+
+/// Approve a pending recovery action (production entry point).
+///
+/// Resolves live_path from config. Returns TransactionNotFound if server
+/// is not in config.
+pub fn approve_crash_recovery(
+    server_id: &str,
+    transaction_id: &str,
+    fingerprint: &str,
+) -> ApprovalResult {
+    let live_path = match find_live_path_for_server(server_id) {
+        Some(p) => p,
+        None => {
+            return ApprovalResult::TransactionNotFound(format!(
+                "No live path found for server '{}'",
+                server_id
+            ))
+        }
+    };
+    approve_crash_recovery_inner(server_id, transaction_id, fingerprint, &live_path)
+}
+
+/// Approve a pending recovery action with explicit live_path (test-only).
+#[cfg(feature = "testing")]
+pub fn approve_crash_recovery_at(
+    server_id: &str,
+    transaction_id: &str,
+    fingerprint: &str,
+    live_path: &Path,
+) -> ApprovalResult {
+    approve_crash_recovery_inner(server_id, transaction_id, fingerprint, live_path)
+}
+
+/// Reject a pending recovery — rollback the transaction, live unchanged.
+///
+/// The frontend sends only stable identifiers. The backend resolves the
+/// transaction and rolls it back.
+pub fn reject_crash_recovery(server_id: &str, transaction_id: &str) -> Result<(), String> {
+    use crate::install_transaction::{InstallTransaction, TransactionMeta};
+
+    let live_path = match find_live_path_for_server(server_id) {
+        Some(p) => p,
+        None => return Err(format!("No live path found for server '{}'", server_id)),
+    };
+    reject_crash_recovery_inner(server_id, transaction_id, &live_path)
+}
+
+/// Reject a pending recovery with explicit live_path (testable without config).
+#[cfg(feature = "testing")]
+pub fn reject_crash_recovery_at(
+    server_id: &str,
+    transaction_id: &str,
+    live_path: &Path,
+) -> Result<(), String> {
+    reject_crash_recovery_inner(server_id, transaction_id, live_path)
+}
+
+fn reject_crash_recovery_inner(
+    server_id: &str,
+    transaction_id: &str,
+    live_path: &Path,
+) -> Result<(), String> {
+    use crate::install_transaction::{InstallTransaction, TransactionMeta};
+
+    let parent = live_path.parent().ok_or("Live path has no parent")?;
+    let staging_root = parent.join(".lbby-staging");
+
+    // Find the specific transaction
+    let mut found_staging: Option<PathBuf> = None;
+    if let Ok(entries) = std::fs::read_dir(&staging_root) {
+        for entry in entries.flatten() {
+            let staging_path = entry.path();
+            let marker = staging_path.join("transaction.json");
+            if !marker.exists() {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&marker) {
+                if let Ok(meta) = serde_json::from_str::<TransactionMeta>(&content) {
+                    if meta.transaction_id == transaction_id && meta.server_id == server_id {
+                        found_staging = Some(staging_path);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let staging_path = found_staging.ok_or_else(|| {
+        format!(
+            "Transaction {} not found for server {}",
+            transaction_id, server_id
+        )
+    })?;
+
+    // Load TransactionMeta and resume the transaction so we can roll it back
+    let marker_path = staging_path.join("transaction.json");
+    let meta_content = std::fs::read_to_string(&marker_path)
+        .map_err(|e| format!("Failed to read transaction marker: {}", e))?;
+    let meta: TransactionMeta = serde_json::from_str(&meta_content)
+        .map_err(|e| format!("Failed to parse transaction marker: {}", e))?;
+    let txn = InstallTransaction::resume(meta)?;
+    txn.rollback()?;
+
+    eprintln!(
+        "[RECOVERY] Rejected recovery for transaction {} — rolled back",
+        transaction_id
+    );
+
+    Ok(())
+}
+
+/// Find the live server path for a given server_id.
+///
+/// Scans the config to find the server directory. This is a helper that
+/// avoids hardcoding paths.
+fn find_live_path_for_server(server_id: &str) -> Option<PathBuf> {
+    let cfg = crate::config::load_config();
+    let server_path = PathBuf::from(&cfg.server_path);
+    // server_path points to the server directory itself
+    if server_path.exists() && server_path.file_name().map_or(false, |n| n == server_id) {
+        return Some(server_path);
+    }
+    // Try as parent/servers/server_id
+    let candidate = server_path.join(server_id);
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    // Try parent directory
+    if let Some(parent) = server_path.parent() {
+        let candidate = parent.join(server_id);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+// ── Retry state persistence (cross-lifecycle) ────────────────────────
+
+/// Persisted retry state for cross-pause/resume lifecycle tracking.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RetryStateSnapshot {
+    pub boot_attempts_used: u8,
+    pub dependency_repairs_used: u8,
+    pub runtime_repairs_used: u8,
+    pub recovery_actions_used: u8,
+}
+
+fn retry_state_path(server_path: &Path) -> PathBuf {
+    server_path.join(".lbby-retry-state.json")
+}
+
+/// Save orchestrator retry state to the server directory before pause.
+pub fn save_retry_state(server_path: &Path, snapshot: &RetryStateSnapshot) -> Result<(), String> {
+    let path = retry_state_path(server_path);
+    let json = serde_json::to_string_pretty(snapshot)
+        .map_err(|e| format!("Failed to serialize retry state: {}", e))?;
+    std::fs::write(&path, json).map_err(|e| format!("Failed to write retry state: {}", e))
+}
+
+/// Load orchestrator retry state from a prior pause.
+/// Returns None if no prior state exists (fresh lifecycle).
+pub fn load_retry_state(server_path: &Path) -> Option<RetryStateSnapshot> {
+    let path = retry_state_path(server_path);
+    let content = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Delete retry state after successful commit or rollback.
+pub fn clear_retry_state(server_path: &Path) {
+    let _ = std::fs::remove_file(retry_state_path(server_path));
+}
+
+/// Preserve quarantine artifact out of staging before transaction commit.
+///
+/// Moves quarantine contents from `<staging>/.lbby-quarantine/` to
+/// `<live-parent>/.lbby-quarantine/<server-id>/<txn-id>/`.
+///
+/// Returns the new quarantine root path.
+pub fn preserve_quarantine_on_commit(
+    staging_path: &Path,
+    server_id: &str,
+    transaction_id: &str,
+) -> Result<PathBuf, String> {
+    let staging_quarantine = staging_path.join(".lbby-quarantine");
+    if !staging_quarantine.exists() {
+        // No quarantine to preserve
+        return Ok(staging_quarantine);
+    }
+
+    let live_parent = staging_path.parent().ok_or("Staging path has no parent")?;
+    let preserve_root = live_parent
+        .join(".lbby-quarantine")
+        .join(server_id)
+        .join(transaction_id);
+
+    std::fs::create_dir_all(&preserve_root)
+        .map_err(|e| format!("Failed to create quarantine preserve dir: {}", e))?;
+
+    // Move all contents from staging quarantine to preserve root
+    move_dir_contents(&staging_quarantine, &preserve_root)?;
+
+    eprintln!(
+        "[RECOVERY] Preserved quarantine artifacts to {}",
+        preserve_root.display()
+    );
+
+    Ok(preserve_root)
+}
+
+/// Recursively move contents of one directory into another.
+fn move_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
+    if !src.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(src)
+        .map_err(|e| format!("Failed to read dir {}: {}", src.display(), e))?
+    {
+        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            std::fs::create_dir_all(&dst_path)
+                .map_err(|e| format!("Failed to create dir {}: {}", dst_path.display(), e))?;
+            move_dir_contents(&src_path, &dst_path)?;
+            std::fs::remove_dir(&src_path).ok(); // Remove empty source dir
+        } else {
+            std::fs::rename(&src_path, &dst_path).map_err(|e| {
+                format!(
+                    "Failed to move {} → {}: {}",
+                    src_path.display(),
+                    dst_path.display(),
+                    e
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -604,36 +1138,36 @@ mod tests {
 
     #[test]
     fn test_fingerprint_deterministic() {
-        let fp1 = compute_fingerprint("txn1", "mymod", Path::new("mods/mymod.jar"), 1, &[]);
-        let fp2 = compute_fingerprint("txn1", "mymod", Path::new("mods/mymod.jar"), 1, &[]);
+        let fp1 = compute_fingerprint("txn1", "mymod", Path::new("mods/mymod.jar"), 1, &[], "");
+        let fp2 = compute_fingerprint("txn1", "mymod", Path::new("mods/mymod.jar"), 1, &[], "");
         assert_eq!(fp1, fp2);
     }
 
     #[test]
     fn test_fingerprint_changes_with_mod_id() {
-        let fp1 = compute_fingerprint("txn1", "modA", Path::new("mods/a.jar"), 1, &[]);
-        let fp2 = compute_fingerprint("txn1", "modB", Path::new("mods/a.jar"), 1, &[]);
+        let fp1 = compute_fingerprint("txn1", "modA", Path::new("mods/a.jar"), 1, &[], "");
+        let fp2 = compute_fingerprint("txn1", "modB", Path::new("mods/a.jar"), 1, &[], "");
         assert_ne!(fp1, fp2);
     }
 
     #[test]
     fn test_fingerprint_changes_with_jar() {
-        let fp1 = compute_fingerprint("txn1", "mymod", Path::new("mods/a.jar"), 1, &[]);
-        let fp2 = compute_fingerprint("txn1", "mymod", Path::new("mods/b.jar"), 1, &[]);
+        let fp1 = compute_fingerprint("txn1", "mymod", Path::new("mods/a.jar"), 1, &[], "");
+        let fp2 = compute_fingerprint("txn1", "mymod", Path::new("mods/b.jar"), 1, &[], "");
         assert_ne!(fp1, fp2);
     }
 
     #[test]
     fn test_fingerprint_changes_with_transaction() {
-        let fp1 = compute_fingerprint("txn1", "mymod", Path::new("mods/a.jar"), 1, &[]);
-        let fp2 = compute_fingerprint("txn2", "mymod", Path::new("mods/a.jar"), 1, &[]);
+        let fp1 = compute_fingerprint("txn1", "mymod", Path::new("mods/a.jar"), 1, &[], "");
+        let fp2 = compute_fingerprint("txn2", "mymod", Path::new("mods/a.jar"), 1, &[], "");
         assert_ne!(fp1, fp2);
     }
 
     #[test]
     fn test_fingerprint_changes_with_attempt() {
-        let fp1 = compute_fingerprint("txn1", "mymod", Path::new("mods/a.jar"), 1, &[]);
-        let fp2 = compute_fingerprint("txn1", "mymod", Path::new("mods/a.jar"), 2, &[]);
+        let fp1 = compute_fingerprint("txn1", "mymod", Path::new("mods/a.jar"), 1, &[], "");
+        let fp2 = compute_fingerprint("txn1", "mymod", Path::new("mods/a.jar"), 2, &[], "");
         assert_ne!(fp1, fp2);
     }
 

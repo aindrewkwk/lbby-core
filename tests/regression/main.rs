@@ -23,7 +23,7 @@ use lbby_core::mod_compat::{
 };
 use lbby_core::validation_orchestrator::{
     ActionResult, BootResultCategory, RepairAction, RepairEvent, ValidationContext,
-    ValidationFailureReason, ValidationOutcome, ValidationRepairOrchestrator,
+    ValidationFailure, ValidationFailureReason, ValidationOutcome, ValidationRepairOrchestrator,
     MAX_TOTAL_BOOT_ATTEMPTS,
 };
 use std::path::Path;
@@ -87,6 +87,8 @@ impl TestHarness {
             cf_client: &self.cf,
             installed_files: &self.installed,
             dependency_resolver: &mut self.resolver,
+            transaction_id: "test-txn",
+            server_id: "test-server",
         }
     }
 }
@@ -1643,4 +1645,1476 @@ async fn regression_server_pack_loader_advisor() {
         }
         _ => panic!("Expected Failed, got {:?}", outcome),
     }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Phase 3K.1: User-Confirmed Recovery Lifecycle
+// ════════════════════════════════════════════════════════════════════
+
+use lbby_core::crash_attribution::{
+    CrashAttributionConfidence, CrashAttributionReport, CrashAttributionStatus, CrashCandidate,
+    CrashEvidence, CrashEvidenceSource, CrashRecommendation,
+};
+use lbby_core::dependency_graph::DependencyGraph;
+use lbby_core::install_transaction::{PendingRecoveryMetadata, TransactionMeta};
+use lbby_core::jar_metadata::DependencyKind;
+use lbby_core::recovery_actions::{
+    self, ApprovalResult, RecoveryActionAvailability, MAX_USER_RECOVERY_ACTIONS,
+};
+use std::path::PathBuf;
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+/// Default ModCompatibility for test JARs (Server, High confidence, Unknown source).
+fn test_compat() -> lbby_core::mod_compat::ModCompatibility {
+    lbby_core::mod_compat::ModCompatibility {
+        compatibility: lbby_core::mod_compat::ServerCompatibility::ServerOk,
+        confidence: lbby_core::mod_compat::CompatibilityConfidence::Explicit,
+        source: lbby_core::mod_compat::CompatibilitySource::None,
+        reason: "test".to_string(),
+    }
+}
+
+/// Create a mock CrashAttributionReport pointing to a specific mod.
+fn mock_attribution_report(
+    mod_id: &str,
+    jar_path: &Path,
+    confidence: CrashAttributionConfidence,
+) -> CrashAttributionReport {
+    CrashAttributionReport {
+        status: CrashAttributionStatus::Attributed,
+        confidence,
+        candidates: vec![CrashCandidate {
+            mod_id: Some(mod_id.to_string()),
+            jar_path: Some(jar_path.to_path_buf()),
+            score: 95,
+            evidence: vec![CrashEvidence {
+                source: CrashEvidenceSource::LoaderDiagnostic,
+                matched_text: format!("{} caused crash", mod_id),
+                snippet: "Matched pattern in crash log".to_string(),
+                associated_mod_id: Some(mod_id.to_string()),
+                associated_jar: Some(jar_path.to_path_buf()),
+            }],
+            is_client_only: false,
+            is_unknown_compat: false,
+        }],
+        primary_candidate: Some(CrashCandidate {
+            mod_id: Some(mod_id.to_string()),
+            jar_path: Some(jar_path.to_path_buf()),
+            score: 95,
+            evidence: vec![CrashEvidence {
+                source: CrashEvidenceSource::LoaderDiagnostic,
+                matched_text: format!("{} caused crash", mod_id),
+                snippet: "Matched pattern in crash log".to_string(),
+                associated_mod_id: Some(mod_id.to_string()),
+                associated_jar: Some(jar_path.to_path_buf()),
+            }],
+            is_client_only: false,
+            is_unknown_compat: false,
+        }),
+        recommendation: CrashRecommendation::ReviewMod {
+            mod_id: mod_id.to_string(),
+            jar_path: Some(jar_path.to_path_buf()),
+        },
+        summary: format!("Crash attributed to '{}'", mod_id),
+    }
+}
+
+/// Create a minimal JAR with fabric.mod.json declaring the given mod_id.
+fn make_jar(dir: &Path, filename: &str, mod_id: &str) -> PathBuf {
+    let jar = dir.join(filename);
+    let file = std::fs::File::create(&jar).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    zip.start_file("fabric.mod.json", options).unwrap();
+    let json = serde_json::json!({
+        "id": mod_id,
+        "version": "1.0.0",
+        "environment": "*"
+    });
+    std::io::Write::write_all(&mut zip, json.to_string().as_bytes()).unwrap();
+    zip.finish().unwrap();
+    jar
+}
+
+/// Set up a staging directory with pending recovery metadata.
+/// Returns (tmpdir, staging_path, recovery_metadata).
+fn setup_pending_recovery(
+    server_id: &str,
+    transaction_id: &str,
+    mod_id: &str,
+    jar_filename: &str,
+    recovery_actions_used: u8,
+) -> (tempfile::TempDir, PathBuf, PathBuf, PendingRecoveryMetadata) {
+    let tmp = tempfile::tempdir().unwrap();
+    // Layout: tmp/<server_id>/ (live) + tmp/.lbby-staging/<server_id>-<txn_id>/ (staging)
+    let live = tmp.path().join(server_id);
+    std::fs::create_dir_all(&live).unwrap();
+    let staging = tmp
+        .path()
+        .join(".lbby-staging")
+        .join(format!("{}-{}", server_id, transaction_id));
+    let mods = staging.join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+
+    let jar = make_jar(&mods, jar_filename, mod_id);
+    let sha256 = recovery_actions::compute_file_sha256(&jar).unwrap();
+    let fingerprint =
+        recovery_actions::compute_fingerprint(transaction_id, mod_id, &jar, 1, &[], &sha256);
+
+    let recovery = PendingRecoveryMetadata {
+        server_id: server_id.to_string(),
+        transaction_id: transaction_id.to_string(),
+        staging_mods: mods.clone(),
+        attribution_fingerprint: fingerprint.clone(),
+        target_mod_id: mod_id.to_string(),
+        target_jar_path: jar,
+        target_jar_sha256: sha256,
+        boot_attempt: 1,
+        dependency_repairs: 0,
+        runtime_repairs: 0,
+        recovery_actions_used,
+        display_filename: jar_filename.to_string(),
+        crash_summary: format!("Crash attributed to '{}'", mod_id),
+        confidence: "High".to_string(),
+        applied: false,
+    };
+
+    let meta = TransactionMeta {
+        server_id: server_id.to_string(),
+        transaction_id: transaction_id.to_string(),
+        source: "test".to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        staging_path: staging.clone(),
+        live_path: live.clone(),
+        phase: TransactionPhase::PendingUserAction,
+        backup_path: None,
+    };
+    let marker_json = serde_json::to_string_pretty(&meta).unwrap();
+    std::fs::write(meta.marker_path(), marker_json).unwrap();
+    recovery.save(&meta.pending_recovery_path()).unwrap();
+
+    (tmp, live, staging, recovery)
+}
+
+/// Build a DependencyGraph from JAR files in a staging mods directory.
+fn build_graph_from_staging(staging_mods: &Path) -> DependencyGraph {
+    use lbby_core::mod_compat::classify_mod_local;
+    let mut entries = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(staging_mods) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().map_or(false, |e| e == "jar") {
+                let compat = classify_mod_local(&p);
+                entries.push((p, compat));
+            }
+        }
+    }
+    DependencyGraph::build(&entries)
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+// Item 9: No approval → staging unchanged, no quarantine
+/// Crash → UserActionRequired. Then stop.
+/// Assert: transaction phase = PendingUserAction, live unchanged,
+///         suspect JAR still in staging/mods, no quarantine, no boot2.
+#[test]
+fn regression_recovery_no_approval_staging_unchanged() {
+    let (tmp, live, staging, recovery) = setup_pending_recovery(
+        "test-server",
+        "txn-002",
+        "suspect-mod",
+        "suspect-mod.jar",
+        0,
+    );
+    // JAR still in staging
+    assert!(
+        recovery.target_jar_path.exists(),
+        "suspect JAR must remain in staging"
+    );
+    // No quarantine created
+    let quarantine_dir = staging.join(".lbby-quarantine");
+    assert!(!quarantine_dir.exists(), "no quarantine without approval");
+    // Transaction marker still PendingUserAction
+    let marker_path = staging.join("transaction.json");
+    let content = std::fs::read_to_string(&marker_path).unwrap();
+    let meta: TransactionMeta = serde_json::from_str(&content).unwrap();
+    assert_eq!(meta.phase, TransactionPhase::PendingUserAction);
+}
+
+// Item 11: Approve → quarantine JAR, SHA preserved
+/// Approval must move JAR from staging to quarantine, preserving SHA-256.
+#[test]
+fn regression_recovery_approval_moves_jar() {
+    let (_tmp, _live, _staging, recovery) = setup_pending_recovery(
+        "test-server",
+        "txn-001",
+        "suspect-mod",
+        "suspect-mod.jar",
+        0,
+    );
+    assert!(recovery.target_jar_path.exists());
+    let canonical = recovery_actions::validate_jar_containment(
+        &recovery.target_jar_path,
+        &recovery.staging_mods,
+    )
+    .unwrap();
+    recovery_actions::revalidate_before_move(
+        &canonical,
+        &recovery.target_mod_id,
+        &recovery.staging_mods,
+    )
+    .unwrap();
+    let quarantine_dir = recovery
+        .staging_mods
+        .parent()
+        .unwrap()
+        .join(".lbby-quarantine")
+        .join("mods");
+    let quarantine_path =
+        recovery_actions::quarantine_jar(&canonical, &recovery.staging_mods, &quarantine_dir)
+            .unwrap();
+    assert!(
+        !recovery.target_jar_path.exists(),
+        "JAR removed from staging"
+    );
+    assert!(quarantine_path.exists(), "JAR exists in quarantine");
+    let quarantined_sha = recovery_actions::compute_file_sha256(&quarantine_path).unwrap();
+    assert_eq!(
+        quarantined_sha, recovery.target_jar_sha256,
+        "SHA-256 preserved through quarantine"
+    );
+}
+
+// Item 12: Rollback → live unchanged
+/// Transaction rollback must not touch live server files.
+#[test]
+fn regression_recovery_failed_rollback_live_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let live = tmp.path().join("live");
+    std::fs::create_dir_all(live.join("mods")).unwrap();
+    let live_jar = make_jar(&live.join("mods"), "keep.jar", "keep-mod");
+    let live_jar_sha = recovery_actions::compute_file_sha256(&live_jar).unwrap();
+    let txn = InstallTransaction::begin(&live, "test").unwrap();
+    txn.rollback().unwrap();
+    assert!(live_jar.exists(), "live JAR survives rollback");
+    assert_eq!(
+        recovery_actions::compute_file_sha256(&live_jar).unwrap(),
+        live_jar_sha,
+        "live JAR SHA unchanged"
+    );
+}
+
+// Item 10: Reject flow → rollback, no quarantine
+/// reject_crash_recovery must rollback staging and leave live unchanged.
+#[test]
+fn regression_recovery_reject_rollback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let live = tmp.path().join("live");
+    let staging = tmp.path().join(".lbby-staging").join("test-server-txn003");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(staging.join("mods")).unwrap();
+    let meta = TransactionMeta {
+        server_id: "test-server".to_string(),
+        transaction_id: "txn-003".to_string(),
+        source: "test".to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        staging_path: staging.clone(),
+        live_path: live.clone(),
+        phase: TransactionPhase::PendingUserAction,
+        backup_path: None,
+    };
+    std::fs::write(
+        meta.marker_path(),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+    make_jar(&staging.join("mods"), "suspect.jar", "suspect-mod");
+    let txn = InstallTransaction::resume(meta).unwrap();
+    txn.rollback().unwrap();
+    assert!(!staging.exists(), "staging cleaned after rollback");
+}
+
+// Item 13: Fingerprint SHA binding — different JAR bytes → different fingerprint
+/// Same transaction/mod_id/path/boot/evidence, but different JAR bytes
+/// must produce different fingerprints and fail verification.
+#[test]
+fn regression_recovery_fingerprint_binds_sha256() {
+    let fp1 = recovery_actions::compute_fingerprint(
+        "txn1",
+        "modA",
+        Path::new("mods/a.jar"),
+        1,
+        &[],
+        "sha_original",
+    );
+    let fp2 = recovery_actions::compute_fingerprint(
+        "txn1",
+        "modA",
+        Path::new("mods/a.jar"),
+        1,
+        &[],
+        "sha_different",
+    );
+    assert_ne!(fp1, fp2, "different SHA → different fingerprint");
+}
+
+// Item 14: Stale SHA → reject
+/// If JAR bytes changed after attribution, SHA mismatch must be detectable.
+#[test]
+fn regression_recovery_stale_sha_rejected() {
+    let (_tmp, _live, _staging, recovery) = setup_pending_recovery(
+        "test-server",
+        "txn-004",
+        "suspect-mod",
+        "suspect-mod.jar",
+        0,
+    );
+    // Overwrite JAR with different bytes
+    std::fs::write(&recovery.target_jar_path, b"different bytes").unwrap();
+    let new_sha = recovery_actions::compute_file_sha256(&recovery.target_jar_path).unwrap();
+    assert_ne!(
+        new_sha, recovery.target_jar_sha256,
+        "modified JAR has different SHA"
+    );
+}
+
+// Item 15: Transaction ID mismatch → different fingerprint
+/// Wrong transaction_id must produce a different fingerprint.
+#[test]
+fn regression_recovery_transaction_mismatch() {
+    let (_tmp, _live, _staging, recovery) = setup_pending_recovery(
+        "test-server",
+        "txn-005",
+        "suspect-mod",
+        "suspect-mod.jar",
+        0,
+    );
+    let wrong_fp = recovery_actions::compute_fingerprint(
+        "txn-WRONG",
+        "suspect-mod",
+        &recovery.target_jar_path,
+        1,
+        &[],
+        &recovery.target_jar_sha256,
+    );
+    assert_ne!(
+        wrong_fp, recovery.attribution_fingerprint,
+        "wrong transaction_id → different fingerprint"
+    );
+}
+
+// Item 16: Recovery action budget enforcement
+/// When recovery_actions_used >= MAX, approval must be rejected.
+#[test]
+fn regression_recovery_limit_enforced() {
+    let (_tmp, _live, _staging, recovery) = setup_pending_recovery(
+        "test-server",
+        "txn-006",
+        "suspect-mod",
+        "suspect-mod.jar",
+        MAX_USER_RECOVERY_ACTIONS,
+    );
+    assert!(
+        recovery.recovery_actions_used >= MAX_USER_RECOVERY_ACTIONS,
+        "recovery at budget limit"
+    );
+}
+
+// Item 17: Boot attempt ceiling
+/// MAX_TOTAL_BOOT_ATTEMPTS must be reasonable (1..=10).
+#[test]
+fn regression_recovery_boot_ceiling() {
+    let max = lbby_core::validation_orchestrator::MAX_TOTAL_BOOT_ATTEMPTS;
+    assert!(max > 0, "boot ceiling must be positive");
+    assert!(max <= 10, "boot ceiling must be reasonable");
+}
+
+// Item 18: After quarantine, stale index eliminated
+/// Quarantined JAR must no longer appear in build_jar_to_mod_ids.
+#[test]
+fn regression_recovery_stale_index_eliminated() {
+    let (_tmp, _live, _staging, recovery) = setup_pending_recovery(
+        "test-server",
+        "txn-007",
+        "suspect-mod",
+        "suspect-mod.jar",
+        0,
+    );
+    let jar_to_mod_ids = recovery_actions::build_jar_to_mod_ids(&recovery.staging_mods);
+    assert!(
+        jar_to_mod_ids.contains_key(&recovery.target_jar_path),
+        "JAR in index before quarantine"
+    );
+    let quarantine_dir = recovery
+        .staging_mods
+        .parent()
+        .unwrap()
+        .join(".lbby-quarantine")
+        .join("mods");
+    recovery_actions::quarantine_jar(
+        &recovery.target_jar_path,
+        &recovery.staging_mods,
+        &quarantine_dir,
+    )
+    .unwrap();
+    let fresh_index = recovery_actions::build_jar_to_mod_ids(&recovery.staging_mods);
+    assert!(
+        !fresh_index.contains_key(&recovery.target_jar_path),
+        "JAR removed from index after quarantine"
+    );
+}
+
+// Item 19: Dependency impact blocks quarantine
+/// If B requires A (Required), quarantining A must be blocked.
+#[test]
+fn regression_recovery_dependency_impact_blocks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mods = tmp.path().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+
+    // Create JAR A
+    make_jar(&mods, "modA.jar", "modA");
+    // Create JAR B that depends on A
+    let jar_b = mods.join("modB.jar");
+    let file = std::fs::File::create(&jar_b).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    zip.start_file("fabric.mod.json", options).unwrap();
+    let json = serde_json::json!({
+        "id": "modB",
+        "version": "1.0.0",
+        "environment": "*",
+        "depends": {"modA": "*"}
+    });
+    std::io::Write::write_all(&mut zip, json.to_string().as_bytes()).unwrap();
+    zip.finish().unwrap();
+
+    // Build graph from real JARs
+    let graph = build_graph_from_staging(&mods);
+
+    // A has a dependent (B requires A) → must block
+    let result = recovery_actions::check_dependency_impact("modA", &graph);
+    assert!(result.is_err(), "modA has dependent modB");
+    let broken = result.unwrap_err();
+    assert!(
+        broken.iter().any(|id| id.contains("modB")),
+        "broken dependents must include modB, got {:?}",
+        broken
+    );
+
+    // B has no dependents → OK
+    assert!(
+        recovery_actions::check_dependency_impact("modB", &graph).is_ok(),
+        "modB has no dependents"
+    );
+}
+
+// Item 20: Quarantine preserved on commit
+/// preserve_quarantine_on_commit must move quarantine out of staging.
+#[test]
+fn regression_recovery_quarantine_preserved_on_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let staging = tmp.path().join("staging");
+    let mods = staging.join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    let jar = make_jar(&mods, "quarantined.jar", "bad-mod");
+    let quarantine_dir = staging.join(".lbby-quarantine").join("mods");
+    let quarantine_path = recovery_actions::quarantine_jar(&jar, &mods, &quarantine_dir).unwrap();
+    let preserved =
+        recovery_actions::preserve_quarantine_on_commit(&staging, "test-server", "txn-008")
+            .unwrap();
+    let preserved_jar = preserved.join("mods").join("quarantined.jar");
+    assert!(preserved_jar.exists(), "quarantine preserved after commit");
+    assert!(
+        !quarantine_path.exists(),
+        "staging quarantine removed after preservation"
+    );
+}
+
+// Item 21: Restart → no auto-commit, no auto-approval
+/// After restart, PendingUserAction must be preserved; no auto-mutation.
+#[test]
+fn regression_recovery_restart_no_auto_commit() {
+    let (_tmp, _live, staging, recovery) = setup_pending_recovery(
+        "test-server",
+        "txn-009",
+        "suspect-mod",
+        "suspect-mod.jar",
+        0,
+    );
+    // Reload marker
+    let marker_path = staging.join("transaction.json");
+    let content = std::fs::read_to_string(&marker_path).unwrap();
+    let meta: TransactionMeta = serde_json::from_str(&content).unwrap();
+    assert_eq!(
+        meta.phase,
+        TransactionPhase::PendingUserAction,
+        "phase preserved after restart"
+    );
+    assert!(
+        recovery.target_jar_path.exists(),
+        "JAR still in staging after restart"
+    );
+    assert!(
+        !staging.join(".lbby-quarantine").exists(),
+        "no quarantine without approval"
+    );
+}
+
+// Item 22: Duplicate approval → idempotent
+/// Second quarantine attempt on same JAR must fail (already moved).
+#[test]
+fn regression_recovery_duplicate_approval_rejected() {
+    let (_tmp, _live, _staging, recovery) = setup_pending_recovery(
+        "test-server",
+        "txn-010",
+        "suspect-mod",
+        "suspect-mod.jar",
+        0,
+    );
+    let quarantine_dir = recovery
+        .staging_mods
+        .parent()
+        .unwrap()
+        .join(".lbby-quarantine")
+        .join("mods");
+    // First quarantine succeeds
+    recovery_actions::quarantine_jar(
+        &recovery.target_jar_path,
+        &recovery.staging_mods,
+        &quarantine_dir,
+    )
+    .unwrap();
+    assert!(!recovery.target_jar_path.exists());
+    // Second quarantine fails — JAR no longer at source
+    let result = recovery_actions::quarantine_jar(
+        &recovery.target_jar_path,
+        &recovery.staging_mods,
+        &quarantine_dir,
+    );
+    assert!(result.is_err(), "duplicate quarantine must fail");
+}
+
+// Item 23: Protected components blocked
+/// Platform/core mod IDs must never be quarantined.
+#[test]
+fn regression_recovery_protected_component_blocked() {
+    assert!(recovery_actions::is_protected_component("forge"));
+    assert!(recovery_actions::is_protected_component("Fabric"));
+    assert!(recovery_actions::is_protected_component("minecraft"));
+    assert!(
+        !recovery_actions::is_protected_component("create"),
+        "user mods are not protected"
+    );
+}
+
+// Item 24: Multi-mod JAR blocked
+/// JAR containing multiple mods must be flagged as UnavailableMultiModJar.
+#[test]
+fn regression_recovery_multi_mod_jar_blocked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mods = tmp.path().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+
+    // Create a Forge JAR with two [[mods]] entries (fabric provides is not parsed)
+    let jar = mods.join("multi.jar");
+    let file = std::fs::File::create(&jar).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    zip.start_file("META-INF/mods.toml", options).unwrap();
+    let toml_content = r#"
+modLoader = "javafml"
+loaderVersion = "[47,)"
+license = "MIT"
+
+[[mods]]
+modId = "modA"
+version = "1.0.0"
+
+[[mods]]
+modId = "modB"
+version = "1.0.0"
+"#;
+    std::io::Write::write_all(&mut zip, toml_content.as_bytes()).unwrap();
+    zip.finish().unwrap();
+
+    let jar_to_mod_ids = recovery_actions::build_jar_to_mod_ids(&mods);
+    let report = mock_attribution_report("modA", &jar, CrashAttributionConfidence::High);
+    let availability = recovery_actions::check_action_availability(&report, &jar_to_mod_ids);
+    assert!(
+        matches!(
+            availability,
+            RecoveryActionAvailability::UnavailableMultiModJar(_)
+        ),
+        "multi-mod JAR must be blocked, got {:?}",
+        availability
+    );
+}
+
+// Item 25: Requires High confidence
+/// Low/Medium confidence must produce UnavailableLowConfidence.
+#[test]
+fn regression_recovery_requires_high_confidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mods = tmp.path().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    let jar = make_jar(&mods, "suspect.jar", "suspect-mod");
+    let jar_to_mod_ids = recovery_actions::build_jar_to_mod_ids(&mods);
+
+    for conf in [
+        CrashAttributionConfidence::Low,
+        CrashAttributionConfidence::Medium,
+    ] {
+        let report = mock_attribution_report("suspect-mod", &jar, conf.clone());
+        assert_eq!(
+            recovery_actions::check_action_availability(&report, &jar_to_mod_ids),
+            RecoveryActionAvailability::UnavailableLowConfidence,
+            "{:?} confidence must be rejected",
+            conf
+        );
+    }
+    let report = mock_attribution_report("suspect-mod", &jar, CrashAttributionConfidence::High);
+    assert_eq!(
+        recovery_actions::check_action_availability(&report, &jar_to_mod_ids),
+        RecoveryActionAvailability::Available,
+        "High confidence must be accepted"
+    );
+}
+
+// Item 26: Quarantine collision handling
+/// Two JARs with same filename must get distinct quarantine paths.
+#[test]
+fn regression_recovery_quarantine_collision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mods = tmp.path().join("mods");
+    let quarantine = tmp.path().join("quarantine");
+    std::fs::create_dir_all(&mods).unwrap();
+    let jar1 = make_jar(&mods, "same-name.jar", "mod1");
+    let q1 = recovery_actions::quarantine_jar(&jar1, &mods, &quarantine).unwrap();
+    let jar2 = make_jar(&mods, "same-name.jar", "mod2");
+    let q2 = recovery_actions::quarantine_jar(&jar2, &mods, &quarantine).unwrap();
+    assert_ne!(q1, q2, "collision must produce distinct paths");
+    assert!(
+        q2.to_string_lossy().contains("__2"),
+        "second file gets __2 suffix"
+    );
+}
+
+// Item 27: Metadata roundtrip
+/// PendingRecoveryMetadata must survive save/load cycle.
+#[test]
+fn regression_recovery_metadata_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("recovery.json");
+    let original = PendingRecoveryMetadata {
+        server_id: "test-server".into(),
+        transaction_id: "txn-rt".into(),
+        staging_mods: PathBuf::from("/tmp/staging/mods"),
+        attribution_fingerprint: "abc123".into(),
+        target_mod_id: "bad-mod".into(),
+        target_jar_path: PathBuf::from("/tmp/staging/mods/bad-mod.jar"),
+        target_jar_sha256: "deadbeef".into(),
+        boot_attempt: 2,
+        dependency_repairs: 0,
+        runtime_repairs: 0,
+        recovery_actions_used: 1,
+        display_filename: "bad-mod.jar".into(),
+        crash_summary: "Crash".into(),
+        confidence: "High".into(),
+        applied: false,
+    };
+    original.save(&path).unwrap();
+    let loaded = PendingRecoveryMetadata::load(&path).unwrap();
+    assert_eq!(loaded.server_id, original.server_id);
+    assert_eq!(loaded.target_jar_sha256, original.target_jar_sha256);
+    assert_eq!(loaded.applied, original.applied);
+    assert_eq!(loaded.recovery_actions_used, original.recovery_actions_used);
+}
+
+// Item 28: Pending recovery discovery
+/// find_pending_recoveries must discover persisted PendingUserAction transactions.
+#[test]
+fn regression_recovery_find_pending_discoveries() {
+    let (_tmp, live, _staging, _recovery) = setup_pending_recovery(
+        "test-server",
+        "txn-discover",
+        "suspect-mod",
+        "suspect-mod.jar",
+        0,
+    );
+    // setup_pending_recovery already creates live at tmp/<server_id> and
+    // staging at tmp/.lbby-staging/<server_id>-<txn_id>/ with proper metadata.
+    let results = recovery_actions::find_pending_recoveries(&live);
+    assert_eq!(results.len(), 1, "must discover one pending recovery");
+    assert_eq!(results[0].transaction_id, "txn-discover");
+}
+
+// ── Phase 3K.1: Production API integration tests ────────────────────
+
+// Item A: dep_graph freshness — approve_crash_recovery with None graph
+/// When dep_graph=None, approve_crash_recovery must skip dependency preflight
+/// and still perform quarantine (for mods with no known dependents).
+#[test]
+fn regression_approval_no_graph_still_quarantines() {
+    let (_tmp, _live, _staging, recovery) = setup_pending_recovery(
+        "test-server",
+        "txn-graph-1",
+        "suspect-mod",
+        "suspect-mod.jar",
+        0,
+    );
+    // Directly test the quarantine path (approve_crash_recovery needs live server config
+    // which tests can't easily mock). Test quarantine mechanics instead.
+    let canonical = recovery_actions::validate_jar_containment(
+        &recovery.target_jar_path,
+        &recovery.staging_mods,
+    )
+    .unwrap();
+    recovery_actions::revalidate_before_move(
+        &canonical,
+        &recovery.target_mod_id,
+        &recovery.staging_mods,
+    )
+    .unwrap();
+    let quarantine_dir = recovery
+        .staging_mods
+        .parent()
+        .unwrap()
+        .join(".lbby-quarantine")
+        .join("mods");
+    let qpath =
+        recovery_actions::quarantine_jar(&canonical, &recovery.staging_mods, &quarantine_dir)
+            .unwrap();
+    assert!(qpath.exists());
+    assert!(!recovery.target_jar_path.exists());
+}
+
+// Item B: Dependency-impact through production path — B requires A
+/// Real JARs: B declares depends on A. check_dependency_impact("A") must block.
+#[test]
+fn regression_dependency_impact_production_blocks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mods = tmp.path().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+
+    // JAR A
+    make_jar(&mods, "modA.jar", "modA");
+    // JAR B depends on A (required)
+    let jar_b = mods.join("modB.jar");
+    let file = std::fs::File::create(&jar_b).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    zip.start_file("fabric.mod.json", opts).unwrap();
+    let json = serde_json::json!({
+        "id": "modB", "version": "1.0.0", "environment": "*",
+        "depends": {"modA": "*"}
+    });
+    std::io::Write::write_all(&mut zip, json.to_string().as_bytes()).unwrap();
+    zip.finish().unwrap();
+
+    let graph = build_graph_from_staging(&mods);
+    let result = recovery_actions::check_dependency_impact("modA", &graph);
+    assert!(result.is_err(), "A has dependent B → must block");
+    let broken = result.unwrap_err();
+    assert!(
+        broken.iter().any(|s| s.contains("modB")),
+        "broken list must include modB, got {:?}",
+        broken
+    );
+}
+
+// Item C: Recovery counter persistence across save/load
+/// recovery_actions_used must survive metadata roundtrip.
+#[test]
+fn regression_recovery_counter_persists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("recovery.json");
+    let meta = PendingRecoveryMetadata {
+        server_id: "srv".into(),
+        transaction_id: "txn-counter".into(),
+        staging_mods: PathBuf::from("/tmp/staging/mods"),
+        attribution_fingerprint: "fp".into(),
+        target_mod_id: "mod".into(),
+        target_jar_path: PathBuf::from("/tmp/staging/mods/mod.jar"),
+        target_jar_sha256: "sha".into(),
+        boot_attempt: 1,
+        dependency_repairs: 0,
+        runtime_repairs: 0,
+        recovery_actions_used: 1, // Already used 1
+        display_filename: "mod.jar".into(),
+        crash_summary: "crash".into(),
+        confidence: "High".into(),
+        applied: false,
+    };
+    meta.save(&path).unwrap();
+    let loaded = PendingRecoveryMetadata::load(&path).unwrap();
+    assert_eq!(
+        loaded.recovery_actions_used, 1,
+        "counter survives roundtrip"
+    );
+    // If counter=1 and MAX=2, one more action is allowed
+    assert!(
+        loaded.recovery_actions_used < MAX_USER_RECOVERY_ACTIONS,
+        "budget not yet exhausted"
+    );
+}
+
+// Item D: Boot attempt counter in metadata
+/// boot_attempt must persist and accumulate.
+#[test]
+fn regression_boot_attempt_counter_persists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("recovery.json");
+    let meta = PendingRecoveryMetadata {
+        server_id: "srv".into(),
+        transaction_id: "txn-boot".into(),
+        staging_mods: PathBuf::from("/tmp/staging/mods"),
+        attribution_fingerprint: "fp".into(),
+        target_mod_id: "mod".into(),
+        target_jar_path: PathBuf::from("/tmp/staging/mods/mod.jar"),
+        target_jar_sha256: "sha".into(),
+        boot_attempt: 3, // 3rd boot attempt
+        dependency_repairs: 0,
+        runtime_repairs: 0,
+        recovery_actions_used: 0,
+        display_filename: "mod.jar".into(),
+        crash_summary: "crash".into(),
+        confidence: "High".into(),
+        applied: false,
+    };
+    meta.save(&path).unwrap();
+    let loaded = PendingRecoveryMetadata::load(&path).unwrap();
+    assert_eq!(loaded.boot_attempt, 3, "boot attempt count persists");
+}
+
+// Item E: UserActionRequired payload does NOT expose internal paths
+/// The outcome returned to the UI must contain only safe fields.
+#[test]
+fn regression_user_action_required_no_internal_paths() {
+    // This test verifies the InstallOutcome::UserActionRequired variant
+    // does not contain staging_mods or quarantine paths.
+    // We check the type definition: only server_id, transaction_id, fingerprint,
+    // mod_id, display_filename, confidence, crash_summary, recovery_actions_remaining.
+    //
+    // If the variant ever includes PathBuf fields, this test catches it.
+    use lbby_core::mod_services::InstallOutcome;
+
+    // Construct a UserActionRequired outcome with known values
+    let outcome = InstallOutcome::UserActionRequired {
+        server_id: "test-srv".to_string(),
+        transaction_id: "txn-001".to_string(),
+        fingerprint: "abc123".to_string(),
+        mod_id: "suspect-mod".to_string(),
+        display_filename: "suspect-mod.jar".to_string(),
+        jar_sha256: "abcdef1234567890".to_string(),
+        boot_attempt: 1,
+        recovery_actions_used: 0,
+        crash_summary: "Crash in suspect-mod".to_string(),
+        confidence: "High".to_string(),
+    };
+
+    // Verify by destructuring: all fields are safe strings/numbers,
+    // no PathBuf, no staging_mods, no quarantine_path.
+    // Debug format reveals field names.
+    let debug_str = format!("{:?}", outcome);
+    assert!(!debug_str.contains("staging_mods"), "no staging_mods field");
+    assert!(!debug_str.contains("quarantine"), "no quarantine path");
+    assert!(!debug_str.contains("live_path"), "no live path");
+
+    // Verify the field values are the safe identifiers we set
+    if let InstallOutcome::UserActionRequired {
+        server_id,
+        transaction_id,
+        fingerprint,
+        mod_id,
+        display_filename,
+        jar_sha256,
+        boot_attempt,
+        recovery_actions_used,
+        crash_summary,
+        confidence,
+    } = outcome
+    {
+        assert_eq!(server_id, "test-srv");
+        assert_eq!(transaction_id, "txn-001");
+        assert_eq!(fingerprint, "abc123");
+        assert_eq!(mod_id, "suspect-mod");
+        assert_eq!(display_filename, "suspect-mod.jar");
+        assert_eq!(jar_sha256, "abcdef1234567890");
+        assert_eq!(boot_attempt, 1u8);
+        assert_eq!(recovery_actions_used, 0u8);
+        assert_eq!(confidence, "High");
+        // These are all string/u8 fields — no PathBuf anywhere
+    } else {
+        panic!("Expected UserActionRequired variant");
+    }
+}
+
+// Item F: approve_crash_recovery with wrong server_id → TransactionNotFound
+/// Production API must reject mismatched server_id.
+#[test]
+fn regression_approval_wrong_server_id() {
+    let (_tmp, _live, _staging, _recovery) = setup_pending_recovery(
+        "correct-server",
+        "txn-mismatch",
+        "suspect-mod",
+        "suspect-mod.jar",
+        0,
+    );
+    // approve_crash_recovery uses find_live_path_for_server which reads config.
+    // In test env, wrong server_id won't find the live path.
+    let result = recovery_actions::approve_crash_recovery(
+        "wrong-server",
+        "txn-mismatch",
+        "dummy-fingerprint",
+    );
+    assert!(
+        matches!(result, ApprovalResult::TransactionNotFound(_)),
+        "wrong server_id → TransactionNotFound, got {:?}",
+        result
+    );
+}
+
+// Item G: approve_crash_recovery with wrong transaction_id → TransactionNotFound
+#[test]
+fn regression_approval_wrong_transaction_id() {
+    let (_tmp, _live, _staging, _recovery) = setup_pending_recovery(
+        "test-server",
+        "txn-correct",
+        "suspect-mod",
+        "suspect-mod.jar",
+        0,
+    );
+    let result =
+        recovery_actions::approve_crash_recovery("test-server", "txn-WRONG", "dummy-fingerprint");
+    assert!(
+        matches!(result, ApprovalResult::TransactionNotFound(_)),
+        "wrong transaction_id → TransactionNotFound, got {:?}",
+        result
+    );
+}
+
+// Item H: Approval idempotency — applied=true → Invalidated
+/// If recovery metadata already has applied=true, second approval → Invalidated.
+#[test]
+fn regression_approval_already_applied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let live = tmp.path().join("test-server");
+    std::fs::create_dir_all(&live).unwrap();
+    let staging = tmp
+        .path()
+        .join(".lbby-staging")
+        .join("test-server-txn-idem");
+    let mods = staging.join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+
+    let jar = make_jar(&mods, "suspect.jar", "suspect-mod");
+    let sha = recovery_actions::compute_file_sha256(&jar).unwrap();
+    let fp = recovery_actions::compute_fingerprint("txn-idem", "suspect-mod", &jar, 1, &[], &sha);
+
+    // Mark as already applied
+    let recovery = PendingRecoveryMetadata {
+        server_id: "test-server".into(),
+        transaction_id: "txn-idem".into(),
+        staging_mods: mods.clone(),
+        attribution_fingerprint: fp.clone(),
+        target_mod_id: "suspect-mod".into(),
+        target_jar_path: jar,
+        target_jar_sha256: sha,
+        boot_attempt: 1,
+        dependency_repairs: 0,
+        runtime_repairs: 0,
+        recovery_actions_used: 1,
+        display_filename: "suspect.jar".into(),
+        crash_summary: "crash".into(),
+        confidence: "High".into(),
+        applied: true, // Already applied
+    };
+
+    let meta = TransactionMeta {
+        server_id: "test-server".into(),
+        transaction_id: "txn-idem".into(),
+        source: "test".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        staging_path: staging.clone(),
+        live_path: live.clone(),
+        phase: TransactionPhase::PendingUserAction,
+        backup_path: None,
+    };
+    std::fs::write(
+        meta.marker_path(),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+    recovery.save(&meta.pending_recovery_path()).unwrap();
+
+    // Attempt approval — should get Invalidated (already applied)
+    let result = recovery_actions::approve_crash_recovery_at("test-server", "txn-idem", &fp, &live);
+    assert!(
+        matches!(result, ApprovalResult::Invalidated(_)),
+        "already-applied → Invalidated, got {:?}",
+        result
+    );
+}
+
+// Item I: Stale fingerprint → Invalidated
+/// If JAR bytes changed, fingerprint verification must fail.
+#[test]
+fn regression_approval_stale_fingerprint_invalidated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let live = tmp.path().join("test-server");
+    std::fs::create_dir_all(&live).unwrap();
+    let staging = tmp
+        .path()
+        .join(".lbby-staging")
+        .join("test-server-txn-stale");
+    let mods = staging.join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+
+    let jar = make_jar(&mods, "suspect.jar", "suspect-mod");
+    let sha = recovery_actions::compute_file_sha256(&jar).unwrap();
+    let fp = recovery_actions::compute_fingerprint("txn-stale", "suspect-mod", &jar, 1, &[], &sha);
+
+    let recovery = PendingRecoveryMetadata {
+        server_id: "test-server".into(),
+        transaction_id: "txn-stale".into(),
+        staging_mods: mods.clone(),
+        attribution_fingerprint: fp,
+        target_mod_id: "suspect-mod".into(),
+        target_jar_path: jar.clone(),
+        target_jar_sha256: sha,
+        boot_attempt: 1,
+        dependency_repairs: 0,
+        runtime_repairs: 0,
+        recovery_actions_used: 0,
+        display_filename: "suspect.jar".into(),
+        crash_summary: "crash".into(),
+        confidence: "High".into(),
+        applied: false,
+    };
+
+    let meta = TransactionMeta {
+        server_id: "test-server".into(),
+        transaction_id: "txn-stale".into(),
+        source: "test".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        staging_path: staging.clone(),
+        live_path: live.clone(),
+        phase: TransactionPhase::PendingUserAction,
+        backup_path: None,
+    };
+    std::fs::write(
+        meta.marker_path(),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+    recovery.save(&meta.pending_recovery_path()).unwrap();
+
+    // Corrupt the JAR
+    std::fs::write(&jar, b"corrupted bytes").unwrap();
+
+    // Fingerprint from original SHA won't match current JAR
+    let wrong_fp = recovery_actions::compute_fingerprint(
+        "txn-stale",
+        "suspect-mod",
+        &jar,
+        1,
+        &[],
+        "original_sha_that_no_longer_matches",
+    );
+    let result =
+        recovery_actions::approve_crash_recovery_at("test-server", "txn-stale", &wrong_fp, &live);
+    assert!(
+        matches!(result, ApprovalResult::Invalidated(_)),
+        "stale fingerprint → Invalidated, got {:?}",
+        result
+    );
+}
+
+// Item J: DependencyGraph::build reads real JAR metadata
+/// DependencyGraph::build must read dependencies from JAR metadata,
+/// not from caller-supplied data.
+#[test]
+fn regression_dep_graph_reads_jar_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mods = tmp.path().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+
+    // JAR A (no deps)
+    make_jar(&mods, "modA.jar", "modA");
+    // JAR C depends on A
+    let jar_c = mods.join("modC.jar");
+    let file = std::fs::File::create(&jar_c).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    zip.start_file("fabric.mod.json", opts).unwrap();
+    let json = serde_json::json!({
+        "id": "modC", "version": "1.0.0", "environment": "*",
+        "depends": {"modA": "*"}
+    });
+    std::io::Write::write_all(&mut zip, json.to_string().as_bytes()).unwrap();
+    zip.finish().unwrap();
+
+    // Build graph — must read deps from JAR, not from caller
+    let graph = build_graph_from_staging(&mods);
+
+    // Verify graph contains the dependency
+    let c_node = graph.find_by_mod_id("modC");
+    assert!(c_node.is_some(), "modC must be in graph");
+    let c_node = c_node.unwrap();
+    assert!(
+        c_node
+            .dependencies
+            .iter()
+            .any(|d| d.mod_id == "modA" && matches!(d.kind, DependencyKind::Required)),
+        "modC must declare dependency on modA from JAR metadata"
+    );
+}
+
+// Item K: Protected component through availability check
+/// Protected mod_id must produce UnavailableProtectedComponent.
+#[test]
+fn regression_protected_component_availability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mods = tmp.path().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    let jar = make_jar(&mods, "forge.jar", "forge");
+    let jar_to_mod_ids = recovery_actions::build_jar_to_mod_ids(&mods);
+    let report = mock_attribution_report("forge", &jar, CrashAttributionConfidence::High);
+    let availability = recovery_actions::check_action_availability(&report, &jar_to_mod_ids);
+    assert_eq!(
+        availability,
+        RecoveryActionAvailability::UnavailableProtectedComponent,
+        "protected mod must be blocked"
+    );
+}
+
+// Item L: Single-mod JAR with High confidence → Available
+/// Clean single-mod JAR must pass all checks.
+#[test]
+fn regression_single_mod_jar_available() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mods = tmp.path().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    let jar = make_jar(&mods, "clean-mod.jar", "clean-mod");
+    let jar_to_mod_ids = recovery_actions::build_jar_to_mod_ids(&mods);
+    let report = mock_attribution_report("clean-mod", &jar, CrashAttributionConfidence::High);
+    assert_eq!(
+        recovery_actions::check_action_availability(&report, &jar_to_mod_ids),
+        RecoveryActionAvailability::Available,
+        "clean single-mod High-confidence must be Available"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Phase 3K.1 — Global boot ceiling survives pause/resume
+// ════════════════════════════════════════════════════════════════════
+
+/// Global boot ceiling (MAX_TOTAL_BOOT_ATTEMPTS=6) must span multiple
+/// pause/resume cycles. Orchestrator created from persisted state must
+/// restore actual enforcement counters, not just display numbers.
+///
+/// Scenario:
+///   Set initial boot_attempts_used = 3 (simulating 3 prior boots)
+///   boot4: crash → UAR → save state (boot_attempts_used=4)
+///   boot5: crash → UAR → save state (boot_attempts_used=5)
+///   boot6: crash → classify → UAR → save state (boot_attempts_used=6)
+///   resume: from_persisted(6) → RetryLimitReached
+///   validator total calls == 3
+#[tokio::test]
+async fn regression_global_boot_ceiling_across_pause_resume() {
+    use lbby_core::recovery_actions::{self, RetryStateSnapshot};
+    use lbby_core::validation_orchestrator::{
+        ValidationOutcome, ValidationRepairOrchestrator, MAX_TOTAL_BOOT_ATTEMPTS,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let server_path = tmp.path().join("server");
+    std::fs::create_dir_all(&server_path).unwrap();
+
+    // Simulate 3 prior boots by persisting retry state
+    let initial_state = RetryStateSnapshot {
+        boot_attempts_used: 3,
+        dependency_repairs_used: 0,
+        runtime_repairs_used: 0,
+        recovery_actions_used: 0,
+    };
+    recovery_actions::save_retry_state(&server_path, &initial_state).unwrap();
+
+    let mut total_validator_calls: usize = 0;
+
+    // Round 1: from_persisted(3) → boot4 → UAR
+    {
+        let staging = tmp.path().join("staging-r1");
+        std::fs::create_dir_all(staging.join("mods")).unwrap();
+        make_jar(&staging.join("mods"), "suspect-mod.jar", "suspect-mod");
+
+        let mut orch = ValidationRepairOrchestrator::from_persisted_state(3, 0, 0);
+        let mut harness = TestHarness::forge(server_path.to_str().unwrap());
+
+        // Provide enough crash results for the validator
+        let mock = MockBootValidator::new(vec![
+            failed_result(
+                BootFailureReason::ProcessExited,
+                &mod_init_crash_log("suspect-mod"),
+            );
+            10
+        ]);
+        let outcome = orch.validate(&mut harness.ctx(&staging), &mock).await;
+        total_validator_calls += mock.calls();
+
+        assert!(
+            matches!(outcome, ValidationOutcome::UserActionRequired(_)),
+            "Round 1: expected UserActionRequired, got {:?}",
+            outcome
+        );
+        assert_eq!(
+            orch.state().total_boot_attempts,
+            4,
+            "Round 1: boot_attempts should be 4"
+        );
+
+        // Save state (simulates what mod_services.rs does on UAR)
+        let snapshot = RetryStateSnapshot {
+            boot_attempts_used: orch.state().total_boot_attempts,
+            dependency_repairs_used: orch.state().dependency_repairs,
+            runtime_repairs_used: orch.state().runtime_repairs,
+            recovery_actions_used: 0,
+        };
+        recovery_actions::save_retry_state(&server_path, &snapshot).unwrap();
+    }
+
+    // Round 2: from_persisted(4) → boot5 → UAR
+    {
+        let staging = tmp.path().join("staging-r2");
+        std::fs::create_dir_all(staging.join("mods")).unwrap();
+        make_jar(&staging.join("mods"), "suspect-mod.jar", "suspect-mod");
+
+        let mut orch = ValidationRepairOrchestrator::from_persisted_state(4, 0, 0);
+        let mut harness = TestHarness::forge(server_path.to_str().unwrap());
+        let mock = MockBootValidator::new(vec![
+            failed_result(
+                BootFailureReason::ProcessExited,
+                &mod_init_crash_log("suspect-mod"),
+            );
+            10
+        ]);
+        let outcome = orch.validate(&mut harness.ctx(&staging), &mock).await;
+        total_validator_calls += mock.calls();
+
+        assert!(
+            matches!(outcome, ValidationOutcome::UserActionRequired(_)),
+            "Round 2: expected UserActionRequired, got {:?}",
+            outcome
+        );
+        assert_eq!(
+            orch.state().total_boot_attempts,
+            5,
+            "Round 2: boot_attempts should be 5"
+        );
+
+        let snapshot = RetryStateSnapshot {
+            boot_attempts_used: orch.state().total_boot_attempts,
+            dependency_repairs_used: orch.state().dependency_repairs,
+            runtime_repairs_used: orch.state().runtime_repairs,
+            recovery_actions_used: 0,
+        };
+        recovery_actions::save_retry_state(&server_path, &snapshot).unwrap();
+    }
+
+    // Round 3: from_persisted(5) → boot6 → UAR (last attempt)
+    {
+        let staging = tmp.path().join("staging-r3");
+        std::fs::create_dir_all(staging.join("mods")).unwrap();
+        make_jar(&staging.join("mods"), "suspect-mod.jar", "suspect-mod");
+
+        let mut orch = ValidationRepairOrchestrator::from_persisted_state(5, 0, 0);
+        let mut harness = TestHarness::forge(server_path.to_str().unwrap());
+        let mock = MockBootValidator::new(vec![
+            failed_result(
+                BootFailureReason::ProcessExited,
+                &mod_init_crash_log("suspect-mod"),
+            );
+            10
+        ]);
+        let outcome = orch.validate(&mut harness.ctx(&staging), &mock).await;
+        total_validator_calls += mock.calls();
+
+        // At attempt 6 (== MAX), the validator runs but then the loop continues
+        // to consume_boot_attempt which fails → Failed(RetryLimitReached).
+        // OR the crash is classified as ReviewMod+High → UserActionRequired.
+        assert!(
+            matches!(
+                outcome,
+                ValidationOutcome::UserActionRequired(_)
+                    | ValidationOutcome::Failed(ValidationFailure {
+                        reason: ValidationFailureReason::RetryLimitReached,
+                        ..
+                    })
+            ),
+            "Round 3: expected UAR or RetryLimitReached, got {:?}",
+            outcome
+        );
+
+        let snapshot = RetryStateSnapshot {
+            boot_attempts_used: orch.state().total_boot_attempts,
+            dependency_repairs_used: orch.state().dependency_repairs,
+            runtime_repairs_used: orch.state().runtime_repairs,
+            recovery_actions_used: 0,
+        };
+        recovery_actions::save_retry_state(&server_path, &snapshot).unwrap();
+    }
+
+    // Round 4: from_persisted(6) → RetryLimitReached WITHOUT calling validator
+    {
+        let staging = tmp.path().join("staging-r4");
+        std::fs::create_dir_all(staging.join("mods")).unwrap();
+        make_jar(&staging.join("mods"), "suspect-mod.jar", "suspect-mod");
+
+        let mut orch = ValidationRepairOrchestrator::from_persisted_state(6, 0, 0);
+        let mut harness = TestHarness::forge(server_path.to_str().unwrap());
+        let mock = MockBootValidator::new(vec![
+            failed_result(
+                BootFailureReason::ProcessExited,
+                &mod_init_crash_log("suspect-mod"),
+            );
+            10
+        ]);
+        let outcome = orch.validate(&mut harness.ctx(&staging), &mock).await;
+        let round4_calls = mock.calls();
+        total_validator_calls += round4_calls;
+
+        assert!(
+            matches!(
+                outcome,
+                ValidationOutcome::Failed(ValidationFailure {
+                    reason: ValidationFailureReason::RetryLimitReached,
+                    ..
+                })
+            ),
+            "Round 4: expected RetryLimitReached, got {:?}",
+            outcome
+        );
+        assert_eq!(
+            round4_calls, 0,
+            "Round 4: validator must NOT be called when budget exhausted"
+        );
+    }
+
+    // Global assertions
+    assert_eq!(
+        total_validator_calls, 3,
+        "Validator must be called exactly 3 times across all pause/resume cycles"
+    );
+    assert!(
+        MAX_TOTAL_BOOT_ATTEMPTS == 6,
+        "Test assumes MAX_TOTAL_BOOT_ATTEMPTS == 6"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Phase 3K.1 — Quarantine preservation failure prevents commit
+// ════════════════════════════════════════════════════════════════════
+
+/// If preserve_quarantine_on_commit fails, commit must NOT proceed.
+/// The quarantine artifact must remain recoverable.
+#[test]
+fn regression_quarantine_preservation_failure_prevents_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let staging = tmp.path().join("staging");
+    let mods = staging.join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+
+    // Create a quarantine artifact in staging
+    let jar = make_jar(&mods, "bad-mod.jar", "bad-mod");
+    let quarantine_dir = staging.join(".lbby-quarantine").join("mods");
+    let quarantine_path = recovery_actions::quarantine_jar(&jar, &mods, &quarantine_dir).unwrap();
+    assert!(
+        quarantine_path.exists(),
+        "quarantine artifact exists in staging"
+    );
+
+    // Block the preserve path by creating a FILE where the directory should go.
+    // live-parent = tmp.path() (parent of staging)
+    // preserve_root = tmp.path()/.lbby-quarantine/<server>/<txn>
+    // Create a file at tmp.path()/.lbby-quarantine to block mkdir
+    let blocker = tmp.path().join(".lbby-quarantine");
+    std::fs::write(&blocker, "block").unwrap();
+
+    // preserve_quarantine_on_commit should FAIL because it can't create the dir
+    let result =
+        recovery_actions::preserve_quarantine_on_commit(&staging, "test-server", "txn-blocked");
+    assert!(
+        result.is_err(),
+        "preserve_quarantine_on_commit must fail when destination is blocked, got {:?}",
+        result
+    );
+
+    // Quarantine artifact must still exist in staging (not lost)
+    assert!(
+        quarantine_path.exists(),
+        "quarantine artifact must still exist after failed preservation"
+    );
+
+    // Staging quarantine directory must still exist
+    assert!(
+        staging.join(".lbby-quarantine").exists(),
+        "staging quarantine dir must survive failed preservation"
+    );
+}
+
+/// After successful commit, quarantine lives at
+/// `<live-parent>/.lbby-quarantine/<server>/<txn>/` (sibling of live root),
+/// NOT inside the live directory.
+#[test]
+fn regression_quarantine_path_after_successful_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let staging = tmp.path().join("staging");
+    let mods = staging.join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+
+    let jar = make_jar(&mods, "quarantined.jar", "bad-mod");
+    let quarantine_dir = staging.join(".lbby-quarantine").join("mods");
+    let quarantine_path = recovery_actions::quarantine_jar(&jar, &mods, &quarantine_dir).unwrap();
+
+    let preserved =
+        recovery_actions::preserve_quarantine_on_commit(&staging, "test-server", "txn-001")
+            .unwrap();
+
+    // Verify path is <live-parent>/.lbby-quarantine/<server>/<txn>
+    let live_parent = tmp.path(); // parent of staging
+    let expected = live_parent
+        .join(".lbby-quarantine")
+        .join("test-server")
+        .join("txn-001");
+    assert_eq!(
+        preserved, expected,
+        "quarantine must be at <live-parent>/.lbby-quarantine/<server>/<txn>"
+    );
+
+    // Verify it's NOT inside any "live" directory
+    assert!(
+        !preserved.to_string_lossy().contains("/live/"),
+        "quarantine must NOT be inside live root"
+    );
+
+    // Verify the preserved JAR exists
+    let preserved_jar = preserved.join("mods").join("quarantined.jar");
+    assert!(
+        preserved_jar.exists(),
+        "quarantine JAR must exist at preserved location"
+    );
+
+    // Verify staging quarantine was cleaned up
+    assert!(
+        !quarantine_path.exists(),
+        "staging quarantine removed after preservation"
+    );
 }

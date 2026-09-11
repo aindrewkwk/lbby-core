@@ -116,6 +116,20 @@ impl ValidationRetryState {
         }
     }
 
+    /// Restore retry counters from persisted recovery metadata.
+    /// Used when resuming after user approval to continue the logical lifecycle.
+    pub fn from_persisted(boot_attempts: u8, dep_repairs: u8, runtime_repairs: u8) -> Self {
+        Self {
+            total_boot_attempts: boot_attempts,
+            dependency_repairs: dep_repairs,
+            runtime_repairs,
+            attempted_missing_mods: HashSet::new(),
+            attempted_java_paths: HashSet::new(),
+            attempted_memory_values: HashSet::new(),
+            attempted_java_majors: HashSet::new(),
+        }
+    }
+
     /// Check if we can attempt another boot (global ceiling).
     pub fn can_attempt_boot(&self) -> bool {
         self.total_boot_attempts < MAX_TOTAL_BOOT_ATTEMPTS
@@ -221,27 +235,37 @@ pub struct ValidationFailure {
     pub crash_report: Option<crate::crash_attribution::CrashAttributionReport>,
 }
 
-/// User action request — produced when High-confidence crash attribution
-/// identifies a unique culprit and a reversible recovery action is available.
-///
-/// The caller must pause the transaction (not roll back) and present this
-/// to the user. If the user approves, call `execute_approved_recovery`.
-#[derive(Debug)]
+/// User action request — produced when High-confidence crash attribution is available.
+/// This is the frontend-safe payload. Backend owns all filesystem paths.
+#[derive(Debug, Clone)]
 pub struct UserActionRequest {
     /// The crash attribution report that triggered this request.
     pub crash_report: crate::crash_attribution::CrashAttributionReport,
     /// The recovery action availability (should be Available).
     pub availability: crate::recovery_actions::RecoveryActionAvailability,
-    /// Deterministic fingerprint for approval validation.
+    /// Deterministic fingerprint for approval validation (includes JAR SHA-256).
     pub fingerprint: String,
-    /// Transaction metadata for pause/resume.
+    /// Real transaction ID — never empty.
     pub transaction_id: String,
-    /// The staging mods directory.
-    pub staging_mods: PathBuf,
-    /// Current boot attempt number.
+    /// Real server ID — never empty.
+    pub server_id: String,
+    /// The mod ID targeted for recovery.
+    pub mod_id: String,
+    /// Display-safe JAR filename (no full path exposed).
+    pub display_filename: String,
+    /// SHA-256 of the JAR bytes at attribution time.
+    pub jar_sha256: String,
+    /// Current boot attempt number (for budget tracking).
     pub boot_attempt: u8,
+    /// Number of recovery actions already used in this session.
+    pub recovery_actions_used: u8,
     /// Full audit trail up to this point.
     pub history: ValidationHistory,
+    // ── Backend-internal fields (NOT exposed to UI) ──
+    /// Canonical target JAR path in staging (backend resolves from attribution).
+    pub(crate) target_jar_path: PathBuf,
+    /// Staging mods directory (backend-internal).
+    pub(crate) staging_mods: PathBuf,
 }
 
 /// Structured failure reason — never reduced to plain strings internally.
@@ -264,7 +288,7 @@ pub enum ValidationFailureReason {
 // ── History / audit trail ──────────────────────────────────────────────
 
 /// Full audit trail of the validation cycle.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ValidationHistory {
     /// Ordered list of boot attempts.
     pub boot_attempts: Vec<BootAttemptRecord>,
@@ -273,7 +297,7 @@ pub struct ValidationHistory {
 }
 
 /// Record of a single boot attempt.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BootAttemptRecord {
     /// 1-based attempt number.
     pub attempt_number: u8,
@@ -369,6 +393,10 @@ pub struct ValidationContext<'a> {
     pub cf_client: &'a reqwest::Client,
     pub installed_files: &'a InstalledFileRegistry,
     pub dependency_resolver: &'a mut DependencyResolver,
+    /// Transaction ID for recovery fingerprint binding. Empty string if unavailable.
+    pub transaction_id: &'a str,
+    /// Server ID for recovery context. Empty string if unavailable.
+    pub server_id: &'a str,
 }
 
 // ── Orchestrator ───────────────────────────────────────────────────────
@@ -400,6 +428,23 @@ impl ValidationRepairOrchestrator {
             history: ValidationHistory::default(),
             config_changed: false,
             test_repair_overrides: Some(std::collections::VecDeque::from(overrides)),
+        }
+    }
+
+    /// Create orchestrator with persisted retry counters from a prior pause.
+    /// Restores boot_attempts, dependency_repairs, runtime_repairs so that
+    /// MAX_TOTAL_BOOT_ATTEMPTS is enforced across the full logical lifecycle.
+    pub fn from_persisted_state(boot_attempts: u8, dep_repairs: u8, runtime_repairs: u8) -> Self {
+        Self {
+            state: ValidationRetryState::from_persisted(
+                boot_attempts,
+                dep_repairs,
+                runtime_repairs,
+            ),
+            history: ValidationHistory::default(),
+            config_changed: false,
+            #[cfg(any(test, feature = "testing"))]
+            test_repair_overrides: None,
         }
     }
 
@@ -606,24 +651,53 @@ impl ValidationRepairOrchestrator {
                                 availability,
                                 crate::recovery_actions::RecoveryActionAvailability::Available
                             ) {
+                                // Get primary candidate info
+                                let primary = crash_report
+                                    .primary_candidate
+                                    .as_ref()
+                                    .or_else(|| crash_report.candidates.first());
+                                let (mod_id, jar_path) = if let Some(p) = primary {
+                                    (
+                                        p.mod_id.clone().unwrap_or("unknown".to_string()),
+                                        p.jar_path
+                                            .as_ref()
+                                            .map(|p| PathBuf::from(p))
+                                            .unwrap_or_default(),
+                                    )
+                                } else {
+                                    (String::new(), PathBuf::new())
+                                };
+
+                                // Compute JAR SHA-256 for fingerprint binding
+                                let jar_sha256 = if jar_path.exists() {
+                                    crate::recovery_actions::compute_file_sha256(&jar_path)
+                                        .unwrap_or_default()
+                                } else {
+                                    String::new()
+                                };
+
                                 // Compute fingerprint for approval validation
-                                let fingerprint =
-                                    if let Some(primary) = &crash_report.primary_candidate {
-                                        let evidence_ids: Vec<String> = primary
-                                            .evidence
+                                let evidence_ids: Vec<String> = primary
+                                    .map(|p| {
+                                        p.evidence
                                             .iter()
                                             .map(|e| format!("{:?}", e.source))
-                                            .collect();
-                                        crate::recovery_actions::compute_fingerprint(
-                                            "", // transaction_id not available here
-                                            primary.mod_id.as_deref().unwrap_or("unknown"),
-                                            primary.jar_path.as_deref().unwrap_or(Path::new("")),
-                                            attempt,
-                                            &evidence_ids,
-                                        )
-                                    } else {
-                                        String::new()
-                                    };
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                let fingerprint = crate::recovery_actions::compute_fingerprint(
+                                    ctx.transaction_id,
+                                    &mod_id,
+                                    &jar_path,
+                                    attempt,
+                                    &evidence_ids,
+                                    &jar_sha256,
+                                );
+
+                                let display_filename = jar_path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "unknown.jar".to_string());
 
                                 eprintln!(
                                     "[CF][recovery] User action available — pausing for approval"
@@ -633,10 +707,16 @@ impl ValidationRepairOrchestrator {
                                     crash_report,
                                     availability,
                                     fingerprint,
-                                    transaction_id: String::new(),
-                                    staging_mods,
+                                    transaction_id: ctx.transaction_id.to_string(),
+                                    server_id: ctx.server_id.to_string(),
+                                    mod_id,
+                                    display_filename,
+                                    jar_sha256,
                                     boot_attempt: attempt,
+                                    recovery_actions_used: 0, // caller tracks this
                                     history: std::mem::take(&mut self.history),
+                                    target_jar_path: jar_path,
+                                    staging_mods,
                                 });
                             }
 
@@ -1428,6 +1508,8 @@ mod tests {
             cf_client: cf,
             installed_files,
             dependency_resolver: resolver,
+            transaction_id: "test-txn",
+            server_id: "test-server",
         }
     }
 
@@ -1996,6 +2078,8 @@ mod tests {
             cf_client: &reqwest::Client::new(),
             installed_files: &mut installed_files,
             dependency_resolver: &mut resolver,
+            transaction_id: "test-txn",
+            server_id: "test-server",
         };
 
         // boot1: WrongJava → runtime repair succeeds, boot2: Success
@@ -2049,6 +2133,8 @@ mod tests {
             cf_client: &reqwest::Client::new(),
             installed_files: &mut installed_files,
             dependency_resolver: &mut resolver,
+            transaction_id: "test-txn",
+            server_id: "test-server",
         };
 
         // boot1: missing-dep log → BootDependency → NotRepairable → Failed

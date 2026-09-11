@@ -89,6 +89,18 @@ pub fn unknown_crash_log() -> String {
     "Some random crash with no recognizable pattern".to_string()
 }
 
+/// Crash log that triggers RepairAction::None (no automatic repair)
+/// but has enough info for crash attribution to find a mod.
+/// Uses patterns that parse_explicit_mod_ids recognizes.
+pub fn mod_init_crash_log(mod_id: &str) -> String {
+    format!(
+        "[12:00:00] [main/ERROR]: Some generic crash\n\
+         java.lang.RuntimeException: Something went wrong\n\
+         Mod ID: {}",
+        mod_id
+    )
+}
+
 pub fn combined_missing_dep_and_loader_log(missing_mod: &str) -> String {
     format!(
         "{}\n{}",

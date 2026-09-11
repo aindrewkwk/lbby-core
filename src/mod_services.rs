@@ -12,6 +12,43 @@ use std::path::{Component, Path, PathBuf};
 
 use tokio::io::AsyncWriteExt;
 
+/// Outcome of an install operation.
+///
+/// Instead of forcing `Result<ServerConfig, String>` (which conflates "user action required"
+/// with "error"), this enum cleanly represents three states:
+/// - `Success`: install completed and committed.
+/// - `UserActionRequired`: transaction paused — user must approve recovery.
+/// - (errors are still returned as `Err(String)`)
+#[derive(Debug)]
+pub enum InstallOutcome {
+    /// Install completed successfully. Config is committed.
+    Success(ServerConfig),
+    /// High-confidence crash attribution found. Transaction paused.
+    /// Frontend must present approval UI; backend owns all paths.
+    UserActionRequired {
+        /// Server ID (stable identifier).
+        server_id: String,
+        /// Transaction ID (stable identifier).
+        transaction_id: String,
+        /// Attribution fingerprint (includes JAR SHA-256).
+        fingerprint: String,
+        /// Target mod ID for recovery.
+        mod_id: String,
+        /// Display-safe JAR filename (no full path).
+        display_filename: String,
+        /// SHA-256 of target JAR bytes at attribution time.
+        jar_sha256: String,
+        /// Boot attempt at time of pause.
+        boot_attempt: u8,
+        /// Recovery actions used so far.
+        recovery_actions_used: u8,
+        /// Crash attribution summary (for UI).
+        crash_summary: String,
+        /// Confidence level string.
+        confidence: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ModTaskProgress {
     pub stage: String,
@@ -1634,7 +1671,7 @@ fn loader_from_mrpack(
 pub async fn install_modrinth_modpack(
     app: std::sync::Arc<crate::app_state::AppEventSender>,
     source: String,
-) -> Result<ServerConfig, String> {
+) -> Result<InstallOutcome, String> {
     emit_mod_progress(&app, "Reading manifest", "Preparing Modrinth modpack", 0, 1);
     let pack_path = if source.starts_with("http://") || source.starts_with("https://") {
         resolve_or_download_mrpack(&app, &source).await?
@@ -1741,7 +1778,7 @@ pub async fn install_modrinth_modpack(
     }
 
     emit_mod_progress(&app, "Finalizing", "Modpack installation completed", 1, 1);
-    Ok(cfg)
+    Ok(InstallOutcome::Success(cfg))
 }
 
 async fn resolve_or_download_mrpack(
@@ -1812,7 +1849,7 @@ fn loader_from_curse(loaders: &[CurseLoader]) -> Result<(ServerType, Option<Stri
 pub async fn install_curseforge_modpack(
     app: std::sync::Arc<crate::app_state::AppEventSender>,
     zip_path: String,
-) -> Result<ServerConfig, String> {
+) -> Result<InstallOutcome, String> {
     let file = std::fs::File::open(&zip_path).map_err(|e| e.to_string())?;
     let mut zip =
         zip::ZipArchive::new(file).map_err(|e| format!("Invalid CurseForge ZIP: {}", e))?;
@@ -1985,8 +2022,19 @@ pub async fn install_curseforge_modpack(
         txn.copy_persistent_state()?;
         // Boot validation: verify the staged server actually starts
         // Phase 3G: use ValidationRepairOrchestrator for centralized retry logic
+        // Phase 3K.1: restore persisted retry state from prior pause (if any)
         let cf = curseforge_client()?;
-        let mut orch = crate::validation_orchestrator::ValidationRepairOrchestrator::new();
+        let mut orch = if let Some(prior) =
+            crate::recovery_actions::load_retry_state(Path::new(&cfg2.server_path))
+        {
+            crate::validation_orchestrator::ValidationRepairOrchestrator::from_persisted_state(
+                prior.boot_attempts_used,
+                prior.dependency_repairs_used,
+                prior.runtime_repairs_used,
+            )
+        } else {
+            crate::validation_orchestrator::ValidationRepairOrchestrator::new()
+        };
         let empty_registry = crate::boot_failure_analyzer::InstalledFileRegistry::new();
         let mut resolver = crate::dependency_resolver::DependencyResolver::new(
             cf.clone(),
@@ -1999,6 +2047,8 @@ pub async fn install_curseforge_modpack(
             cf_client: &cf,
             installed_files: &empty_registry,
             dependency_resolver: &mut resolver,
+            transaction_id: &txn.meta().transaction_id,
+            server_id: &txn.meta().server_id,
         };
         let validator = crate::boot_validator::BootValidator::new();
         let outcome = orch.validate(&mut orch_ctx, &validator).await;
@@ -2008,10 +2058,17 @@ pub async fn install_curseforge_modpack(
                     "[lbby] Boot validation passed after {} attempt(s)",
                     success.total_boot_attempts
                 );
+                // Preserve quarantine artifacts out of staging before commit
+                crate::recovery_actions::preserve_quarantine_on_commit(
+                    txn.staging_path(),
+                    &txn.meta().server_id,
+                    &txn.meta().transaction_id,
+                )?;
+                crate::recovery_actions::clear_retry_state(Path::new(&cfg2.server_path));
                 let meta = txn.commit()?;
                 cfg2.server_path = meta.live_path.to_string_lossy().to_string();
                 config::save_config(&cfg2)?;
-                return Ok(cfg2);
+                return Ok(InstallOutcome::Success(cfg2));
             }
             crate::validation_orchestrator::ValidationOutcome::Failed(failure) => {
                 let err = format!(
@@ -2024,20 +2081,59 @@ pub async fn install_curseforge_modpack(
                     &txn.meta().transaction_id,
                     &failure.final_boot_result,
                 );
+                crate::recovery_actions::clear_retry_state(Path::new(&cfg2.server_path));
                 txn.rollback()?;
                 return Err(err);
             }
             crate::validation_orchestrator::ValidationOutcome::UserActionRequired(req) => {
-                // Phase 3K: orchestrator found a High-confidence recovery action.
-                // TODO: pause transaction and present to user instead of rolling back.
-                // For now, log diagnostics and fail with attribution info.
-                let err = format!(
-                    "Boot validation requires user action: recovery available for '{}' (confidence: {:?})",
-                    req.crash_report.summary, req.crash_report.confidence
+                // Phase 3K.1: persist recovery metadata and pause transaction.
+                // No rollback — staging stays alive for later approval.
+                let recovery_meta = crate::install_transaction::PendingRecoveryMetadata {
+                    server_id: req.server_id.clone(),
+                    transaction_id: req.transaction_id.clone(),
+                    staging_mods: req.staging_mods.clone(),
+                    attribution_fingerprint: req.fingerprint.clone(),
+                    target_mod_id: req.mod_id.clone(),
+                    target_jar_path: req.target_jar_path.clone(),
+                    target_jar_sha256: req.jar_sha256.clone(),
+                    boot_attempt: req.boot_attempt,
+                    dependency_repairs: orch.state().dependency_repairs,
+                    runtime_repairs: orch.state().runtime_repairs,
+                    recovery_actions_used: req.recovery_actions_used,
+                    display_filename: req.display_filename.clone(),
+                    crash_summary: req.crash_report.summary.clone(),
+                    confidence: format!("{:?}", req.crash_report.confidence),
+                    applied: false,
+                };
+                let recovery_path = txn.meta().pending_recovery_path();
+                recovery_meta.save(&recovery_path)?;
+                // Persist orchestrator retry state for cross-lifecycle ceiling
+                let _ = crate::recovery_actions::save_retry_state(
+                    Path::new(&cfg2.server_path),
+                    &crate::recovery_actions::RetryStateSnapshot {
+                        boot_attempts_used: orch.state().total_boot_attempts,
+                        dependency_repairs_used: orch.state().dependency_repairs,
+                        runtime_repairs_used: orch.state().runtime_repairs,
+                        recovery_actions_used: req.recovery_actions_used,
+                    },
                 );
-                eprintln!("[CF][recovery] {}", err);
-                txn.rollback()?;
-                return Err(err);
+                eprintln!(
+                    "[CF][recovery] Pausing transaction {} — pending recovery for '{}'",
+                    req.transaction_id, req.mod_id
+                );
+                let _paused_meta = txn.pause();
+                return Ok(InstallOutcome::UserActionRequired {
+                    server_id: req.server_id,
+                    transaction_id: req.transaction_id,
+                    fingerprint: req.fingerprint,
+                    mod_id: req.mod_id,
+                    display_filename: req.display_filename,
+                    jar_sha256: req.jar_sha256,
+                    boot_attempt: req.boot_attempt,
+                    recovery_actions_used: req.recovery_actions_used,
+                    crash_summary: req.crash_report.summary,
+                    confidence: format!("{:?}", req.crash_report.confidence),
+                });
             }
         }
     }
@@ -2834,8 +2930,20 @@ pub async fn install_curseforge_modpack(
         }
     }
     // Phase 3G: use ValidationRepairOrchestrator for centralized retry logic
-    let mut orch = crate::validation_orchestrator::ValidationRepairOrchestrator::new();
+    // Phase 3K.1: restore persisted retry state from prior pause (if any)
+    let mut orch = if let Some(prior) =
+        crate::recovery_actions::load_retry_state(Path::new(&cfg.server_path))
+    {
+        crate::validation_orchestrator::ValidationRepairOrchestrator::from_persisted_state(
+            prior.boot_attempts_used,
+            prior.dependency_repairs_used,
+            prior.runtime_repairs_used,
+        )
+    } else {
+        crate::validation_orchestrator::ValidationRepairOrchestrator::new()
+    };
     let mut orch_cfg = cfg; // move cfg into orchestrator context
+    let txn_meta = txn.meta();
     let mut orch_ctx = crate::validation_orchestrator::ValidationContext {
         cfg: &mut orch_cfg,
         staging_path: txn.staging_path(),
@@ -2843,6 +2951,8 @@ pub async fn install_curseforge_modpack(
         cf_client: &cf,
         installed_files: &boot_installed_file_registry,
         dependency_resolver: &mut boot_resolver,
+        transaction_id: &txn_meta.transaction_id,
+        server_id: &txn_meta.server_id,
     };
     let validator = crate::boot_validator::BootValidator::new();
     let outcome = orch.validate(&mut orch_ctx, &validator).await;
@@ -2852,10 +2962,17 @@ pub async fn install_curseforge_modpack(
                 "[CF] Boot validation passed after {} attempt(s)",
                 success.total_boot_attempts
             );
+            // Preserve quarantine artifacts out of staging before commit
+            crate::recovery_actions::preserve_quarantine_on_commit(
+                txn.staging_path(),
+                &txn.meta().server_id,
+                &txn.meta().transaction_id,
+            )?;
+            crate::recovery_actions::clear_retry_state(Path::new(&orch_cfg.server_path));
             let meta = txn.commit()?;
             orch_cfg.server_path = meta.live_path.to_string_lossy().to_string();
             config::save_config(&orch_cfg)?;
-            return Ok(orch_cfg);
+            return Ok(InstallOutcome::Success(orch_cfg));
         }
         crate::validation_orchestrator::ValidationOutcome::Failed(failure) => {
             let err = format!(
@@ -2868,19 +2985,59 @@ pub async fn install_curseforge_modpack(
                 &txn.meta().transaction_id,
                 &failure.final_boot_result,
             );
+            crate::recovery_actions::clear_retry_state(Path::new(&orch_cfg.server_path));
             txn.rollback()?;
             return Err(err);
         }
         crate::validation_orchestrator::ValidationOutcome::UserActionRequired(req) => {
-            // Phase 3K: orchestrator found a High-confidence recovery action.
-            // TODO: pause transaction and present to user instead of rolling back.
-            let err = format!(
-                "Boot validation requires user action: recovery available for '{}' (confidence: {:?})",
-                req.crash_report.summary, req.crash_report.confidence
+            // Phase 3K.1: persist recovery metadata and pause transaction.
+            // No rollback — staging stays alive for later approval.
+            let recovery_meta = crate::install_transaction::PendingRecoveryMetadata {
+                server_id: req.server_id.clone(),
+                transaction_id: req.transaction_id.clone(),
+                staging_mods: req.staging_mods.clone(),
+                attribution_fingerprint: req.fingerprint.clone(),
+                target_mod_id: req.mod_id.clone(),
+                target_jar_path: req.target_jar_path.clone(),
+                target_jar_sha256: req.jar_sha256.clone(),
+                boot_attempt: req.boot_attempt,
+                dependency_repairs: orch.state().dependency_repairs,
+                runtime_repairs: orch.state().runtime_repairs,
+                recovery_actions_used: req.recovery_actions_used,
+                display_filename: req.display_filename.clone(),
+                crash_summary: req.crash_report.summary.clone(),
+                confidence: format!("{:?}", req.crash_report.confidence),
+                applied: false,
+            };
+            let recovery_path = txn.meta().pending_recovery_path();
+            recovery_meta.save(&recovery_path)?;
+            // Persist orchestrator retry state for cross-lifecycle ceiling
+            let _ = crate::recovery_actions::save_retry_state(
+                Path::new(&orch_cfg.server_path),
+                &crate::recovery_actions::RetryStateSnapshot {
+                    boot_attempts_used: orch.state().total_boot_attempts,
+                    dependency_repairs_used: orch.state().dependency_repairs,
+                    runtime_repairs_used: orch.state().runtime_repairs,
+                    recovery_actions_used: req.recovery_actions_used,
+                },
             );
-            eprintln!("[CF][recovery] {}", err);
-            txn.rollback()?;
-            return Err(err);
+            eprintln!(
+                "[MR][recovery] Pausing transaction {} — pending recovery for '{}'",
+                req.transaction_id, req.mod_id
+            );
+            let _paused_meta = txn.pause();
+            return Ok(InstallOutcome::UserActionRequired {
+                server_id: req.server_id,
+                transaction_id: req.transaction_id,
+                fingerprint: req.fingerprint,
+                mod_id: req.mod_id,
+                display_filename: req.display_filename,
+                jar_sha256: req.jar_sha256,
+                boot_attempt: req.boot_attempt,
+                recovery_actions_used: req.recovery_actions_used,
+                crash_summary: req.crash_report.summary,
+                confidence: format!("{:?}", req.crash_report.confidence),
+            });
         }
     }
 }
@@ -3125,7 +3282,7 @@ fn open_folder(path: &Path) -> Result<(), String> {
 pub async fn install_modpack_from_file(
     app: std::sync::Arc<crate::app_state::AppEventSender>,
     file_path: String,
-) -> Result<ServerConfig, String> {
+) -> Result<InstallOutcome, String> {
     let lower = file_path.to_ascii_lowercase();
     if lower.ends_with(".mrpack") {
         install_modrinth_modpack(app, file_path).await
@@ -3230,7 +3387,7 @@ fn cfwidget_find_file<'a>(
 pub async fn install_curseforge_modpack_link(
     app: std::sync::Arc<crate::app_state::AppEventSender>,
     url: String,
-) -> Result<ServerConfig, String> {
+) -> Result<InstallOutcome, String> {
     let (slug, file_id) = parse_curseforge_url(&url)?;
     emit_mod_progress(
         &app,

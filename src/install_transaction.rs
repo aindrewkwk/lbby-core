@@ -33,6 +33,68 @@ impl TransactionMeta {
     pub fn marker_path(&self) -> PathBuf {
         self.staging_path.join("transaction.json")
     }
+
+    /// Path to the pending recovery metadata file (persisted alongside transaction.json).
+    pub fn pending_recovery_path(&self) -> PathBuf {
+        self.staging_path.join("pending_recovery.json")
+    }
+}
+
+/// Persisted recovery state — written when a transaction is paused for user action.
+///
+/// This is the authoritative record of what recovery the user can approve.
+/// The backend reconstructs the recovery from this metadata — the frontend
+/// never sends filesystem paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingRecoveryMetadata {
+    /// Server identifier.
+    pub server_id: String,
+    /// Transaction identifier.
+    pub transaction_id: String,
+    /// Staging mods directory (backend-internal, not exposed to UI).
+    pub staging_mods: PathBuf,
+    /// Attribution fingerprint (includes JAR SHA-256).
+    pub attribution_fingerprint: String,
+    /// Target mod ID for recovery.
+    pub target_mod_id: String,
+    /// Canonical path to the target JAR in staging.
+    pub target_jar_path: PathBuf,
+    /// SHA-256 of the target JAR bytes at attribution time.
+    pub target_jar_sha256: String,
+    /// Boot attempt count at the time of pause.
+    pub boot_attempt: u8,
+    /// Dependency repair rounds completed before pause.
+    pub dependency_repairs: u8,
+    /// Runtime remediation rounds completed before pause.
+    pub runtime_repairs: u8,
+    /// Number of recovery actions already used in this session.
+    pub recovery_actions_used: u8,
+    /// Display-safe JAR filename (for UI).
+    pub display_filename: String,
+    /// Crash attribution summary (for UI).
+    pub crash_summary: String,
+    /// Attribution confidence level.
+    pub confidence: String,
+    /// Whether approval has been applied (idempotency guard).
+    pub applied: bool,
+}
+
+impl PendingRecoveryMetadata {
+    /// Persist recovery metadata alongside the transaction marker.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize pending recovery: {}", e))?;
+        std::fs::write(path, json)
+            .map_err(|e| format!("Failed to write pending recovery metadata: {}", e))
+    }
+
+    /// Load recovery metadata from disk.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read pending recovery metadata: {}", e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse pending recovery metadata: {}", e))
+    }
 }
 
 // ── Install transaction ─────────────────────────────────────────────────
