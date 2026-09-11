@@ -24,6 +24,7 @@ pub enum OperationKind {
     None,
     Starting,
     Stopping,
+    Recovering,
     Restoring,
     Importing,
     Exporting,
