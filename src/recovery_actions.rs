@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -91,6 +92,78 @@ pub enum RecoveryActionAvailability {
     UnavailableMissingJar,
     /// Multi-provider: multiple JARs claim the same mod ID.
     UnavailableDuplicateProvider,
+}
+
+// ── Server lifecycle state for restore safety (Phase 3L.1) ──────────
+
+/// Authoritative server lifecycle state.
+/// Maps to the existing `ServerStatus` in server.rs but is defined independently
+/// so the recovery core does not depend on the Tauri server module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServerLifecycleState {
+    Stopped,
+    Installing,
+    DownloadingJava,
+    DownloadingJar,
+    Preparing,
+    Starting,
+    Running,
+    Stopping,
+    Restarting,
+    Error,
+    /// Provider could not determine the state.
+    Unknown,
+}
+
+impl ServerLifecycleState {
+    /// Whether restore is allowed from this state.
+    pub fn is_stopped(&self) -> bool {
+        matches!(self, Self::Stopped)
+    }
+
+    /// Human-readable name for diagnostics.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Installing => "installing",
+            Self::DownloadingJava => "downloading_java",
+            Self::DownloadingJar => "downloading_jar",
+            Self::Preparing => "preparing",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Restarting => "restarting",
+            Self::Error => "error",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Authoritative source of server lifecycle state.
+///
+/// The production implementation reads from the backend server manager
+/// (Tauri `ServerHandle` for App, cloud node state for Cloud).
+/// Tests use `MockLifecycleProvider`.
+pub trait RestoreLifecycleProvider: Send + Sync {
+    fn get_server_state(&self, server_id: &str) -> Result<ServerLifecycleState, String>;
+}
+
+// ── Per-server operation lock (Phase 3L.1) ─────────────────────────
+
+/// Global per-server restore locks.
+///
+/// Each server_id gets its own `Mutex<()>`. Two restores for the same
+/// server serialize; restores for different servers proceed in parallel.
+static RESTORE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+/// Get (or create) the per-server lock Arc. Caller clones it and locks in
+/// its own scope so the guard's lifetime is correct.
+fn get_server_lock_arc(server_id: &str) -> Arc<Mutex<()>> {
+    let locks = RESTORE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = locks.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(server_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -633,6 +706,153 @@ pub struct PendingRecoveryInfo {
     pub recovery: crate::install_transaction::PendingRecoveryMetadata,
 }
 
+// ── Quarantine management types (Phase 3L) ─────────────────────────────
+
+/// Current status of a quarantined artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuarantineStatus {
+    /// Artifact is quarantined and available for restore.
+    Quarantined,
+    /// Artifact has been successfully restored to live/mods.
+    Restored,
+    /// Restore attempt failed (see RestoreRecord for details).
+    RestoreFailed,
+    /// Metadata file exists but artifact JAR is missing from disk.
+    MissingArtifact,
+    /// Artifact JAR exists but SHA-256 does not match metadata.
+    HashMismatch,
+}
+
+/// Authoritative metadata for a quarantined artifact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuarantineRecord {
+    /// Stable record ID (derived from transaction_id + relative path + sha256).
+    pub record_id: String,
+    /// Server that owns this quarantine.
+    pub server_id: String,
+    /// Transaction that quarantined this artifact.
+    pub transaction_id: String,
+    /// Relative path the JAR occupied in live/mods (e.g. "mods/create-0.5.1.jar").
+    pub original_relative_path: PathBuf,
+    /// Filename of the quarantined JAR.
+    pub filename: String,
+    /// Mod IDs declared by this JAR at quarantine time.
+    pub mod_ids: Vec<String>,
+    /// SHA-256 of the quarantined JAR bytes.
+    pub sha256: String,
+    /// Which recovery action number produced this quarantine.
+    pub recovery_action_number: u8,
+    /// Human-readable reason for quarantine.
+    pub reason: String,
+    /// ISO-8601 timestamp of quarantine creation.
+    pub created_at: String,
+    /// Current status.
+    pub status: QuarantineStatus,
+    /// ISO-8601 timestamp if restored, None otherwise.
+    pub restored_at: Option<String>,
+    /// SHA-256 verified after restore (if restored).
+    pub restore_sha256: Option<String>,
+    /// Absolute path the artifact was restored to (if restored).
+    pub restore_target: Option<PathBuf>,
+}
+
+/// Top-level quarantine metadata file (schema_version + records).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuarantineMetadata {
+    /// Schema version for future migrations.
+    pub schema_version: u32,
+    /// All quarantine records for this transaction.
+    pub records: Vec<QuarantineRecord>,
+}
+
+impl QuarantineMetadata {
+    /// Empty metadata with schema version 1.
+    pub fn v1() -> Self {
+        Self {
+            schema_version: 1,
+            records: Vec::new(),
+        }
+    }
+}
+
+/// Compute a stable record ID from transaction_id + relative path + sha256.
+pub fn compute_record_id(transaction_id: &str, relative_path: &str, sha256: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(transaction_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(relative_path.as_bytes());
+    hasher.update(b"|");
+    hasher.update(sha256.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Result of a quarantine listing operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuarantineListing {
+    pub records: Vec<QuarantineRecord>,
+    /// Transaction directories that had no metadata.json (legacy or corrupt).
+    pub orphaned_transactions: Vec<String>,
+}
+
+/// Result of a restore attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestoreResult {
+    /// Restore succeeded. Artifact copied to live/mods, quarantine preserved.
+    Restored { sha256: String, target: PathBuf },
+    /// Restore succeeded but metadata update failed. File is live; repairable on next listing.
+    RestoredMetadataUpdateFailed { sha256: String, target: PathBuf },
+    /// Record already restored (idempotency).
+    AlreadyRestored,
+    /// Quarantine metadata not found for this record_id.
+    RecordNotFound(String),
+    /// Quarantine metadata is corrupt or missing required fields.
+    InvalidMetadata(String),
+    /// Quarantined JAR no longer exists on disk.
+    MissingArtifact,
+    /// SHA-256 of quarantined JAR does not match metadata.
+    HashMismatch,
+    /// Target file already exists in live/mods.
+    DestinationConflict { existing_path: PathBuf },
+    /// Live mods already contains another JAR declaring the same mod_id.
+    DuplicateProviderConflict {
+        conflicting_jar: PathBuf,
+        mod_id: String,
+    },
+    /// Server is not in the Stopped state (Running, Starting, Validating, etc.).
+    ServerNotStopped { state: String },
+    /// Server state changed during restore (TOCTOU re-check caught a race).
+    StateChanged { new_state: String },
+    /// Server has an active transaction (Building, Committing, PendingUserAction).
+    ActiveTransaction { transaction_id: String },
+    /// Target mod is explicitly ClientOnly — cannot restore to dedicated server.
+    ExplicitClientOnly { mod_id: String },
+    /// Target is a protected platform component.
+    ProtectedComponent { mod_id: String },
+    /// Quarantine artifact mod_ids do not match metadata mod_ids.
+    IdentityMismatch {
+        expected: Vec<String>,
+        actual: Vec<String>,
+    },
+    /// Restore path would escape live/mods (path traversal).
+    PathEscape,
+    /// Quarantine artifact source path escapes the expected quarantine directory.
+    QuarantineSourceEscape,
+    /// Internal failure during copy/verify/rename.
+    Failed(String),
+}
+
+/// Audit record for a restore attempt (persisted in history).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreRecord {
+    pub record_id: String,
+    pub server_id: String,
+    pub transaction_id: String,
+    pub mod_ids: Vec<String>,
+    pub sha256: String,
+    pub result: RestoreResult,
+    pub timestamp: String,
+}
+
 /// Domain-specific approval entry point.
 ///
 /// The frontend sends only stable identifiers: server_id, transaction_id, fingerprint.
@@ -1079,6 +1299,761 @@ fn move_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// ── Quarantine metadata persistence (Phase 3L) ────────────────────────
+
+/// Path to the quarantine metadata file for a transaction.
+fn quarantine_metadata_path(quarantine_txn_dir: &Path) -> PathBuf {
+    quarantine_txn_dir.join("quarantine_metadata.json")
+}
+
+/// Load quarantine metadata from a transaction quarantine directory.
+/// Returns None if file does not exist (not an error — legacy dir).
+/// Returns Err if file exists but is corrupt.
+fn load_quarantine_metadata(
+    quarantine_txn_dir: &Path,
+) -> Result<Option<QuarantineMetadata>, String> {
+    let path = quarantine_metadata_path(quarantine_txn_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read quarantine metadata: {}", e))?;
+    let meta: QuarantineMetadata = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse quarantine metadata: {}", e))?;
+    Ok(Some(meta))
+}
+
+/// Save quarantine metadata to a transaction quarantine directory.
+pub fn save_quarantine_metadata(
+    quarantine_txn_dir: &Path,
+    meta: &QuarantineMetadata,
+) -> Result<(), String> {
+    std::fs::create_dir_all(quarantine_txn_dir)
+        .map_err(|e| format!("Failed to create quarantine dir: {}", e))?;
+    let path = quarantine_metadata_path(quarantine_txn_dir);
+    let json = serde_json::to_string_pretty(meta)
+        .map_err(|e| format!("Failed to serialize quarantine metadata: {}", e))?;
+    std::fs::write(&path, json)
+        .map_err(|e| format!("Failed to write quarantine metadata: {}", e))?;
+    Ok(())
+}
+
+/// Record a newly quarantined artifact into the transaction quarantine metadata.
+///
+/// Called after `preserve_quarantine_on_commit` to persist the record alongside
+/// the preserved artifact. The `quarantine_txn_dir` is the preserve root for
+/// this transaction (e.g. `<live-parent>/.lbby-quarantine/<server-id>/<txn-id>/`).
+pub fn record_quarantine(
+    quarantine_txn_dir: &Path,
+    server_id: &str,
+    transaction_id: &str,
+    original_relative_path: &str,
+    filename: &str,
+    mod_ids: Vec<String>,
+    sha256: &str,
+    recovery_action_number: u8,
+    reason: &str,
+) -> Result<QuarantineRecord, String> {
+    let record_id = compute_record_id(transaction_id, original_relative_path, sha256);
+    let record = QuarantineRecord {
+        record_id,
+        server_id: server_id.to_string(),
+        transaction_id: transaction_id.to_string(),
+        original_relative_path: PathBuf::from(original_relative_path),
+        filename: filename.to_string(),
+        mod_ids,
+        sha256: sha256.to_string(),
+        recovery_action_number,
+        reason: reason.to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        status: QuarantineStatus::Quarantined,
+        restored_at: None,
+        restore_sha256: None,
+        restore_target: None,
+    };
+
+    let mut meta =
+        load_quarantine_metadata(quarantine_txn_dir)?.unwrap_or_else(QuarantineMetadata::v1);
+    meta.records.push(record.clone());
+    save_quarantine_metadata(quarantine_txn_dir, &meta)?;
+
+    eprintln!(
+        "[RECOVERY] Recorded quarantine: {} (record_id: {})",
+        filename, record.record_id
+    );
+
+    Ok(record)
+}
+
+// ── Quarantine listing (Phase 3L) ─────────────────────────────────────
+
+/// List all quarantined mods for a server.
+///
+/// Scans `<live-parent>/.lbby-quarantine/<server-id>/` for transaction
+/// directories, loads metadata, verifies artifacts still exist and SHA matches.
+///
+/// Returns newest-first (by created_at) when timestamps are available.
+pub fn list_quarantined_mods(server_id: &str) -> Result<QuarantineListing, String> {
+    let live_path = find_live_path_for_server(server_id)
+        .ok_or(format!("No live path found for server '{}'", server_id))?;
+    list_quarantined_mods_at(server_id, &live_path)
+}
+
+/// List quarantined mods with explicit live_path (testable without config).
+pub fn list_quarantined_mods_at(
+    server_id: &str,
+    live_path: &Path,
+) -> Result<QuarantineListing, String> {
+    let parent = live_path.parent().ok_or("Live path has no parent")?;
+    let quarantine_server_dir = parent.join(".lbby-quarantine").join(server_id);
+
+    if !quarantine_server_dir.exists() {
+        return Ok(QuarantineListing {
+            records: Vec::new(),
+            orphaned_transactions: Vec::new(),
+        });
+    }
+
+    let mut all_records = Vec::new();
+    let mut orphaned = Vec::new();
+
+    let entries = std::fs::read_dir(&quarantine_server_dir)
+        .map_err(|e| format!("Failed to read quarantine dir: {}", e))?;
+
+    for entry in entries.flatten() {
+        // Skip symlinks — do not follow links outside the quarantine dir (Phase 3L.1)
+        let ft = entry.file_type().ok();
+        if ft.map_or(false, |f| f.is_symlink()) {
+            continue;
+        }
+        let txn_dir = entry.path();
+        if !txn_dir.is_dir() {
+            continue;
+        }
+        let txn_name = txn_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        match load_quarantine_metadata(&txn_dir)? {
+            Some(mut meta) => {
+                // Verify each record: artifact exists, SHA matches
+                for rec in &mut meta.records {
+                    if rec.status == QuarantineStatus::Restored {
+                        // Restored records keep their status
+                        all_records.push(rec.clone());
+                        continue;
+                    }
+                    let artifact_path = txn_dir.join("mods").join(&rec.filename);
+                    if !artifact_path.exists() {
+                        rec.status = QuarantineStatus::MissingArtifact;
+                    } else {
+                        match compute_file_sha256(&artifact_path) {
+                            Ok(hash) if hash == rec.sha256 => {
+                                rec.status = QuarantineStatus::Quarantined;
+                            }
+                            Ok(_) => {
+                                rec.status = QuarantineStatus::HashMismatch;
+                            }
+                            Err(_) => {
+                                rec.status = QuarantineStatus::MissingArtifact;
+                            }
+                        }
+                    }
+                    all_records.push(rec.clone());
+                }
+            }
+            None => {
+                // No metadata — check if there are JAR files (legacy or orphan)
+                let mods_dir = txn_dir.join("mods");
+                let has_jars_in_mods = if mods_dir.exists() {
+                    std::fs::read_dir(&mods_dir)
+                        .ok()
+                        .map(|rd| {
+                            rd.flatten()
+                                .any(|e| e.path().extension().map_or(false, |ext| ext == "jar"))
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                let has_jars_at_root = std::fs::read_dir(&txn_dir)
+                    .ok()
+                    .map(|rd| {
+                        rd.flatten()
+                            .any(|e| e.path().extension().map_or(false, |ext| ext == "jar"))
+                    })
+                    .unwrap_or(false);
+                if has_jars_in_mods || has_jars_at_root {
+                    orphaned.push(txn_name);
+                }
+            }
+        }
+    }
+
+    // Sort newest first by created_at
+    all_records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    Ok(QuarantineListing {
+        records: all_records,
+        orphaned_transactions: orphaned,
+    })
+}
+
+// ── Active transaction scanning (Phase 3L) ────────────────────────────
+
+/// Check whether a server has any active install transactions.
+///
+/// An active transaction is one in Building, Committing, or PendingUserAction phase.
+/// Returns Ok(()) if no active transactions, or Err with the transaction_id if one exists.
+fn check_no_active_transactions(live_path: &Path) -> Result<(), String> {
+    use crate::install_transaction::{TransactionMeta, TransactionPhase};
+
+    let parent = live_path.parent().ok_or("Live path has no parent")?;
+    let staging_root = parent.join(".lbby-staging");
+
+    if !staging_root.exists() {
+        return Ok(());
+    }
+
+    if let Ok(entries) = std::fs::read_dir(&staging_root) {
+        for entry in entries.flatten() {
+            let staging_path = entry.path();
+            let marker = staging_path.join("transaction.json");
+            if !marker.exists() {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&marker) {
+                if let Ok(meta) = serde_json::from_str::<TransactionMeta>(&content) {
+                    if meta.live_path == live_path {
+                        match meta.phase {
+                            TransactionPhase::Building
+                            | TransactionPhase::Committing
+                            | TransactionPhase::PendingUserAction => {
+                                return Err(meta.transaction_id);
+                            }
+                            TransactionPhase::Committed => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── Duplicate provider check (Phase 3L) ──────────────────────────────
+
+/// Scan live/mods for JARs that declare any of the given mod_ids.
+/// Returns the first conflicting JAR and mod_id, or Ok(()) if no conflict.
+fn check_duplicate_providers(
+    live_mods: &Path,
+    mod_ids: &[String],
+) -> Result<(), (PathBuf, String)> {
+    if !live_mods.exists() {
+        return Ok(());
+    }
+    if let Ok(entries) = std::fs::read_dir(live_mods) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "jar") {
+                let metadata = crate::jar_metadata::read_jar_mod_metadata(&path);
+                for declared_id in &metadata.mod_ids {
+                    if mod_ids.contains(declared_id) {
+                        return Err((path, declared_id.clone()));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Path containment for restore (Phase 3L) ──────────────────────────
+
+/// Validate that a restore destination is safely inside live_path/mods.
+///
+/// Rejects: path traversal, absolute external paths, symlink escapes.
+/// `relative_path` is relative to `live_path` (e.g. "mods/create.jar").
+fn validate_restore_destination(
+    relative_path: &Path,
+    live_path: &Path,
+) -> Result<PathBuf, RestoreResult> {
+    let path_str = relative_path.to_string_lossy();
+
+    // Reject path traversal
+    if path_str.contains("..") {
+        return Err(RestoreResult::PathEscape);
+    }
+
+    // Reject absolute paths
+    if relative_path.is_absolute() {
+        return Err(RestoreResult::PathEscape);
+    }
+
+    // ── Structural validation: relative_path must start with "mods/" ──
+    // Checked BEFORE filesystem resolution. A tampered persisted record like
+    // "config/foo.jar" or "world/foo.jar" is rejected as InvalidMetadata —
+    // the metadata is structurally wrong, not a filesystem escape.
+    let rel_components: Vec<_> = relative_path.components().collect();
+    if rel_components.is_empty() {
+        return Err(RestoreResult::InvalidMetadata(
+            "Empty relative_path".to_string(),
+        ));
+    }
+    // First component must be "mods"
+    match rel_components[0] {
+        std::path::Component::Normal(c) if c == "mods" => {}
+        _ => {
+            return Err(RestoreResult::InvalidMetadata(format!(
+                "relative_path '{}' does not start with mods/",
+                path_str
+            )))
+        }
+    }
+    // Must have at least 2 components: mods/<filename>
+    if rel_components.len() < 2 {
+        return Err(RestoreResult::InvalidMetadata(format!(
+            "relative_path '{}' must be mods/<filename>",
+            path_str
+        )));
+    }
+    // Reject nested subdirectories — restore only supports mods/*.jar
+    if rel_components.len() > 2 {
+        return Err(RestoreResult::InvalidMetadata(format!(
+            "Nested paths not supported: '{}'. Only mods/<filename> allowed",
+            path_str
+        )));
+    }
+
+    // Resolve against live_path
+    let destination = live_path.join(relative_path);
+
+    // ── Canonical containment: must be under live/mods/ ───────────────
+    let mods_root = live_path.join("mods");
+    let canonical_mods = mods_root.canonicalize().map_err(|e| {
+        RestoreResult::Failed(format!(
+            "Failed to canonicalize mods root '{}': {}",
+            mods_root.display(),
+            e
+        ))
+    })?;
+
+    let dest_parent = match destination.parent() {
+        Some(p) => p,
+        None => {
+            return Err(RestoreResult::Failed(
+                "Destination has no parent".to_string(),
+            ))
+        }
+    };
+
+    let canonical_parent = dest_parent.canonicalize().map_err(|e| {
+        RestoreResult::Failed(format!(
+            "Failed to canonicalize destination parent '{}': {}",
+            dest_parent.display(),
+            e
+        ))
+    })?;
+
+    // The canonical parent must be a descendant of (or equal to) canonical mods root.
+    if !canonical_parent.starts_with(&canonical_mods) {
+        return Err(RestoreResult::PathEscape);
+    }
+
+    // Construct the final path under the canonical parent.
+    let filename = destination.file_name().ok_or(RestoreResult::Failed(
+        "Destination has no filename".to_string(),
+    ))?;
+    Ok(canonical_parent.join(filename))
+}
+
+// ── Quarantine source containment (Phase 3L.1) ─────────────────────
+
+/// Validate that a quarantine artifact path resolves inside the expected
+/// quarantine transaction directory. Even backend-written metadata must be
+/// treated as untrusted after restart / manual edits.
+fn validate_quarantine_source_containment(artifact_path: &Path, quarantine_txn_dir: &Path) -> bool {
+    let canonical_txn_dir = match quarantine_txn_dir.canonicalize() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let canonical_artifact_parent = match artifact_path.parent().and_then(|p| p.canonicalize().ok())
+    {
+        Some(c) => c,
+        None => return false,
+    };
+    canonical_artifact_parent.starts_with(&canonical_txn_dir)
+}
+
+// ── Atomic restore (Phase 3L / 3L.1) ───────────────────────────────
+
+/// Perform an atomic restore: copy → verify SHA → TOCTOU re-check → rename.
+///
+/// 1. Write to temp file `.lbby-restore-<id>.tmp` (not ending in .jar)
+/// 2. Verify SHA-256 of temp file matches expected
+/// 3. Re-check authoritative server lifecycle (TOCTOU guard)
+/// 4. Atomic rename temp → final destination
+/// 5. Post-rename verification: hash the live file
+///
+/// On any failure: cleanup temp, return error. Quarantine source untouched.
+fn atomic_restore_copy(
+    source: &Path,
+    destination: &Path,
+    expected_sha256: &str,
+    record_id: &str,
+    server_id: &str,
+    lifecycle_provider: &dyn RestoreLifecycleProvider,
+) -> Result<String, RestoreResult> {
+    let parent = destination.parent().ok_or(RestoreResult::Failed(
+        "Destination has no parent".to_string(),
+    ))?;
+
+    // ── Temp-file containment: must be under the same canonical mods root ──
+    // Defense-in-depth: even though validate_restore_destination already ensures
+    // the destination is under live/mods, we verify the temp file location too.
+    let canonical_parent = parent.canonicalize().map_err(|e| {
+        RestoreResult::Failed(format!(
+            "Failed to canonicalize temp parent '{}': {}",
+            parent.display(),
+            e
+        ))
+    })?;
+
+    // 1. Create temp file (NOT ending in .jar) — under the canonical parent
+    let temp_path = canonical_parent.join(format!(".lbby-restore-{}.tmp", record_id));
+
+    // Copy source → temp
+    std::fs::copy(source, &temp_path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        RestoreResult::Failed(format!("Failed to copy quarantine artifact to temp: {}", e))
+    })?;
+
+    // 2. Verify SHA of temp file
+    let temp_sha = compute_file_sha256(&temp_path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        RestoreResult::Failed(format!("Failed to hash temp file: {}", e))
+    })?;
+
+    if temp_sha != expected_sha256 {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(RestoreResult::Failed(format!(
+            "SHA mismatch after copy: expected {}, got {}",
+            expected_sha256, temp_sha
+        )));
+    }
+
+    // 3. TOCTOU re-check: server must still be Stopped before we commit.
+    match lifecycle_provider.get_server_state(server_id) {
+        Ok(state) if !state.is_stopped() => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(RestoreResult::StateChanged {
+                new_state: state.name().to_string(),
+            });
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(RestoreResult::Failed(format!(
+                "Failed to re-check server state: {}",
+                e
+            )));
+        }
+        _ => {} // Still stopped — proceed
+    }
+
+    // 4. Atomic rename temp → destination
+    std::fs::rename(&temp_path, destination).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        RestoreResult::Failed(format!("Failed to rename temp to destination: {}", e))
+    })?;
+
+    // 5. Post-rename verification
+    let live_sha = compute_file_sha256(destination).map_err(|e| {
+        let _ = std::fs::remove_file(destination);
+        RestoreResult::Failed(format!("Failed to verify restored file: {}", e))
+    })?;
+
+    if live_sha != expected_sha256 {
+        let _ = std::fs::remove_file(destination);
+        return Err(RestoreResult::Failed(format!(
+            "Post-rename SHA mismatch: expected {}, got {}",
+            expected_sha256, live_sha
+        )));
+    }
+
+    Ok(live_sha)
+}
+
+// ── Restore API (Phase 3L / 3L.1) ─────────────────────────────────
+
+/// Restore a quarantined mod (production entry point).
+///
+/// Resolves live_path from config. Queries authoritative lifecycle state
+/// via the `RestoreLifecycleProvider` trait — frontend/API clients must NOT
+/// pass filesystem paths or runtime booleans.
+pub fn restore_quarantined_mod(
+    server_id: &str,
+    transaction_id: &str,
+    record_id: &str,
+    lifecycle_provider: &dyn RestoreLifecycleProvider,
+) -> RestoreResult {
+    let live_path = match find_live_path_for_server(server_id) {
+        Some(p) => p,
+        None => {
+            return RestoreResult::RecordNotFound(format!(
+                "No live path found for server '{}'",
+                server_id
+            ))
+        }
+    };
+    restore_quarantined_mod_inner(
+        server_id,
+        transaction_id,
+        record_id,
+        &live_path,
+        lifecycle_provider,
+    )
+}
+
+/// Core restore implementation shared by production and test-only entry points.
+fn restore_quarantined_mod_inner(
+    server_id: &str,
+    transaction_id: &str,
+    record_id: &str,
+    live_path: &Path,
+    lifecycle_provider: &dyn RestoreLifecycleProvider,
+) -> RestoreResult {
+    // ── Acquire per-server lock (held until return) ──────────────────
+    let _server_lock = get_server_lock_arc(server_id);
+    let _server_guard = _server_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    // 1. Server must be Stopped (authoritative lifecycle check)
+    let lifecycle_state = match lifecycle_provider.get_server_state(server_id) {
+        Ok(state) => state,
+        Err(e) => return RestoreResult::Failed(format!("Failed to query server state: {}", e)),
+    };
+    if !lifecycle_state.is_stopped() {
+        return RestoreResult::ServerNotStopped {
+            state: lifecycle_state.name().to_string(),
+        };
+    }
+
+    // 2. No active transactions
+    if let Err(active_txn) = check_no_active_transactions(live_path) {
+        return RestoreResult::ActiveTransaction {
+            transaction_id: active_txn,
+        };
+    }
+
+    // 3. Locate quarantine transaction directory
+    let parent = match live_path.parent() {
+        Some(p) => p,
+        None => return RestoreResult::Failed("Live path has no parent".to_string()),
+    };
+    let quarantine_txn_dir = parent
+        .join(".lbby-quarantine")
+        .join(server_id)
+        .join(transaction_id);
+
+    if !quarantine_txn_dir.exists() {
+        return RestoreResult::RecordNotFound(format!(
+            "Quarantine directory not found for transaction {}",
+            transaction_id
+        ));
+    }
+
+    // 4. Load metadata
+    let mut meta = match load_quarantine_metadata(&quarantine_txn_dir) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return RestoreResult::RecordNotFound(
+                "No quarantine metadata for this transaction".to_string(),
+            )
+        }
+        Err(e) => return RestoreResult::InvalidMetadata(e),
+    };
+
+    // 5. Find the record
+    let rec_idx = match meta.records.iter().position(|r| r.record_id == record_id) {
+        Some(i) => i,
+        None => {
+            return RestoreResult::RecordNotFound(format!(
+                "Record '{}' not found in transaction {}",
+                record_id, transaction_id
+            ))
+        }
+    };
+
+    let record = meta.records[rec_idx].clone();
+
+    // 6. Server ownership check
+    if record.server_id != server_id {
+        return RestoreResult::RecordNotFound(format!(
+            "Record belongs to server '{}', not '{}'",
+            record.server_id, server_id
+        ));
+    }
+
+    // 7. Transaction ownership check
+    if record.transaction_id != transaction_id {
+        return RestoreResult::RecordNotFound(format!(
+            "Record belongs to transaction '{}', not '{}'",
+            record.transaction_id, transaction_id
+        ));
+    }
+
+    // 8. Already restored? (idempotency)
+    if record.status == QuarantineStatus::Restored {
+        return RestoreResult::AlreadyRestored;
+    }
+
+    // 9. Artifact exists
+    let artifact_path = quarantine_txn_dir.join("mods").join(&record.filename);
+    if !artifact_path.exists() {
+        return RestoreResult::MissingArtifact;
+    }
+
+    // 10. Quarantine source containment (Phase 3L.1 — validate metadata isn't lying)
+    if !validate_quarantine_source_containment(&artifact_path, &quarantine_txn_dir) {
+        return RestoreResult::QuarantineSourceEscape;
+    }
+
+    // 11. SHA verification
+    let current_sha = match compute_file_sha256(&artifact_path) {
+        Ok(h) => h,
+        Err(_) => return RestoreResult::MissingArtifact,
+    };
+    if current_sha != record.sha256 {
+        return RestoreResult::HashMismatch;
+    }
+
+    // 12. Identity verification — read JAR metadata, compare mod_ids
+    let jar_metadata = crate::jar_metadata::read_jar_mod_metadata(&artifact_path);
+    let mut expected_ids = record.mod_ids.clone();
+    expected_ids.sort();
+    let mut actual_ids = jar_metadata.mod_ids.clone();
+    actual_ids.sort();
+    if !expected_ids.is_empty() && !actual_ids.is_empty() && expected_ids != actual_ids {
+        return RestoreResult::IdentityMismatch {
+            expected: expected_ids,
+            actual: actual_ids,
+        };
+    }
+
+    // 13. Protected component check
+    for mod_id in &record.mod_ids {
+        if is_protected_component(mod_id) {
+            return RestoreResult::ProtectedComponent {
+                mod_id: mod_id.clone(),
+            };
+        }
+    }
+
+    // 14. Path containment — validate original_relative_path resolves inside live_path
+    let destination = match validate_restore_destination(&record.original_relative_path, live_path)
+    {
+        Ok(d) => d,
+        Err(e) => return e, // Already a RestoreResult (PathEscape, InvalidMetadata, or Failed)
+    };
+
+    // 15. Destination collision — file already exists
+    if destination.exists() {
+        return RestoreResult::DestinationConflict {
+            existing_path: destination,
+        };
+    }
+
+    // 16. Duplicate provider — another JAR in live/mods declares same mod_id
+    let live_mods = live_path.join("mods");
+    if let Err((conflicting_jar, mod_id)) = check_duplicate_providers(&live_mods, &record.mod_ids) {
+        return RestoreResult::DuplicateProviderConflict {
+            conflicting_jar,
+            mod_id,
+        };
+    }
+
+    // 17. ExplicitClientOnly check
+    let compat = crate::mod_compat::classify_mod_local(&artifact_path);
+    if matches!(
+        compat.compatibility,
+        crate::mod_compat::ServerCompatibility::ClientOnly
+    ) && matches!(
+        compat.confidence,
+        crate::mod_compat::CompatibilityConfidence::Explicit
+    ) {
+        if let Some(first_id) = record.mod_ids.first() {
+            return RestoreResult::ExplicitClientOnly {
+                mod_id: first_id.clone(),
+            };
+        }
+    }
+
+    // 18. Ensure live/mods exists
+    if let Err(e) = std::fs::create_dir_all(&live_mods) {
+        return RestoreResult::Failed(format!("Failed to create live/mods: {}", e));
+    }
+
+    // 19. Atomic restore: copy → verify → TOCTOU re-check → rename
+    let restore_sha = match atomic_restore_copy(
+        &artifact_path,
+        &destination,
+        &record.sha256,
+        record_id,
+        server_id,
+        lifecycle_provider,
+    ) {
+        Ok(sha) => sha,
+        Err(restore_result) => {
+            // Record failure in metadata
+            meta.records[rec_idx].status = QuarantineStatus::RestoreFailed;
+            let _ = save_quarantine_metadata(&quarantine_txn_dir, &meta);
+            return restore_result;
+        }
+    };
+
+    // 20. Update metadata: mark as restored
+    meta.records[rec_idx].status = QuarantineStatus::Restored;
+    meta.records[rec_idx].restored_at = Some(chrono::Utc::now().to_rfc3339());
+    meta.records[rec_idx].restore_sha256 = Some(restore_sha.clone());
+    meta.records[rec_idx].restore_target = Some(destination.clone());
+
+    if let Err(e) = save_quarantine_metadata(&quarantine_txn_dir, &meta) {
+        // Metadata update failed but file IS restored. Return explicit variant.
+        return RestoreResult::RestoredMetadataUpdateFailed {
+            sha256: restore_sha,
+            target: destination,
+        };
+    }
+
+    RestoreResult::Restored {
+        sha256: restore_sha,
+        target: destination,
+    }
+}
+
+/// Restore a quarantined mod with explicit live_path (testable without config).
+///
+/// **Test/development only** — the production API `restore_quarantined_mod`
+/// resolves paths internally. Frontend and Cloud clients must not provide
+/// filesystem paths.
+#[cfg(any(test, feature = "testing"))]
+pub fn restore_quarantined_mod_at(
+    server_id: &str,
+    transaction_id: &str,
+    record_id: &str,
+    live_path: &Path,
+    lifecycle_provider: &dyn RestoreLifecycleProvider,
+) -> RestoreResult {
+    restore_quarantined_mod_inner(
+        server_id,
+        transaction_id,
+        record_id,
+        live_path,
+        lifecycle_provider,
+    )
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
