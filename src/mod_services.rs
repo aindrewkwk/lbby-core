@@ -2024,16 +2024,23 @@ pub async fn install_curseforge_modpack(
         // Phase 3G: use ValidationRepairOrchestrator for centralized retry logic
         // Phase 3K.1: restore persisted retry state from prior pause (if any)
         let cf = curseforge_client()?;
-        let mut orch = if let Some(prior) =
-            crate::recovery_actions::load_retry_state(Path::new(&cfg2.server_path))
+        let mut orch = match crate::recovery_actions::load_retry_state(Path::new(&cfg2.server_path))
         {
-            crate::validation_orchestrator::ValidationRepairOrchestrator::from_persisted_state(
-                prior.boot_attempts_used,
-                prior.dependency_repairs_used,
-                prior.runtime_repairs_used,
-            )
-        } else {
-            crate::validation_orchestrator::ValidationRepairOrchestrator::new()
+            Ok(Some(prior)) => {
+                crate::validation_orchestrator::ValidationRepairOrchestrator::from_persisted_state(
+                    prior.boot_attempts_used,
+                    prior.dependency_repairs_used,
+                    prior.runtime_repairs_used,
+                )
+            }
+            Ok(None) => crate::validation_orchestrator::ValidationRepairOrchestrator::new(),
+            Err(e) => {
+                // Unsupported schema — fail safely, do NOT overwrite future state
+                return Err(format!(
+                    "Cannot proceed: unsupported retry-state schema ({})",
+                    e
+                ));
+            }
         };
         let empty_registry = crate::boot_failure_analyzer::InstalledFileRegistry::new();
         let mut resolver = crate::dependency_resolver::DependencyResolver::new(
@@ -2064,8 +2071,9 @@ pub async fn install_curseforge_modpack(
                     &txn.meta().server_id,
                     &txn.meta().transaction_id,
                 )?;
-                crate::recovery_actions::clear_retry_state(Path::new(&cfg2.server_path));
+                // Commit first (durable), THEN clear retry state
                 let meta = txn.commit()?;
+                crate::recovery_actions::clear_retry_state(Path::new(&cfg2.server_path));
                 cfg2.server_path = meta.live_path.to_string_lossy().to_string();
                 config::save_config(&cfg2)?;
                 return Ok(InstallOutcome::Success(cfg2));
@@ -2081,14 +2089,16 @@ pub async fn install_curseforge_modpack(
                     &txn.meta().transaction_id,
                     &failure.final_boot_result,
                 );
-                crate::recovery_actions::clear_retry_state(Path::new(&cfg2.server_path));
+                // Rollback first (durable staging removal), THEN clear retry state
                 txn.rollback()?;
+                crate::recovery_actions::clear_retry_state(Path::new(&cfg2.server_path));
                 return Err(err);
             }
             crate::validation_orchestrator::ValidationOutcome::UserActionRequired(req) => {
                 // Phase 3K.1: persist recovery metadata and pause transaction.
                 // No rollback — staging stays alive for later approval.
                 let recovery_meta = crate::install_transaction::PendingRecoveryMetadata {
+                    schema_version: crate::atomic_persistence::CURRENT_SCHEMA_VERSION,
                     server_id: req.server_id.clone(),
                     transaction_id: req.transaction_id.clone(),
                     staging_mods: req.staging_mods.clone(),
@@ -2111,6 +2121,7 @@ pub async fn install_curseforge_modpack(
                 let _ = crate::recovery_actions::save_retry_state(
                     Path::new(&cfg2.server_path),
                     &crate::recovery_actions::RetryStateSnapshot {
+                        schema_version: crate::atomic_persistence::CURRENT_SCHEMA_VERSION,
                         boot_attempts_used: orch.state().total_boot_attempts,
                         dependency_repairs_used: orch.state().dependency_repairs,
                         runtime_repairs_used: orch.state().runtime_repairs,
@@ -2121,7 +2132,9 @@ pub async fn install_curseforge_modpack(
                     "[CF][recovery] Pausing transaction {} — pending recovery for '{}'",
                     req.transaction_id, req.mod_id
                 );
-                let _paused_meta = txn.pause();
+                let _paused_meta = txn
+                    .pause()
+                    .map_err(|e| format!("Failed to persist pause state for recovery: {}", e))?;
                 return Ok(InstallOutcome::UserActionRequired {
                     server_id: req.server_id,
                     transaction_id: req.transaction_id,
@@ -2931,16 +2944,22 @@ pub async fn install_curseforge_modpack(
     }
     // Phase 3G: use ValidationRepairOrchestrator for centralized retry logic
     // Phase 3K.1: restore persisted retry state from prior pause (if any)
-    let mut orch = if let Some(prior) =
-        crate::recovery_actions::load_retry_state(Path::new(&cfg.server_path))
-    {
-        crate::validation_orchestrator::ValidationRepairOrchestrator::from_persisted_state(
-            prior.boot_attempts_used,
-            prior.dependency_repairs_used,
-            prior.runtime_repairs_used,
-        )
-    } else {
-        crate::validation_orchestrator::ValidationRepairOrchestrator::new()
+    let mut orch = match crate::recovery_actions::load_retry_state(Path::new(&cfg.server_path)) {
+        Ok(Some(prior)) => {
+            crate::validation_orchestrator::ValidationRepairOrchestrator::from_persisted_state(
+                prior.boot_attempts_used,
+                prior.dependency_repairs_used,
+                prior.runtime_repairs_used,
+            )
+        }
+        Ok(None) => crate::validation_orchestrator::ValidationRepairOrchestrator::new(),
+        Err(e) => {
+            // Unsupported schema — fail safely, do NOT overwrite future state
+            return Err(format!(
+                "Cannot proceed: unsupported retry-state schema ({})",
+                e
+            ));
+        }
     };
     let mut orch_cfg = cfg; // move cfg into orchestrator context
     let txn_meta = txn.meta();
@@ -2968,8 +2987,9 @@ pub async fn install_curseforge_modpack(
                 &txn.meta().server_id,
                 &txn.meta().transaction_id,
             )?;
-            crate::recovery_actions::clear_retry_state(Path::new(&orch_cfg.server_path));
+            // Commit first (durable), THEN clear retry state
             let meta = txn.commit()?;
+            crate::recovery_actions::clear_retry_state(Path::new(&orch_cfg.server_path));
             orch_cfg.server_path = meta.live_path.to_string_lossy().to_string();
             config::save_config(&orch_cfg)?;
             return Ok(InstallOutcome::Success(orch_cfg));
@@ -2985,14 +3005,16 @@ pub async fn install_curseforge_modpack(
                 &txn.meta().transaction_id,
                 &failure.final_boot_result,
             );
-            crate::recovery_actions::clear_retry_state(Path::new(&orch_cfg.server_path));
+            // Rollback first (durable staging removal), THEN clear retry state
             txn.rollback()?;
+            crate::recovery_actions::clear_retry_state(Path::new(&orch_cfg.server_path));
             return Err(err);
         }
         crate::validation_orchestrator::ValidationOutcome::UserActionRequired(req) => {
             // Phase 3K.1: persist recovery metadata and pause transaction.
             // No rollback — staging stays alive for later approval.
             let recovery_meta = crate::install_transaction::PendingRecoveryMetadata {
+                schema_version: crate::atomic_persistence::CURRENT_SCHEMA_VERSION,
                 server_id: req.server_id.clone(),
                 transaction_id: req.transaction_id.clone(),
                 staging_mods: req.staging_mods.clone(),
@@ -3015,6 +3037,7 @@ pub async fn install_curseforge_modpack(
             let _ = crate::recovery_actions::save_retry_state(
                 Path::new(&orch_cfg.server_path),
                 &crate::recovery_actions::RetryStateSnapshot {
+                    schema_version: crate::atomic_persistence::CURRENT_SCHEMA_VERSION,
                     boot_attempts_used: orch.state().total_boot_attempts,
                     dependency_repairs_used: orch.state().dependency_repairs,
                     runtime_repairs_used: orch.state().runtime_repairs,
@@ -3025,7 +3048,9 @@ pub async fn install_curseforge_modpack(
                 "[MR][recovery] Pausing transaction {} — pending recovery for '{}'",
                 req.transaction_id, req.mod_id
             );
-            let _paused_meta = txn.pause();
+            let _paused_meta = txn
+                .pause()
+                .map_err(|e| format!("Failed to persist pause state for recovery: {}", e))?;
             return Ok(InstallOutcome::UserActionRequired {
                 server_id: req.server_id,
                 transaction_id: req.transaction_id,

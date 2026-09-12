@@ -1764,6 +1764,7 @@ fn setup_pending_recovery(
         recovery_actions::compute_fingerprint(transaction_id, mod_id, &jar, 1, &[], &sha256);
 
     let recovery = PendingRecoveryMetadata {
+        schema_version: lbby_core::atomic_persistence::CURRENT_SCHEMA_VERSION,
         server_id: server_id.to_string(),
         transaction_id: transaction_id.to_string(),
         staging_mods: mods.clone(),
@@ -1782,6 +1783,7 @@ fn setup_pending_recovery(
     };
 
     let meta = TransactionMeta {
+        schema_version: lbby_core::atomic_persistence::CURRENT_SCHEMA_VERSION,
         server_id: server_id.to_string(),
         transaction_id: transaction_id.to_string(),
         source: "test".to_string(),
@@ -1917,6 +1919,7 @@ fn regression_recovery_reject_rollback() {
     std::fs::create_dir_all(&live).unwrap();
     std::fs::create_dir_all(staging.join("mods")).unwrap();
     let meta = TransactionMeta {
+        schema_version: lbby_core::atomic_persistence::CURRENT_SCHEMA_VERSION,
         server_id: "test-server".to_string(),
         transaction_id: "txn-003".to_string(),
         source: "test".to_string(),
@@ -2312,6 +2315,7 @@ fn regression_recovery_metadata_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("recovery.json");
     let original = PendingRecoveryMetadata {
+        schema_version: lbby_core::atomic_persistence::CURRENT_SCHEMA_VERSION,
         server_id: "test-server".into(),
         transaction_id: "txn-rt".into(),
         staging_mods: PathBuf::from("/tmp/staging/mods"),
@@ -2436,6 +2440,7 @@ fn regression_recovery_counter_persists() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("recovery.json");
     let meta = PendingRecoveryMetadata {
+        schema_version: lbby_core::atomic_persistence::CURRENT_SCHEMA_VERSION,
         server_id: "srv".into(),
         transaction_id: "txn-counter".into(),
         staging_mods: PathBuf::from("/tmp/staging/mods"),
@@ -2472,6 +2477,7 @@ fn regression_boot_attempt_counter_persists() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("recovery.json");
     let meta = PendingRecoveryMetadata {
+        schema_version: lbby_core::atomic_persistence::CURRENT_SCHEMA_VERSION,
         server_id: "srv".into(),
         transaction_id: "txn-boot".into(),
         staging_mods: PathBuf::from("/tmp/staging/mods"),
@@ -2620,6 +2626,7 @@ fn regression_approval_already_applied() {
 
     // Mark as already applied
     let recovery = PendingRecoveryMetadata {
+        schema_version: lbby_core::atomic_persistence::CURRENT_SCHEMA_VERSION,
         server_id: "test-server".into(),
         transaction_id: "txn-idem".into(),
         staging_mods: mods.clone(),
@@ -2638,6 +2645,7 @@ fn regression_approval_already_applied() {
     };
 
     let meta = TransactionMeta {
+        schema_version: lbby_core::atomic_persistence::CURRENT_SCHEMA_VERSION,
         server_id: "test-server".into(),
         transaction_id: "txn-idem".into(),
         source: "test".into(),
@@ -2682,6 +2690,7 @@ fn regression_approval_stale_fingerprint_invalidated() {
     let fp = recovery_actions::compute_fingerprint("txn-stale", "suspect-mod", &jar, 1, &[], &sha);
 
     let recovery = PendingRecoveryMetadata {
+        schema_version: lbby_core::atomic_persistence::CURRENT_SCHEMA_VERSION,
         server_id: "test-server".into(),
         transaction_id: "txn-stale".into(),
         staging_mods: mods.clone(),
@@ -2700,6 +2709,7 @@ fn regression_approval_stale_fingerprint_invalidated() {
     };
 
     let meta = TransactionMeta {
+        schema_version: lbby_core::atomic_persistence::CURRENT_SCHEMA_VERSION,
         server_id: "test-server".into(),
         transaction_id: "txn-stale".into(),
         source: "test".into(),
@@ -2841,6 +2851,7 @@ async fn regression_global_boot_ceiling_across_pause_resume() {
 
     // Simulate 3 prior boots by persisting retry state
     let initial_state = RetryStateSnapshot {
+        schema_version: lbby_core::atomic_persistence::CURRENT_SCHEMA_VERSION,
         boot_attempts_used: 3,
         dependency_repairs_used: 0,
         runtime_repairs_used: 0,
@@ -2883,6 +2894,7 @@ async fn regression_global_boot_ceiling_across_pause_resume() {
 
         // Save state (simulates what mod_services.rs does on UAR)
         let snapshot = RetryStateSnapshot {
+            schema_version: lbby_core::atomic_persistence::CURRENT_SCHEMA_VERSION,
             boot_attempts_used: orch.state().total_boot_attempts,
             dependency_repairs_used: orch.state().dependency_repairs,
             runtime_repairs_used: orch.state().runtime_repairs,
@@ -2921,6 +2933,7 @@ async fn regression_global_boot_ceiling_across_pause_resume() {
         );
 
         let snapshot = RetryStateSnapshot {
+            schema_version: lbby_core::atomic_persistence::CURRENT_SCHEMA_VERSION,
             boot_attempts_used: orch.state().total_boot_attempts,
             dependency_repairs_used: orch.state().dependency_repairs,
             runtime_repairs_used: orch.state().runtime_repairs,
@@ -2964,6 +2977,7 @@ async fn regression_global_boot_ceiling_across_pause_resume() {
         );
 
         let snapshot = RetryStateSnapshot {
+            schema_version: lbby_core::atomic_persistence::CURRENT_SCHEMA_VERSION,
             boot_attempts_used: orch.state().total_boot_attempts,
             dependency_repairs_used: orch.state().dependency_repairs,
             runtime_repairs_used: orch.state().runtime_repairs,
@@ -3302,6 +3316,7 @@ fn regression_restore_active_transaction_blocked() {
         .join(format!("srv3-{}", txn_id));
     std::fs::create_dir_all(&staging_txn).unwrap();
     let meta = TransactionMeta {
+        schema_version: lbby_core::atomic_persistence::CURRENT_SCHEMA_VERSION,
         server_id: "srv3".to_string(),
         transaction_id: txn_id.to_string(),
         source: "test".to_string(),

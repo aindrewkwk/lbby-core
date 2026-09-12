@@ -2,6 +2,7 @@
 // Contains all game server management logic, without any UI or web server dependencies.
 
 pub mod app_state;
+pub mod atomic_persistence;
 pub mod automodpack;
 pub mod backup;
 pub mod boot_failure_analyzer;
@@ -32,6 +33,7 @@ pub mod player_actions;
 #[cfg(feature = "sqlite")]
 pub mod player_stats;
 pub mod playit;
+pub mod reconciliation;
 pub mod recovery_actions;
 pub mod remote;
 pub mod runtime_remediator;

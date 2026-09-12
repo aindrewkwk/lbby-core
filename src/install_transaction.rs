@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::atomic_persistence::{atomic_write_json, CURRENT_SCHEMA_VERSION};
+
 // ── Transaction metadata (persisted as transaction.json) ────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -19,6 +21,10 @@ pub enum TransactionPhase {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionMeta {
+    /// Schema version. Absent in pre-3N files → defaults to 0 (legacy v0).
+    /// Current writes use schema_version = 1.
+    #[serde(default)]
+    pub schema_version: u32,
     pub server_id: String,
     pub transaction_id: String,
     pub source: String,
@@ -47,6 +53,9 @@ impl TransactionMeta {
 /// never sends filesystem paths.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingRecoveryMetadata {
+    /// Schema version. Absent in pre-3N files → defaults to 0 (legacy v0).
+    #[serde(default)]
+    pub schema_version: u32,
     /// Server identifier.
     pub server_id: String,
     /// Transaction identifier.
@@ -79,21 +88,44 @@ pub struct PendingRecoveryMetadata {
     pub applied: bool,
 }
 
+impl crate::atomic_persistence::HasSchemaVersion for PendingRecoveryMetadata {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+
+impl crate::atomic_persistence::HasSchemaVersion for TransactionMeta {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+
 impl PendingRecoveryMetadata {
     /// Persist recovery metadata alongside the transaction marker.
+    /// Uses atomic write to prevent partial corruption.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("Failed to serialize pending recovery: {}", e))?;
-        std::fs::write(path, json)
-            .map_err(|e| format!("Failed to write pending recovery metadata: {}", e))
+        atomic_write_json(path, self)
     }
 
     /// Load recovery metadata from disk.
+    /// Returns Err if file exists but is corrupt.
     pub fn load(path: &Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read pending recovery metadata: {}", e))?;
-        serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse pending recovery metadata: {}", e))
+        let mut meta: Self = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse pending recovery metadata: {}", e))?;
+        // Legacy v0 migration: set schema_version if absent
+        if meta.schema_version == 0 {
+            meta.schema_version = CURRENT_SCHEMA_VERSION;
+        }
+        // Reject future schema versions
+        if meta.schema_version > CURRENT_SCHEMA_VERSION {
+            return Err(format!(
+                "Unsupported schema version {} (max supported: {})",
+                meta.schema_version, CURRENT_SCHEMA_VERSION
+            ));
+        }
+        Ok(meta)
     }
 }
 
@@ -127,6 +159,7 @@ impl InstallTransaction {
             .map_err(|e| format!("Failed to create staging dir: {}", e))?;
 
         let meta = TransactionMeta {
+            schema_version: CURRENT_SCHEMA_VERSION,
             server_id: server_name,
             transaction_id: txn_id,
             source: source.to_string(),
@@ -285,9 +318,7 @@ impl InstallTransaction {
         self.meta.phase = TransactionPhase::Committed;
         // Save the marker into the now-live directory (so it survives staging cleanup)
         let live_marker = self.meta.live_path.join(".lbby-transaction.json");
-        let json = serde_json::to_string_pretty(&self.meta)
-            .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
-        std::fs::write(&live_marker, json)
+        atomic_write_json(&live_marker, &self.meta)
             .map_err(|e| format!("Failed to write commit marker: {}", e))?;
 
         // Step 5: Clean up the staging marker (staging dir is now live, so the old marker is gone)
@@ -339,9 +370,14 @@ impl InstallTransaction {
 
     /// Find stale (incomplete) transactions for a given server path.
     ///
+    /// This is READ-ONLY — no files are created, modified, or deleted.
     /// Scans the `.lbby-staging` directory for transaction markers.
-    /// Returns metadata for transactions that are in Building or Committing phase.
-    /// Committed transactions are cleaned up automatically.
+    /// Returns metadata for transactions that are in Building, Committing,
+    /// or PendingUserAction phase. Also returns Committed entries that
+    /// need cleanup (but does NOT clean them up — that is the caller's job).
+    ///
+    /// For actual cleanup, use `reconcile_recovery_state()` which handles
+    /// committed cleanup explicitly.
     pub fn find_stale(live_path: &Path) -> Vec<TransactionMeta> {
         let parent = match live_path.parent() {
             Some(p) => p,
@@ -372,8 +408,10 @@ impl InstallTransaction {
                                 stale.push(meta);
                             }
                             TransactionPhase::Committed => {
-                                // Leftover from a completed transaction — clean up
-                                let _ = std::fs::remove_dir_all(&path);
+                                // Committed entries need cleanup but discovery
+                                // is read-only. Include them so the caller can
+                                // handle cleanup explicitly.
+                                stale.push(meta);
                             }
                         }
                     }
@@ -381,20 +419,14 @@ impl InstallTransaction {
             }
         }
 
-        // Also check the live directory for a committed marker
+        // Also check the live directory for a committed marker (read-only)
         let live_marker = live_path.join(".lbby-transaction.json");
         if live_marker.exists() {
             if let Ok(content) = std::fs::read_to_string(&live_marker) {
                 if let Ok(meta) = serde_json::from_str::<TransactionMeta>(&content) {
                     if meta.phase == TransactionPhase::Committed {
-                        // Clean up committed marker
-                        let _ = std::fs::remove_file(&live_marker);
-                        // Clean up backup if it exists
-                        if let Some(ref backup) = meta.backup_path {
-                            if backup.exists() {
-                                let _ = std::fs::remove_dir_all(backup);
-                            }
-                        }
+                        // Include committed marker — caller handles cleanup
+                        stale.push(meta);
                     }
                 }
             }
@@ -425,17 +457,44 @@ impl InstallTransaction {
     ///
     /// If the app crashes while paused, `find_stale()` will detect the
     /// `PendingUserAction` phase marker on next startup.
-    pub fn pause(mut self) -> TransactionMeta {
+    ///
+    /// On save failure:
+    ///   1. In-memory phase is reverted to Building
+    ///   2. Staging directory is explicitly removed
+    ///   3. No PendingUserAction marker persists
+    ///   4. Live server remains untouched
+    ///   5. Transaction is NOT left resumable
+    pub fn pause(mut self) -> Result<TransactionMeta, String> {
         self.meta.phase = TransactionPhase::PendingUserAction;
-        let _ = self.meta.save(); // best-effort; marker already exists
-        let meta = self.meta.clone();
-        eprintln!(
-            "[CF] Transaction {} paused for user action",
-            meta.transaction_id
-        );
-        // Prevent Drop from rolling back — we consumed the phase
-        std::mem::forget(self);
-        meta
+        match self.meta.save() {
+            Ok(()) => {
+                let meta = self.meta.clone();
+                eprintln!(
+                    "[CF] Transaction {} paused for user action",
+                    meta.transaction_id
+                );
+                // Prevent Drop from rolling back — pause succeeded, staging must persist
+                std::mem::forget(self);
+                Ok(meta)
+            }
+            Err(e) => {
+                // Explicit rollback — do NOT rely on Drop for this.
+                // 1. Revert in-memory phase
+                self.meta.phase = TransactionPhase::Building;
+                // 2. Remove staging directory (if it exists)
+                if self.meta.staging_path.exists() {
+                    let _ = std::fs::remove_dir_all(&self.meta.staging_path);
+                }
+                // 3. Remove the marker file (if it exists)
+                let marker = self.meta.marker_path();
+                if marker.exists() {
+                    let _ = std::fs::remove_file(&marker);
+                }
+                // self drops here but staging is already removed — Drop's
+                // rollback() is a no-op since staging_path no longer exists.
+                Err(format!("Failed to persist pause state: {}", e))
+            }
+        }
     }
 
     /// Resume a paused transaction from its saved metadata.
@@ -485,10 +544,7 @@ impl TransactionMeta {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create staging dir: {}", e))?;
         }
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
-        std::fs::write(&path, json)
-            .map_err(|e| format!("Failed to write transaction marker: {}", e))
+        atomic_write_json(&path, self)
     }
 }
 
@@ -886,6 +942,7 @@ mod tests {
 
         // Write a fake transaction marker
         let meta = TransactionMeta {
+            schema_version: CURRENT_SCHEMA_VERSION,
             server_id: "srv".to_string(),
             transaction_id: "deadbeef1234".to_string(),
             source: "test".to_string(),
@@ -999,5 +1056,46 @@ mod tests {
         assert_eq!(loaded.phase, TransactionPhase::Committed);
 
         InstallTransaction::cleanup_backup(&meta);
+    }
+
+    #[test]
+    fn pause_failure_removes_staging_and_preserves_live() {
+        let base = temp_dir("pause_failure_explicit");
+        let live = make_server_dir(&base, "srv");
+        // Create a file in live to verify it's untouched
+        fs::write(live.join("server.properties"), "online-mode=false").unwrap();
+
+        let txn = InstallTransaction::begin(&live, "test").unwrap();
+        let staging = txn.staging_path().to_path_buf();
+        assert!(staging.exists(), "staging should exist before pause");
+
+        // Force the save to fail
+        let _guard = crate::atomic_persistence::ForceWriteFailureGuard::new();
+
+        let result = txn.pause();
+        assert!(result.is_err(), "pause must return Err on save failure");
+
+        // Verify staging is removed (explicit rollback, not Drop-dependent)
+        assert!(
+            !staging.exists(),
+            "staging directory must be removed on pause failure"
+        );
+
+        // Verify no PendingUserAction marker exists
+        let marker = staging.join("transaction.json");
+        assert!(
+            !marker.exists(),
+            "no PendingUserAction marker should persist on pause failure"
+        );
+
+        // Verify live server is untouched
+        assert!(live.exists(), "live server must still exist");
+        assert_eq!(
+            fs::read_to_string(live.join("server.properties")).unwrap(),
+            "online-mode=false",
+            "live server file must be untouched"
+        );
+
+        // Guard drops here, resetting the failure seam
     }
 }

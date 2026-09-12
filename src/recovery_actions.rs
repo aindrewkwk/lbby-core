@@ -17,6 +17,7 @@
 // - NO network calls
 // - Quarantine is transaction-scoped, not global
 
+use crate::atomic_persistence::{atomic_write_json, CURRENT_SCHEMA_VERSION};
 use crate::crash_attribution::{
     CrashAttributionConfidence, CrashAttributionReport, CrashAttributionStatus,
 };
@@ -759,10 +760,23 @@ pub struct QuarantineRecord {
 /// Top-level quarantine metadata file (schema_version + records).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuarantineMetadata {
-    /// Schema version for future migrations.
+    /// Schema version. Absent in pre-3N files → defaults to 0 (legacy v0).
+    #[serde(default)]
     pub schema_version: u32,
     /// All quarantine records for this transaction.
     pub records: Vec<QuarantineRecord>,
+}
+
+impl crate::atomic_persistence::HasSchemaVersion for QuarantineMetadata {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+
+impl crate::atomic_persistence::HasSchemaVersion for RetryStateSnapshot {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
 }
 
 impl QuarantineMetadata {
@@ -790,8 +804,10 @@ pub fn compute_record_id(transaction_id: &str, relative_path: &str, sha256: &str
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuarantineListing {
     pub records: Vec<QuarantineRecord>,
-    /// Transaction directories that had no metadata.json (legacy or corrupt).
+    /// Transaction directories that had no metadata.json (legacy or orphan).
     pub orphaned_transactions: Vec<String>,
+    /// Transaction directories with corrupt or unsupported-schema metadata.
+    pub corrupt_transactions: Vec<String>,
 }
 
 /// Result of a restore attempt.
@@ -1203,6 +1219,9 @@ fn find_live_path_for_server(server_id: &str) -> Option<PathBuf> {
 /// Persisted retry state for cross-pause/resume lifecycle tracking.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RetryStateSnapshot {
+    /// Schema version. Absent in pre-3N files → defaults to 0 (legacy v0).
+    #[serde(default)]
+    pub schema_version: u32,
     pub boot_attempts_used: u8,
     pub dependency_repairs_used: u8,
     pub runtime_repairs_used: u8,
@@ -1214,19 +1233,71 @@ fn retry_state_path(server_path: &Path) -> PathBuf {
 }
 
 /// Save orchestrator retry state to the server directory before pause.
+/// Uses atomic write to prevent partial corruption.
 pub fn save_retry_state(server_path: &Path, snapshot: &RetryStateSnapshot) -> Result<(), String> {
     let path = retry_state_path(server_path);
-    let json = serde_json::to_string_pretty(snapshot)
-        .map_err(|e| format!("Failed to serialize retry state: {}", e))?;
-    std::fs::write(&path, json).map_err(|e| format!("Failed to write retry state: {}", e))
+    atomic_write_json(&path, snapshot)
+}
+
+/// Error type for retry-state loading.
+#[derive(Debug, Clone)]
+pub enum RetryStateLoadError {
+    /// File was corrupt or unreadable.
+    ParseError(String),
+    /// Schema version is from a future release that this version cannot understand.
+    /// The file is NOT deleted or overwritten — caller must fail safely.
+    UnsupportedSchemaVersion { found: u32, max_supported: u32 },
+}
+
+impl std::fmt::Display for RetryStateLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ParseError(e) => write!(f, "Failed to parse retry state: {}", e),
+            Self::UnsupportedSchemaVersion {
+                found,
+                max_supported,
+            } => {
+                write!(
+                    f,
+                    "Unsupported retry-state schema version {} (max supported: {})",
+                    found, max_supported
+                )
+            }
+        }
+    }
 }
 
 /// Load orchestrator retry state from a prior pause.
-/// Returns None if no prior state exists (fresh lifecycle).
-pub fn load_retry_state(server_path: &Path) -> Option<RetryStateSnapshot> {
+/// Returns Ok(None) if no prior state exists (fresh lifecycle).
+/// Returns Err if file is corrupt or has unsupported schema version.
+/// Does NOT overwrite or delete future-version state.
+pub fn load_retry_state(
+    server_path: &Path,
+) -> Result<Option<RetryStateSnapshot>, RetryStateLoadError> {
     let path = retry_state_path(server_path);
-    let content = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| RetryStateLoadError::ParseError(format!("read failed: {}", e)))?;
+    let mut snapshot: RetryStateSnapshot = serde_json::from_str(&content)
+        .map_err(|e| RetryStateLoadError::ParseError(format!("parse failed: {}", e)))?;
+    // Reject future schema versions — return Err (NOT None)
+    if snapshot.schema_version > CURRENT_SCHEMA_VERSION {
+        eprintln!(
+            "[RECOVERY] Retry state has unsupported schema version {} (max: {}), failing",
+            snapshot.schema_version, CURRENT_SCHEMA_VERSION
+        );
+        return Err(RetryStateLoadError::UnsupportedSchemaVersion {
+            found: snapshot.schema_version,
+            max_supported: CURRENT_SCHEMA_VERSION,
+        });
+    }
+    // Legacy v0 migration: set schema_version if absent
+    if snapshot.schema_version == 0 {
+        snapshot.schema_version = CURRENT_SCHEMA_VERSION;
+    }
+    Ok(Some(snapshot))
 }
 
 /// Delete retry state after successful commit or rollback.
@@ -1310,7 +1381,7 @@ fn quarantine_metadata_path(quarantine_txn_dir: &Path) -> PathBuf {
 
 /// Load quarantine metadata from a transaction quarantine directory.
 /// Returns None if file does not exist (not an error — legacy dir).
-/// Returns Err if file exists but is corrupt.
+/// Returns Err if file exists but is corrupt or has unsupported schema.
 fn load_quarantine_metadata(
     quarantine_txn_dir: &Path,
 ) -> Result<Option<QuarantineMetadata>, String> {
@@ -1322,10 +1393,18 @@ fn load_quarantine_metadata(
         .map_err(|e| format!("Failed to read quarantine metadata: {}", e))?;
     let meta: QuarantineMetadata = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse quarantine metadata: {}", e))?;
+    // Reject future schema versions
+    if meta.schema_version > CURRENT_SCHEMA_VERSION {
+        return Err(format!(
+            "Unsupported quarantine schema version {} (max supported: {})",
+            meta.schema_version, CURRENT_SCHEMA_VERSION
+        ));
+    }
     Ok(Some(meta))
 }
 
 /// Save quarantine metadata to a transaction quarantine directory.
+/// Uses atomic write to prevent partial corruption.
 pub fn save_quarantine_metadata(
     quarantine_txn_dir: &Path,
     meta: &QuarantineMetadata,
@@ -1333,11 +1412,7 @@ pub fn save_quarantine_metadata(
     std::fs::create_dir_all(quarantine_txn_dir)
         .map_err(|e| format!("Failed to create quarantine dir: {}", e))?;
     let path = quarantine_metadata_path(quarantine_txn_dir);
-    let json = serde_json::to_string_pretty(meta)
-        .map_err(|e| format!("Failed to serialize quarantine metadata: {}", e))?;
-    std::fs::write(&path, json)
-        .map_err(|e| format!("Failed to write quarantine metadata: {}", e))?;
-    Ok(())
+    atomic_write_json(&path, meta)
 }
 
 /// Record a newly quarantined artifact into the transaction quarantine metadata.
@@ -1413,11 +1488,13 @@ pub fn list_quarantined_mods_at(
         return Ok(QuarantineListing {
             records: Vec::new(),
             orphaned_transactions: Vec::new(),
+            corrupt_transactions: Vec::new(),
         });
     }
 
     let mut all_records = Vec::new();
     let mut orphaned = Vec::new();
+    let mut corrupt = Vec::new();
 
     let entries = std::fs::read_dir(&quarantine_server_dir)
         .map_err(|e| format!("Failed to read quarantine dir: {}", e))?;
@@ -1437,8 +1514,16 @@ pub fn list_quarantined_mods_at(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        match load_quarantine_metadata(&txn_dir)? {
-            Some(mut meta) => {
+        match load_quarantine_metadata(&txn_dir) {
+            Err(e) => {
+                // Corrupt or unsupported schema — record and skip, don't break listing
+                eprintln!(
+                    "[RECOVERY] Corrupt quarantine metadata in {}: {}",
+                    txn_name, e
+                );
+                corrupt.push(txn_name);
+            }
+            Ok(Some(mut meta)) => {
                 // Verify each record: artifact exists, SHA matches
                 for rec in &mut meta.records {
                     if rec.status == QuarantineStatus::Restored {
@@ -1465,7 +1550,7 @@ pub fn list_quarantined_mods_at(
                     all_records.push(rec.clone());
                 }
             }
-            None => {
+            Ok(None) => {
                 // No metadata — check if there are JAR files (legacy or orphan)
                 let mods_dir = txn_dir.join("mods");
                 let has_jars_in_mods = if mods_dir.exists() {
@@ -1499,6 +1584,7 @@ pub fn list_quarantined_mods_at(
     Ok(QuarantineListing {
         records: all_records,
         orphaned_transactions: orphaned,
+        corrupt_transactions: corrupt,
     })
 }
 
