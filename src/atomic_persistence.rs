@@ -14,22 +14,22 @@ use std::path::Path;
 /// Current schema version for Phase 3N persistence.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
-/// Test-only seam: when set to `true`, `atomic_write_json` will always fail.
-/// This lets tests deterministically trigger persistence failures without
-/// needing to mock the filesystem.
+/// Test-only seam: thread-local flag so parallel tests don't interfere.
+/// When set to `true` for the current thread, `atomic_write_json` will always fail.
 #[cfg(test)]
-static FORCE_ATOMIC_WRITE_FAILURE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+std::thread_local! {
+    static FORCE_ATOMIC_WRITE_FAILURE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
 
-/// Guard that forces `atomic_write_json` to fail while alive.
-/// Automatically resets on drop. Scoped for safety.
+/// Guard that forces `atomic_write_json` to fail on the current thread while alive.
+/// Automatically resets on drop. Thread-local — safe for parallel test execution.
 #[cfg(test)]
 pub struct ForceWriteFailureGuard(());
 
 #[cfg(test)]
 impl ForceWriteFailureGuard {
     pub fn new() -> Self {
-        FORCE_ATOMIC_WRITE_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+        FORCE_ATOMIC_WRITE_FAILURE.with(|f| f.set(true));
         Self(())
     }
 }
@@ -37,7 +37,7 @@ impl ForceWriteFailureGuard {
 #[cfg(test)]
 impl Drop for ForceWriteFailureGuard {
     fn drop(&mut self) {
-        FORCE_ATOMIC_WRITE_FAILURE.store(false, std::sync::atomic::Ordering::SeqCst);
+        FORCE_ATOMIC_WRITE_FAILURE.with(|f| f.set(false));
     }
 }
 
@@ -49,10 +49,13 @@ impl Drop for ForceWriteFailureGuard {
 /// - On failure, `.tmp` is cleaned up best-effort and target is untouched
 /// - File is flushed before rename for durability
 pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
-    // Test-only failure seam
+    // Test-only failure seam (thread-local)
     #[cfg(test)]
-    if FORCE_ATOMIC_WRITE_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err("forced write failure (test seam)".to_string());
+    {
+        let should_fail = FORCE_ATOMIC_WRITE_FAILURE.with(|f| f.get());
+        if should_fail {
+            return Err("forced write failure (test seam)".to_string());
+        }
     }
 
     let json =

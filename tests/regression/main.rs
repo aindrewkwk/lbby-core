@@ -7,6 +7,7 @@
 // Run specific scenario: cargo test --test regression --features testing regression_scenario_a
 
 mod fixtures;
+mod phase_3o_acceptance;
 
 use fixtures::*;
 use lbby_core::boot_failure_analyzer::{InstalledFileInfo, InstalledFileRegistry};
