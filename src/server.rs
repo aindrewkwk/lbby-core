@@ -1737,20 +1737,47 @@ pub async fn do_install_server(
             &cfg.minecraft_version,
             Some(&server_type_str),
         );
+        eprintln!("[forge-diag] required Java major: {}", required_major);
+        eprintln!("[forge-diag] ensure_java({}) starting...", required_major);
         cfg.java_path = match crate::java::ensure_java(required_major, &app).await {
-            Ok(path) => path.to_string_lossy().to_string(),
+            Ok(path) => {
+                eprintln!("[forge-diag] ensure_java OK: {}", path.display());
+                path.to_string_lossy().to_string()
+            }
             Err(download_err) => {
+                eprintln!("[forge-diag] ensure_java FAILED: {}", download_err);
                 let fallback = check_java().await.unwrap_or_else(|_| "java".to_string());
+                eprintln!("[forge-diag] fallback java: {}", fallback);
                 let bin = std::path::PathBuf::from(&fallback);
                 match crate::java::detect_java_major(&bin) {
-                    Some(m) if m >= required_major => fallback,
-                    _ => return Err(format!(
-                        "Java {} is required for Minecraft {} but could not be installed or found. {}",
-                        required_major, cfg.minecraft_version, download_err
-                    )),
+                    Some(m) if m >= required_major => {
+                        eprintln!(
+                            "[forge-diag] fallback java major {} >= {}, using it",
+                            m, required_major
+                        );
+                        fallback
+                    }
+                    Some(m) => {
+                        eprintln!(
+                            "[forge-diag] fallback java major {} < {}, REJECTED",
+                            m, required_major
+                        );
+                        return Err(format!(
+                            "Java {} is required for Minecraft {} but could not be installed or found. {}",
+                            required_major, cfg.minecraft_version, download_err
+                        ));
+                    }
+                    _ => {
+                        eprintln!("[forge-diag] fallback java version detection failed");
+                        return Err(format!(
+                            "Java {} is required for Minecraft {} but could not be installed or found. {}",
+                            required_major, cfg.minecraft_version, download_err
+                        ));
+                    }
                 }
             }
         };
+        eprintln!("[forge-diag] final cfg.java_path: {}", cfg.java_path);
     }
 
     match cfg.server_type {
@@ -2186,6 +2213,44 @@ pub(crate) async fn install_modloader_transactional(
         return Err(format!("Failed to stage {label}: {error}"));
     }
     emit_progress(app, &format!("Running {label}…"), 0.6);
+
+    // === Phase 3O diagnostic: log full invocation context ===
+    eprintln!("[forge-diag] java_path: {}", java_path.display());
+    eprintln!("[forge-diag] staging: {}", staging.display());
+    eprintln!(
+        "[forge-diag] installer: {}",
+        staging.join(&installer_name).display()
+    );
+    eprintln!(
+        "[forge-diag] command: {} -jar {} --installServer",
+        java_path.display(),
+        installer_name
+    );
+    if !staging.exists() {
+        return Err(format!(
+            "{label}: staging directory does not exist: {}",
+            staging.display()
+        ));
+    }
+    if !staging.join(&installer_name).exists() {
+        return Err(format!(
+            "{label}: installer JAR not found at {}",
+            staging.join(&installer_name).display()
+        ));
+    }
+    // Check java -version for diagnostic
+    if let Ok(jv) = std::process::Command::new(java_path)
+        .arg("-version")
+        .output()
+    {
+        let ver = String::from_utf8_lossy(&jv.stderr);
+        eprintln!(
+            "[forge-diag] java -version: {}",
+            ver.lines().next().unwrap_or("?")
+        );
+    }
+    // === end diagnostic ===
+
     let mut cmd = tokio::process::Command::new(java_path);
     cmd.args(["-jar", &installer_name, "--installServer"])
         .current_dir(&staging);
@@ -2198,9 +2263,54 @@ pub(crate) async fn install_modloader_transactional(
         }
     };
     if !output.status.success() {
-        let details = String::from_utf8_lossy(&output.stderr);
+        // Capture BOTH stdout and stderr — Forge installer writes to stdout
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Preserve tail of output for context
+        let stdout_tail: String = stdout
+            .lines()
+            .rev()
+            .take(30)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let stderr_tail: String = stderr
+            .lines()
+            .rev()
+            .take(10)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        eprintln!("[forge-diag] EXIT: {}", output.status.code().unwrap_or(-1));
+        eprintln!("[forge-diag] STDOUT (tail):\n{}", stdout_tail);
+        eprintln!("[forge-diag] STDERR (tail):\n{}", stderr_tail);
+        // List staging dir contents for context
+        if let Ok(entries) = std::fs::read_dir(&staging) {
+            let names: Vec<String> = entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            eprintln!("[forge-diag] staging contents: {:?}", names);
+        }
         tokio::fs::remove_dir_all(&staging).await.ok();
-        return Err(format!("{label} failed: {details}"));
+        return Err(format!(
+            "{label} failed (exit {}):\nSTDOUT:\n{}\nSTDERR:\n{}",
+            output.status.code().unwrap_or(-1),
+            if stdout_tail.is_empty() {
+                "(empty)"
+            } else {
+                &stdout_tail
+            },
+            if stderr_tail.is_empty() {
+                "(empty)"
+            } else {
+                &stderr_tail
+            }
+        ));
     }
     if let Err(error) = detect_modloader_launch(&staging, kind, version_key) {
         tokio::fs::remove_dir_all(&staging).await.ok();

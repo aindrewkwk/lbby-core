@@ -201,12 +201,21 @@ pub fn read_jar_mod_metadata(path: &Path) -> JarModMetadata {
     metadata
 }
 
-/// Check if a mod ID is a platform/loader dependency that should be
+/// Check if a mod ID is a platform/loader/runtime dependency that should be
 /// filtered from dependency tracking.
+///
+/// Platform IDs represent Java runtime, Minecraft, mod loaders, and loader
+/// APIs — they are never downloadable mods and must NOT enter CurseForge
+/// auto-resolution, missing-mod graphs, or dependency repair rounds.
+///
+/// They MAY still contribute to runtime compatibility diagnostics, Java
+/// version requirements, and loader compatibility checks via the
+/// `LoaderVersionRequirement` path when `platform_id_to_loader_kind`
+/// returns `Some`.
 pub fn is_platform_id(mod_id: &str) -> bool {
     matches!(
         mod_id,
-        "minecraft" | "forge" | "neoforge" | "fabricloader" | "fabric" | "quilt_loader"
+        "minecraft" | "forge" | "neoforge" | "fabricloader" | "fabric" | "quilt_loader" | "java"
     )
 }
 

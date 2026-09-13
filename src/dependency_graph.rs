@@ -903,7 +903,7 @@ mod tests {
 
     #[test]
     fn forge_platform_ids_not_included() {
-        let toml = b"modLoader=\"javafml\"\nloaderVersion=\"[47,)\"\n\n[[mods]]\nmodId=\"test\"\n\n[[dependencies.test]]\nmodId=\"forge\"\nversionRange=\"[47,)\"\nmandatory=true\n\n[[dependencies.test]]\nmodId=\"minecraft\"\nversionRange=\"[1.20.1,1.21)\"\nmandatory=true\n\n[[dependencies.test]]\nmodId=\"neoforge\"\nversionRange=\"[20.4,)\"\nmandatory=true\n";
+        let toml = b"modLoader=\"javafml\"\nloaderVersion=\"[47,)\"\n\n[[mods]]\nmodId=\"test\"\n\n[[dependencies.test]]\nmodId=\"forge\"\nversionRange=\"[47,)\"\nmandatory=true\n\n[[dependencies.test]]\nmodId=\"minecraft\"\nversionRange=\"[1.20.1,1.21)\"\nmandatory=true\n\n[[dependencies.test]]\nmodId=\"neoforge\"\nversionRange=\"[20.4,)\"\nmandatory=true\n\n[[dependencies.test]]\nmodId=\"java\"\nversionRange=\"[17,)\"\nmandatory=true\nside=\"BOTH\"\n";
         let jar = make_test_jar(&[("META-INF/mods.toml", toml)]);
 
         let graph = DependencyGraph::build(&[(jar.path().to_path_buf(), make_unknown_compat())]);

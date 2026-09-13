@@ -49,3 +49,13 @@ strip = "symbols"
 panic = "abort"
 incremental = false
 overflow-checks = true
+
+[[bin]]
+name = "oculus_acceptance"
+path = "src/bin/oculus_acceptance.rs"
+required-features = ["testing"]
+
+[[bin]]
+name = "phase_3o_smokes"
+path = "src/bin/phase_3o_smokes.rs"
+required-features = ["testing"]

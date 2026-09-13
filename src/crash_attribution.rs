@@ -253,7 +253,9 @@ fn parse_explicit_mod_ids(log: &str) -> Vec<ParsedEvidence> {
         }
 
         // Forge: "Mod <id> has failed to load correctly"
-        if let Some(id) = extract_between(line, "Mod ", " has failed") {
+        // Requires "to load correctly" suffix to avoid false positives from
+        // the generic "Mod Loading has failed" error message.
+        if let Some(id) = extract_between(line, "Mod ", " has failed to load correctly") {
             results.push(ParsedEvidence {
                 source: CrashEvidenceSource::LoaderDiagnostic,
                 matched_text: line.to_string(),
@@ -262,6 +264,24 @@ fn parse_explicit_mod_ids(log: &str) -> Vec<ParsedEvidence> {
                 jar_path: None,
             });
             continue;
+        }
+
+        // Forge crash report section header: "-- MOD <id> --"
+        // This is Forge's structured crash diagnostic format (CrashReportExtender).
+        let trimmed_hdr = line.trim();
+        if trimmed_hdr.starts_with("-- MOD ") && trimmed_hdr.ends_with(" --") {
+            let id_part = &trimmed_hdr["-- MOD ".len()..trimmed_hdr.len() - " --".len()];
+            let id = id_part.trim();
+            if !id.is_empty() && !id.contains(' ') {
+                results.push(ParsedEvidence {
+                    source: CrashEvidenceSource::LoaderDiagnostic,
+                    matched_text: line.to_string(),
+                    snippet: truncate_snippet(line),
+                    mod_id: Some(id.to_string()),
+                    jar_path: None,
+                });
+                continue;
+            }
         }
 
         // Generic: "Failed to load mod: <id>"
@@ -648,6 +668,13 @@ fn build_candidates(
                 })
             })
         });
+
+        // Skip evidence that resolved to nothing — e.g. framework JAR paths
+        // (fmlloader, modlauncher, mixin) that aren't in staging mods.
+        // These create phantom (None, None) candidates that outscore real ones.
+        if resolved_mod_id.is_none() && resolved_jar.is_none() {
+            continue;
+        }
 
         let key = (resolved_mod_id.clone(), resolved_jar.clone());
 
@@ -1898,5 +1925,206 @@ mod tests {
             CrashAttributionConfidence::High,
             "Stack frame only should not be High"
         );
+    }
+
+    // ── Forge "-- MOD <id> --" section header ─────────────────────
+
+    #[test]
+    fn test_forge_mod_section_header_attribution() {
+        let tmp = TempDir::new().unwrap();
+        create_test_jar(tmp.path(), "oculus-mc1.20.1.jar", &["oculus"]);
+
+        // Real Forge crash report format for Oculus
+        let log = "\
+---- Minecraft Crash Report ----
+Time: 2026-09-13 01:24:47
+Description: Mod loading error has occurred
+
+java.lang.Exception: Mod Loading has failed
+\tat net.minecraftforge.logging.CrashReportExtender.dumpModLoadingCrashReport(CrashReportExtender.java:60)
+
+-- Head --
+Thread: main
+Suspected Mods: NONE
+-- MOD oculus --
+Details:
+\tMod File: /tmp/.lbby-staging/test/mods/oculus-mc1.20.1.jar
+\tFailure message: Oculus (oculus) has failed to load correctly
+\t\tjava.lang.RuntimeException: Attempted to load class net/minecraft/client/gui/screens/Screen for invalid dist DEDICATED_SERVER
+\tMod Version: 1.6.15a
+\tException message: java.lang.RuntimeException: Attempted to load class net/minecraft/client/gui/screens/Screen for invalid dist DEDICATED_SERVER";
+
+        let ctx = test_context(tmp.path());
+        let report = analyze_crash(log, &ctx);
+
+        assert_eq!(report.status, CrashAttributionStatus::Attributed);
+        assert_eq!(report.confidence, CrashAttributionConfidence::High);
+        assert_eq!(
+            report.primary_candidate.as_ref().unwrap().mod_id.as_deref(),
+            Some("oculus"),
+            "Should attribute to oulus from -- MOD oculus -- header"
+        );
+    }
+
+    // ── "Mod Loading has failed" must NOT produce false positive ──
+
+    #[test]
+    fn test_mod_loading_no_false_positive() {
+        let tmp = TempDir::new().unwrap();
+        // Create JAR so the Mod File: path can resolve via ownership index
+        create_test_jar(tmp.path(), "oculus-mc1.20.1.jar", &["oculus"]);
+
+        let log = "\
+java.lang.Exception: Mod Loading has failed
+\tat net.minecraftforge.logging.CrashReportExtender.dumpModLoadingCrashReport(CrashReportExtender.java:60)
+-- Head --
+Suspected Mods: NONE
+-- MOD oculus --
+Details:
+\tMod File: /tmp/.lbby-staging/test/mods/oculus-mc1.20.1.jar
+\tFailure message: Oculus (oculus) has failed to load correctly";
+
+        let ctx = test_context(tmp.path());
+        let report = analyze_crash(log, &ctx);
+
+        // Must NOT have a "Loading" candidate
+        for cand in &report.candidates {
+            assert_ne!(
+                cand.mod_id.as_deref(),
+                Some("Loading"),
+                "\"Mod Loading has failed\" must not produce a false \"Loading\" mod_id"
+            );
+        }
+
+        // Should attribute to oculus (from -- MOD oculus -- header + Mod File)
+        assert_eq!(report.status, CrashAttributionStatus::Attributed);
+        assert_eq!(
+            report.primary_candidate.as_ref().unwrap().mod_id.as_deref(),
+            Some("oculus")
+        );
+    }
+
+    // ── Regression: framework JAR references must not create phantom candidates ──
+
+    /// Crash log with many framework JAR references in stack traces (fmlloader,
+    /// modlauncher, mixin, etc.) must NOT outscore the real mod candidate.
+    /// This reproduces the Phase 3O acceptance bug where (None, None) candidates
+    /// accumulated score from framework JARs extracted by extract_jar_path.
+    #[test]
+    fn test_framework_jars_do_not_outscore_real_mod() {
+        let tmp = TempDir::new().unwrap();
+        create_test_jar(tmp.path(), "oculus-mc1.20.1.jar", &["oculus"]);
+
+        // Realistic Forge crash log with framework JAR references in stack traces
+        let log = "\
+---- Minecraft Crash Report ----
+Time: 2026-09-13 14:55:18
+Description: Mod loading error has occurred
+
+java.lang.Exception: Mod Loading has failed
+\tat net.minecraftforge.logging.CrashReportExtender.dumpModLoadingCrashReport(CrashReportExtender.java:60) ~[forge-1.20.1-47.2.20-universal.jar%23108!/:?]
+\tat net.minecraftforge.server.loading.ServerModLoader.load(ServerModLoader.java:37) ~[forge-1.20.1-47.2.20-universal.jar%23108!/:?]
+\tat net.minecraft.server.Main.main(Main.java:125) ~[server-1.20.1-20230612.114412-srg.jar%23103!/:?]
+
+-- Head --
+Thread: main
+Suspected Mods: NONE
+-- MOD oculus --
+Details:
+\tMod File: /tmp/.lbby-staging/test/mods/oculus-mc1.20.1.jar
+\tFailure message: Oculus (oculus) has failed to load correctly
+\t\tjava.lang.RuntimeException: Attempted to load class net/minecraft/client/gui/screens/Screen for invalid dist DEDICATED_SERVER
+\tMod Version: 1.6.15a
+Stacktrace:
+\tat net.minecraftforge.fml.loading.RuntimeDistCleaner.processClassWithFlags(RuntimeDistCleaner.java:57) ~[fmlloader-1.20.1-47.2.20.jar%2369!/:1.0] {}
+\tat cpw.mods.modlauncher.LaunchPluginHandler.offerClassNodeToPlugins(LaunchPluginHandler.java:88) ~[modlauncher-10.0.9.jar%2355!/:?] {}
+\tat cpw.mods.modlauncher.ClassTransformer.transform(ClassTransformer.java:120) ~[modlauncher-10.0.9.jar%2355!/:?] {}
+\tat cpw.mods.cl.ModuleClassLoader.findClass(ModuleClassLoader.java:219) ~[securejarhandler-2.1.10.jar:?] {}
+
+-- System Details --
+Details:
+\tMinecraft Version: 1.20.1
+\tModLauncher: 10.0.9+10.0.9+main.dcd20f30
+\tSpongePowered MIXIN Subsystem Version=0.8.5 Source=union:/path/mixin-0.8.5.jar%2365!/ Service=ModLauncher";
+
+        let ctx = test_context(tmp.path());
+        let report = analyze_crash(log, &ctx);
+
+        // Must attribute to oulus, NOT to a phantom (None, None) candidate
+        assert_eq!(report.status, CrashAttributionStatus::Attributed);
+        assert_eq!(report.confidence, CrashAttributionConfidence::High);
+        let primary = report.primary_candidate.as_ref().unwrap();
+        assert_eq!(
+            primary.mod_id.as_deref(),
+            Some("oculus"),
+            "Framework JARs (fmlloader, modlauncher, mixin, etc.) must NOT outscore real mod evidence"
+        );
+        assert!(
+            primary.jar_path.is_some(),
+            "Primary candidate must have a jar_path resolved from the staging index"
+        );
+
+        // No candidate should have both mod_id=None and jar_path=None
+        for cand in &report.candidates {
+            assert!(
+                cand.mod_id.is_some() || cand.jar_path.is_some(),
+                "Phantom (None, None) candidate found with score={}: evidence={:?}",
+                cand.score,
+                cand.evidence
+                    .iter()
+                    .map(|e| &e.matched_text)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Negative twin: when the only attributed mod's JAR is NOT in the staging index,
+    /// check_action_availability must return UnavailableMissingJar.
+    #[test]
+    fn test_framework_jars_negative_jar_not_in_index() {
+        let tmp = TempDir::new().unwrap();
+        // Create a DIFFERENT jar — not the one the crash log references
+        create_test_jar(tmp.path(), "other-mod.jar", &["other"]);
+
+        let log = "\
+-- MOD oculus --
+Details:
+\tMod File: /tmp/.lbby-staging/test/mods/oculus-mc1.20.1.jar
+\tFailure message: Oculus (oculus) has failed to load correctly
+\tat net.minecraftforge.fml.loading.RuntimeDistCleaner.processClassWithFlags(RuntimeDistCleaner.java:57) ~[fmlloader-1.20.1-47.2.20.jar%2369!/:1.0] {}";
+
+        let ctx = test_context(tmp.path());
+        let report = analyze_crash(log, &ctx);
+
+        // oculus jar is NOT in staging → no ownership index entry →
+        // -- MOD oculus -- gives mod_id but jar can't be resolved from index
+        // (no matching jar in staging mods). Jar resolution from mod_id also
+        // fails because index has no "oculus" entry.
+        // So the evidence resolves to (Some("oculus"), None).
+        // verify no phantom (None, None) candidates exist
+        for cand in &report.candidates {
+            assert!(
+                cand.mod_id.is_some() || cand.jar_path.is_some(),
+                "Phantom (None, None) candidate found"
+            );
+        }
+
+        // Check action availability — should be UnavailableMissingJar because
+        // no jar_path is present on the primary candidate
+        if let Some(primary) = &report.primary_candidate {
+            if primary.jar_path.is_none() {
+                let jar_to_mod_ids = std::collections::HashMap::new();
+                let availability =
+                    crate::recovery_actions::check_action_availability(&report, &jar_to_mod_ids);
+                assert!(
+                    matches!(
+                        availability,
+                        crate::recovery_actions::RecoveryActionAvailability::UnavailableMissingJar
+                    ),
+                    "Expected UnavailableMissingJar when jar not in staging, got: {:?}",
+                    availability
+                );
+            }
+        }
     }
 }

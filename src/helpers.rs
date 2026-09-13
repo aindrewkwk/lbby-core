@@ -275,11 +275,7 @@ pub fn read_forge_dependencies(path: &std::path::Path) -> Vec<(String, String)> 
                     .unwrap_or(true);
                 let dep_type = dep.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 let is_required = mandatory || dep_type.eq_ignore_ascii_case("required");
-                if is_required
-                    && !mod_id.is_empty()
-                    && mod_id != "forge"
-                    && mod_id != "neoforge"
-                    && mod_id != "minecraft"
+                if is_required && !mod_id.is_empty() && !crate::jar_metadata::is_platform_id(mod_id)
                 {
                     result.push((mod_id.to_string(), version_range.to_string()));
                 }
@@ -311,7 +307,7 @@ pub fn read_fabric_dependencies(path: &std::path::Path) -> Vec<(String, String)>
     let mut result = Vec::new();
     for (mod_id, version) in deps {
         let version_str = version.as_str().unwrap_or("*");
-        if mod_id != "fabricloader" && mod_id != "fabric" && mod_id != "minecraft" {
+        if !crate::jar_metadata::is_platform_id(mod_id) {
             result.push((mod_id.clone(), version_str.to_string()));
         }
     }
@@ -721,6 +717,87 @@ displayName="Test Mod"
             "Should find curios"
         );
     }
+}
+
+// -- Platform dependency filtering in helpers ----------------------------
+
+#[test]
+fn forge_helpers_filter_java_pseudo_dep() {
+    // Mods.toml with java, minecraft, forge dependencies — all must be filtered
+    let toml = b"modLoader=\"javafml\"\nloaderVersion=\"[47,)\"\n\n[[mods]]\nmodId=\"testmod\"\n\n[[dependencies.testmod]]\nmodId=\"java\"\nversionRange=\"[17,)\"\nmandatory=true\nside=\"BOTH\"\n\n[[dependencies.testmod]]\nmodId=\"minecraft\"\nversionRange=\"[1.20.1,1.21)\"\nmandatory=true\nside=\"BOTH\"\n\n[[dependencies.testmod]]\nmodId=\"forge\"\nversionRange=\"[47,)\"\nmandatory=true\nside=\"BOTH\"\n\n[[dependencies.testmod]]\nmodId=\"neoforge\"\nversionRange=\"[20.4,)\"\nmandatory=false\nside=\"BOTH\"\n\n[[dependencies.testmod]]\nmodId=\"embeddium\"\nversionRange=\"[0.3.1,)\"\nmandatory=true\nside=\"CLIENT\"\n\n[[dependencies.testmod]]\nmodId=\"flywheel\"\nversionRange=\"[0.6,)\"\nmandatory=true\nside=\"BOTH\"\n";
+    let dir = tempfile::tempdir().unwrap();
+    let jar_path = dir.path().join("testmod-1.0.jar");
+    let file = std::fs::File::create(&jar_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    zip.start_file("META-INF/mods.toml", options).unwrap();
+    std::io::Write::write_all(&mut zip, toml).unwrap();
+    zip.finish().unwrap();
+
+    let deps = read_forge_dependencies(&jar_path);
+    // java, minecraft, forge, neoforge must be filtered
+    assert!(
+        !deps.iter().any(|(id, _)| id == "java"),
+        "java must NOT appear as a download dependency"
+    );
+    assert!(
+        !deps.iter().any(|(id, _)| id == "minecraft"),
+        "minecraft must NOT appear"
+    );
+    assert!(
+        !deps.iter().any(|(id, _)| id == "forge"),
+        "forge must NOT appear"
+    );
+    assert!(
+        !deps.iter().any(|(id, _)| id == "neoforge"),
+        "neoforge must NOT appear"
+    );
+    // real mod dependencies must remain
+    assert!(
+        deps.iter().any(|(id, _)| id == "flywheel"),
+        "flywheel should remain as a real dependency"
+    );
+    assert!(
+        deps.iter().any(|(id, _)| id == "embeddium"),
+        "embeddium should remain as a real dependency"
+    );
+}
+
+#[test]
+fn fabric_helpers_filter_java_pseudo_dep() {
+    let json = b"{\"schemaVersion\":1,\"id\":\"testmod\",\"environment\":\"*\",\"depends\":{\"java\":\">=17\",\"minecraft\":\"1.20.1\",\"fabricloader\":\">=0.14\",\"fabric\":\"*\",\"real_lib\":\">=2.0\"}}";
+    let dir = tempfile::tempdir().unwrap();
+    let jar_path = dir.path().join("testmod-1.0.jar");
+    let file = std::fs::File::create(&jar_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    zip.start_file("fabric.mod.json", options).unwrap();
+    std::io::Write::write_all(&mut zip, json).unwrap();
+    zip.finish().unwrap();
+
+    let deps = read_fabric_dependencies(&jar_path);
+    assert!(
+        !deps.iter().any(|(id, _)| id == "java"),
+        "java must NOT appear as a download dependency"
+    );
+    assert!(
+        !deps.iter().any(|(id, _)| id == "minecraft"),
+        "minecraft must NOT appear"
+    );
+    assert!(
+        !deps.iter().any(|(id, _)| id == "fabricloader"),
+        "fabricloader must NOT appear"
+    );
+    assert!(
+        !deps.iter().any(|(id, _)| id == "fabric"),
+        "fabric must NOT appear"
+    );
+    assert!(
+        deps.iter().any(|(id, _)| id == "real_lib"),
+        "real_lib should remain as a real dependency"
+    );
 }
 
 #[test]

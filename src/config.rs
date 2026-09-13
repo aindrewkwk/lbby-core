@@ -301,6 +301,12 @@ pub fn generate_remote_token() -> String {
 }
 
 fn base_dir() -> PathBuf {
+    #[cfg(any(test, feature = "testing"))]
+    if let Ok(dir) = std::env::var("LBBY_CONFIG_DIR") {
+        let path = PathBuf::from(dir);
+        std::fs::create_dir_all(&path).ok();
+        return path;
+    }
     let base = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("lbby");

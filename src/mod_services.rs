@@ -3104,6 +3104,194 @@ fn backup_modpack_targets(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Resume a paused CurseForge install transaction after user approval.
+///
+/// This is the second half of the UAR flow:
+/// 1. Find the paused transaction (PendingUserAction)
+/// 2. Load PendingRecoveryMetadata → verify `applied == true`
+/// 3. Resume the transaction
+/// 4. Re-run BootValidator (quarantined mod is gone → should pass)
+/// 5. On Validated → preserve quarantine → commit → clear retry state
+/// 6. On Failed → rollback
+pub async fn resume_curseforge_install(
+    app: std::sync::Arc<crate::app_state::AppEventSender>,
+) -> Result<InstallOutcome, String> {
+    let cfg = config::load_config();
+    let live_path = server_dir(&cfg)?;
+    let stale = crate::install_transaction::InstallTransaction::find_stale(&live_path);
+
+    // Find the PendingUserAction transaction
+    let pending_meta = stale
+        .into_iter()
+        .find(|m| m.phase == crate::install_transaction::TransactionPhase::PendingUserAction)
+        .ok_or_else(|| "No paused transaction found to resume".to_string())?;
+
+    let txn_id = pending_meta.transaction_id.clone();
+    let server_id = pending_meta.server_id.clone();
+    let staging_path = pending_meta.staging_path.clone();
+
+    eprintln!(
+        "[CF][resume] Found paused transaction {} for server '{}'",
+        txn_id, server_id
+    );
+
+    // Load pending recovery metadata — must be approved (applied == true)
+    let recovery_path = staging_path.join("pending_recovery.json");
+    let recovery_meta = crate::install_transaction::PendingRecoveryMetadata::load(&recovery_path)?;
+    if !recovery_meta.applied {
+        return Err(
+            "Pending recovery has not been approved yet. Call approve_crash_recovery first."
+                .to_string(),
+        );
+    }
+
+    eprintln!(
+        "[CF][resume] Recovery approved for '{}' — resuming transaction",
+        recovery_meta.target_mod_id
+    );
+
+    // Resume the transaction
+    let txn = crate::install_transaction::InstallTransaction::resume(pending_meta)?;
+
+    // Copy persistent state from live → staging
+    txn.copy_persistent_state()?;
+
+    // Build config for the staging path
+    let mut cfg2 = cfg.clone();
+    cfg2.server_path = live_path.to_string_lossy().to_string();
+
+    // Build orchestrator from persisted retry state
+    let mut orch = match crate::recovery_actions::load_retry_state(Path::new(&cfg2.server_path)) {
+        Ok(Some(prior)) => {
+            eprintln!(
+                "[CF][resume] Restoring retry state: boot={}, dep={}, runtime={}",
+                prior.boot_attempts_used, prior.dependency_repairs_used, prior.runtime_repairs_used
+            );
+            crate::validation_orchestrator::ValidationRepairOrchestrator::from_persisted_state(
+                prior.boot_attempts_used,
+                prior.dependency_repairs_used,
+                prior.runtime_repairs_used,
+            )
+        }
+        Ok(None) => crate::validation_orchestrator::ValidationRepairOrchestrator::new(),
+        Err(e) => {
+            return Err(format!(
+                "Cannot resume: unsupported retry-state schema ({})",
+                e
+            ));
+        }
+    };
+
+    let cf = curseforge_http_client()?;
+    let empty_registry = crate::boot_failure_analyzer::InstalledFileRegistry::new();
+    let mut resolver = crate::dependency_resolver::DependencyResolver::new(
+        cf.clone(),
+        CURSEFORGE_API_KEY.to_string(),
+    );
+    let mut orch_ctx = crate::validation_orchestrator::ValidationContext {
+        cfg: &mut cfg2,
+        staging_path: txn.staging_path(),
+        app: &app,
+        cf_client: &cf,
+        installed_files: &empty_registry,
+        dependency_resolver: &mut resolver,
+        transaction_id: &txn_id,
+        server_id: &server_id,
+    };
+    let validator = crate::boot_validator::BootValidator::new();
+    let outcome = orch.validate(&mut orch_ctx, &validator).await;
+    match outcome {
+        crate::validation_orchestrator::ValidationOutcome::Validated(success) => {
+            eprintln!(
+                "[CF][resume] Boot validation passed after {} attempt(s)",
+                success.total_boot_attempts
+            );
+            crate::recovery_actions::preserve_quarantine_on_commit(
+                txn.staging_path(),
+                &server_id,
+                &txn_id,
+            )?;
+            let meta = txn.commit()?;
+            crate::recovery_actions::clear_retry_state(Path::new(&cfg2.server_path));
+            // Clean up pending_recovery.json
+            let _ = std::fs::remove_file(&recovery_path);
+            let mut final_cfg = cfg2;
+            final_cfg.server_path = meta.live_path.to_string_lossy().to_string();
+            config::save_config(&final_cfg)?;
+            eprintln!("[CF][resume] Transaction committed — server is live");
+            Ok(InstallOutcome::Success(final_cfg))
+        }
+        crate::validation_orchestrator::ValidationOutcome::Failed(failure) => {
+            let err = format!(
+                "Resume validation failed ({:?}): {:?}",
+                failure.reason, failure.final_boot_result
+            );
+            crate::boot_validator::save_validation_diagnostics(
+                txn.staging_path(),
+                &server_id,
+                &txn_id,
+                &failure.final_boot_result,
+            );
+            txn.rollback()?;
+            crate::recovery_actions::clear_retry_state(Path::new(&cfg2.server_path));
+            let _ = std::fs::remove_file(&recovery_path);
+            Err(err)
+        }
+        crate::validation_orchestrator::ValidationOutcome::UserActionRequired(req) => {
+            // Another mod failed — persist new recovery metadata and pause again
+            let new_recovery_meta = crate::install_transaction::PendingRecoveryMetadata {
+                schema_version: crate::atomic_persistence::CURRENT_SCHEMA_VERSION,
+                server_id: req.server_id.clone(),
+                transaction_id: req.transaction_id.clone(),
+                staging_mods: req.staging_mods.clone(),
+                attribution_fingerprint: req.fingerprint.clone(),
+                target_mod_id: req.mod_id.clone(),
+                target_jar_path: req.target_jar_path.clone(),
+                target_jar_sha256: req.jar_sha256.clone(),
+                boot_attempt: req.boot_attempt,
+                dependency_repairs: orch.state().dependency_repairs,
+                runtime_repairs: orch.state().runtime_repairs,
+                recovery_actions_used: req.recovery_actions_used,
+                display_filename: req.display_filename.clone(),
+                crash_summary: req.crash_report.summary.clone(),
+                confidence: format!("{:?}", req.crash_report.confidence),
+                applied: false,
+            };
+            let new_recovery_path = txn.meta().pending_recovery_path();
+            new_recovery_meta.save(&new_recovery_path)?;
+            let _ = crate::recovery_actions::save_retry_state(
+                Path::new(&cfg2.server_path),
+                &crate::recovery_actions::RetryStateSnapshot {
+                    schema_version: crate::atomic_persistence::CURRENT_SCHEMA_VERSION,
+                    boot_attempts_used: orch.state().total_boot_attempts,
+                    dependency_repairs_used: orch.state().dependency_repairs,
+                    runtime_repairs_used: orch.state().runtime_repairs,
+                    recovery_actions_used: req.recovery_actions_used,
+                },
+            );
+            eprintln!(
+                "[CF][resume] Another UAR triggered for '{}' — pausing again",
+                req.mod_id
+            );
+            let _paused_meta = txn
+                .pause()
+                .map_err(|e| format!("Failed to persist pause state: {}", e))?;
+            Ok(InstallOutcome::UserActionRequired {
+                server_id: req.server_id,
+                transaction_id: req.transaction_id,
+                fingerprint: req.fingerprint,
+                mod_id: req.mod_id,
+                display_filename: req.display_filename,
+                jar_sha256: req.jar_sha256,
+                boot_attempt: req.boot_attempt,
+                recovery_actions_used: req.recovery_actions_used,
+                crash_summary: req.crash_report.summary,
+                confidence: format!("{:?}", req.crash_report.confidence),
+            })
+        }
+    }
+}
+
 pub fn list_resource_packs() -> Result<Vec<ResourcePackInfo>, String> {
     let cfg = config::load_config();
     let dir = server_dir(&cfg)?.join("resourcepacks");
