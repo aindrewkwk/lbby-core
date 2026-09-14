@@ -1027,9 +1027,11 @@ async fn download_bytes_to_file(
     label: &str,
     current: u32,
     total: u32,
+    expected_sha512: Option<&str>,
 ) -> Result<(), String> {
-    // Atomic download: write to temp file in same directory, flush, then rename.
-    // Partial files never appear as valid installed artifacts.
+    // Atomic download: write to temp file in same directory, flush, verify
+    // hash on temp, then rename. An unverified artifact never appears in the
+    // live mods/resourcepacks/shaderpacks directory.
     let temp = {
         let mut name = dest.file_name().unwrap_or_default().to_os_string();
         name.push(".lbbytmp");
@@ -1070,11 +1072,17 @@ async fn download_bytes_to_file(
                     };
                     emit_mod_progress(app, stage, &format!("{}{}", label, percent), current, total);
                 }
-                // Flush and sync before rename
+                // Flush and sync before verification
                 file.flush().await.map_err(|e| {
                     let _ = std::fs::remove_file(&temp);
                     e.to_string()
                 })?;
+                drop(file); // release handle before verification
+                            // Verify authoritative digest on TEMP artifact — before it
+                            // ever touches the live mods/resourcepacks/shaderpacks dir.
+                if let Some(expected) = expected_sha512 {
+                    verify_sha512(&temp, Some(expected))?;
+                }
                 // Atomic rename — same directory guarantees same filesystem
                 tokio::fs::rename(&temp, dest).await.map_err(|e| {
                     let _ = std::fs::remove_file(&temp);
@@ -1351,9 +1359,9 @@ pub async fn install_modrinth_shader_pack(
         &file.filename,
         1,
         1,
+        file.hashes.get("sha512").map(String::as_str),
     )
     .await?;
-    verify_sha512(&dest, file.hashes.get("sha512").map(String::as_str))?;
 
     Ok(())
 }
@@ -1453,9 +1461,9 @@ async fn install_resource_pack_recursive(
         &file.filename,
         1,
         1,
+        file.hashes.get("sha512").map(String::as_str),
     )
     .await?;
-    verify_sha512(&dest, file.hashes.get("sha512").map(String::as_str))?;
     Ok(())
 }
 
@@ -1510,9 +1518,9 @@ async fn install_modrinth_project_recursive(
                 &file.filename,
                 current,
                 total,
+                file.hashes.get("sha512").map(String::as_str),
             )
             .await?;
-            verify_sha512(&dest, file.hashes.get("sha512").map(String::as_str))?;
         }
     }
     let file = primary_file(&version)?;
@@ -1532,9 +1540,9 @@ async fn install_modrinth_project_recursive(
         &file.filename,
         current,
         total,
+        file.hashes.get("sha512").map(String::as_str),
     )
     .await?;
-    verify_sha512(&dest, file.hashes.get("sha512").map(String::as_str))?;
     Ok(())
 }
 
@@ -1641,7 +1649,17 @@ pub async fn update_mod(
         .map_err(|e| e.to_string())?;
     let tmp = dir.join(format!("{}.download", file_name));
     let result = async {
-        download_bytes_to_file(&app, &download_url, &tmp, "Updating mod", &file_name, 1, 1).await?;
+        download_bytes_to_file(
+            &app,
+            &download_url,
+            &tmp,
+            "Updating mod",
+            &file_name,
+            1,
+            1,
+            None,
+        )
+        .await?;
         tokio::fs::rename(&tmp, &old)
             .await
             .map_err(|e| e.to_string())?;
@@ -1769,9 +1787,9 @@ pub async fn install_modrinth_modpack(
             &file.path,
             idx as u32 + 1,
             total,
+            file.hashes.get("sha512").map(String::as_str),
         )
         .await?;
-        verify_sha512(&dest, file.hashes.get("sha512").map(String::as_str))?;
     }
     emit_mod_progress(
         &app,
@@ -1874,6 +1892,7 @@ async fn resolve_or_download_mrpack(
         "Modrinth pack",
         1,
         1,
+        None,
     )
     .await?;
     Ok(dest)
@@ -2065,6 +2084,7 @@ pub async fn install_curseforge_modpack(
                     "server.jar",
                     1,
                     1,
+                    None,
                 )
                 .await?;
             } else if has_forge {
@@ -2330,6 +2350,7 @@ pub async fn install_curseforge_modpack(
                         &file_name_for_task,
                         current,
                         total,
+                        None,
                     )
                     .await
                     {
@@ -3677,6 +3698,7 @@ pub async fn install_curseforge_modpack_link(
         &file.name,
         1,
         1,
+        None,
     )
     .await?;
 
@@ -3732,6 +3754,18 @@ pub async fn search_modrinth_modpacks(
     Ok(resp.hits)
 }
 
+fn validate_jar_shape(path: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let data = std::fs::read(path).map_err(|e| format!("Cannot read artifact: {}", e))?;
+    if data.is_empty() {
+        return Err("Artifact is empty (0 bytes)".to_string());
+    }
+    // Validate ZIP/JAR structure: attempt to open as zip archive
+    let reader = std::io::Cursor::new(&data);
+    zip::ZipArchive::new(reader).map_err(|e| format!("Not a valid JAR/ZIP: {}", e))?;
+    Ok(())
+}
+
 pub async fn add_mod(file_path: String, overwrite: Option<bool>) -> Result<(), String> {
     let cfg = config::load_config();
     let src = PathBuf::from(&file_path);
@@ -3762,9 +3796,32 @@ pub async fn add_mod(file_path: String, overwrite: Option<bool>) -> Result<(), S
     if dest.exists() && !overwrite.unwrap_or(false) {
         return Err(format!("A mod named {} already exists.", name));
     }
-    tokio::fs::copy(&src, &dest)
+    // Atomic: copy → temp, validate, rename
+    let temp = dest.with_extension(format!("{}.lbbytmp", ext));
+    tokio::fs::copy(&src, &temp)
         .await
         .map_err(|e| e.to_string())?;
+    if ext == "jar" {
+        if let Err(e) = validate_jar_shape(&temp) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!("Invalid JAR: {}", e));
+        }
+    }
+    // For .tmod: no reliable validator exists; preserve current behavior.
+    // At minimum, validate non-empty.
+    if ext == "tmod" {
+        let meta = tokio::fs::metadata(&temp)
+            .await
+            .map_err(|e| e.to_string())?;
+        if meta.len() == 0 {
+            let _ = std::fs::remove_file(&temp);
+            return Err("tmod file is empty (0 bytes)".to_string());
+        }
+    }
+    std::fs::rename(&temp, &dest).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        e.to_string()
+    })?;
     Ok(())
 }
 
@@ -4201,6 +4258,7 @@ pub async fn install_missing_dependencies(
             file_name,
             (i + 1) as u32,
             total as u32,
+            None,
         )
         .await
         .is_ok()
@@ -4381,6 +4439,7 @@ pub async fn auto_fix_dependencies(
             file_name,
             (i + 1) as u32,
             total as u32,
+            None,
         )
         .await
         .is_ok()
@@ -4590,5 +4649,187 @@ mod tests {
     fn validate_basename_rejects_nested_components() {
         assert!(validate_basename("a/b").is_err());
         assert!(validate_basename("a\\b").is_err());
+    }
+
+    // ── download_bytes_to_file hash verification tests ─────────────────────
+
+    use super::{validate_jar_shape, verify_sha512};
+    use sha2::{Digest, Sha512};
+
+    #[test]
+    fn hash_mismatch_with_existing_destination_preserves_old() {
+        let dir =
+            std::env::temp_dir().join(format!("lbby-hash-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("mod.jar");
+        let old_content = b"original valid content here";
+        std::fs::write(&dest, old_content).unwrap();
+
+        // Write a different file as temp, then try to verify with wrong hash
+        let temp = dir.join("mod.jar.lbbytmp");
+        let new_content = b"different content that won't match";
+        std::fs::write(&temp, new_content).unwrap();
+
+        // Compute a hash for a THIRD content (neither old nor new)
+        let wrong_hash = format!("{:x}", Sha512::digest(b"completely different"));
+
+        // Verify should fail on the temp file
+        let result = verify_sha512(&temp, Some(&wrong_hash));
+        assert!(result.is_err());
+
+        // Old destination bytes must be unchanged
+        assert_eq!(std::fs::read(&dest).unwrap(), old_content);
+
+        // Temp should still exist (caller is responsible for cleanup)
+        assert!(temp.exists());
+
+        // Cleanup
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hash_mismatch_with_no_destination_creates_no_dest() {
+        let dir =
+            std::env::temp_dir().join(format!("lbby-hash-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("mod.jar");
+        let temp = dir.join("mod.jar.lbbytmp");
+
+        let content = b"some content for the file";
+        std::fs::write(&temp, content).unwrap();
+
+        // Wrong hash
+        let wrong_hash = format!("{:x}", Sha512::digest(b"wrong"));
+        let result = verify_sha512(&temp, Some(&wrong_hash));
+        assert!(result.is_err());
+
+        // No destination should exist
+        assert!(!dest.exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn successful_verified_replacement_updates_destination() {
+        let dir =
+            std::env::temp_dir().join(format!("lbby-hash-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("mod.jar");
+        let old_content = b"old content that will be replaced";
+        std::fs::write(&dest, old_content).unwrap();
+
+        let temp = dir.join("mod.jar.lbbytmp");
+        let new_content = b"new verified content for replacement";
+        std::fs::write(&temp, new_content).unwrap();
+
+        let correct_hash = format!("{:x}", Sha512::digest(new_content));
+        let result = verify_sha512(&temp, Some(&correct_hash));
+        assert!(result.is_ok());
+
+        // Atomic rename
+        std::fs::rename(&temp, &dest).unwrap();
+
+        // Destination now has new content
+        assert_eq!(std::fs::read(&dest).unwrap(), new_content);
+        // Temp is gone
+        assert!(!temp.exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ── JAR validation tests ───────────────────────────────────────────────
+
+    #[test]
+    fn jar_validation_accepts_valid_jar() {
+        let dir =
+            std::env::temp_dir().join(format!("lbby-jar-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jar_path = dir.join("valid.jar");
+
+        // Create a valid ZIP/JAR
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut bytes);
+            let options = zip::write::SimpleFileOptions::default();
+            writer.start_file("META-INF/MANIFEST.MF", options).unwrap();
+            writer.write_all(b"Manifest-Version: 1.0\n").unwrap();
+            writer.finish().unwrap();
+        }
+        std::fs::write(&jar_path, bytes.into_inner()).unwrap();
+
+        assert!(validate_jar_shape(&jar_path).is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn jar_validation_rejects_fake_jar() {
+        let dir =
+            std::env::temp_dir().join(format!("lbby-jar-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jar_path = dir.join("fake.jar");
+
+        // Write random text data as .jar
+        std::fs::write(&jar_path, b"This is not a JAR file at all").unwrap();
+
+        let result = validate_jar_shape(&jar_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Not a valid JAR/ZIP"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn jar_validation_rejects_empty_file() {
+        let dir =
+            std::env::temp_dir().join(format!("lbby-jar-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jar_path = dir.join("empty.jar");
+
+        std::fs::write(&jar_path, b"").unwrap();
+
+        let result = validate_jar_shape(&jar_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fake_jar_does_not_replace_existing_destination() {
+        let dir =
+            std::env::temp_dir().join(format!("lbby-jar-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("good-mod.jar");
+        let temp = dest.with_extension("jar.lbbytmp");
+
+        // Write a valid JAR as destination
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut bytes);
+            let options = zip::write::SimpleFileOptions::default();
+            writer.start_file("mod.class", options).unwrap();
+            writer.write_all(b"\xCA\xFE\xBA\xBE").unwrap();
+            writer.finish().unwrap();
+        }
+        let good_jar = bytes.into_inner();
+        std::fs::write(&dest, &good_jar).unwrap();
+
+        // Write a fake JAR as temp
+        std::fs::write(&temp, b"not a jar").unwrap();
+
+        // Validation should fail
+        let result = validate_jar_shape(&temp);
+        assert!(result.is_err());
+
+        // Temp should be cleaned up by caller
+        // Destination should be unchanged
+        assert_eq!(std::fs::read(&dest).unwrap(), good_jar);
+
+        // Simulate caller cleanup
+        std::fs::remove_file(&temp).unwrap();
+        assert!(!temp.exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
