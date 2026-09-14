@@ -946,6 +946,32 @@ fn safe_join(base: &Path, relative: &str) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// Validates that `name` is a single, safe filename component — no path
+/// separators, no traversal sequences, no absolute paths, no empty string.
+/// Returns the canonical file name on success.
+pub fn validate_basename(name: &str) -> Result<&str, String> {
+    if name.is_empty() {
+        return Err("Filename must not be empty".into());
+    }
+    if name.contains("..") || name.contains('/') || name.contains('\\') || name.starts_with('.') {
+        return Err(format!("Invalid filename: {}", name));
+    }
+    let p = Path::new(name);
+    if p.is_absolute() {
+        return Err(format!("Absolute path rejected: {}", name));
+    }
+    // Must have exactly one component (no parent directory)
+    let mut components = p.components();
+    match components.next() {
+        Some(Component::Normal(_)) => {}
+        _ => return Err(format!("Invalid filename component: {}", name)),
+    }
+    if components.next().is_some() {
+        return Err(format!("Nested path rejected: {}", name));
+    }
+    Ok(name)
+}
+
 fn read_zip_json<T: for<'de> Deserialize<'de>, R: Read + Seek>(
     zip: &mut zip::ZipArchive<R>,
     name: &str,
@@ -1002,9 +1028,18 @@ async fn download_bytes_to_file(
     current: u32,
     total: u32,
 ) -> Result<(), String> {
+    // Atomic download: write to temp file in same directory, flush, then rename.
+    // Partial files never appear as valid installed artifacts.
+    let temp = {
+        let mut name = dest.file_name().unwrap_or_default().to_os_string();
+        name.push(".lbbytmp");
+        dest.with_file_name(name)
+    };
     // Retry up to 3 times on failure
     let mut last_err = String::new();
     for attempt in 1..=3 {
+        // Clean leftover temp from previous attempt
+        let _ = tokio::fs::remove_file(&temp).await;
         match client()?.get(url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 if let Some(parent) = dest.parent() {
@@ -1014,13 +1049,19 @@ async fn download_bytes_to_file(
                 }
                 let size = resp.content_length().unwrap_or(0);
                 let mut stream = resp.bytes_stream();
-                let mut file = tokio::fs::File::create(dest)
+                let mut file = tokio::fs::File::create(&temp)
                     .await
                     .map_err(|e| e.to_string())?;
                 let mut downloaded = 0u64;
                 while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(|e| e.to_string())?;
-                    file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+                    let chunk = chunk.map_err(|e| {
+                        let _ = std::fs::remove_file(&temp);
+                        e.to_string()
+                    })?;
+                    file.write_all(&chunk).await.map_err(|e| {
+                        let _ = std::fs::remove_file(&temp);
+                        e.to_string()
+                    })?;
                     downloaded += chunk.len() as u64;
                     let percent = if size > 0 {
                         format!(" ({:.0}%)", downloaded as f64 / size as f64 * 100.0)
@@ -1029,6 +1070,16 @@ async fn download_bytes_to_file(
                     };
                     emit_mod_progress(app, stage, &format!("{}{}", label, percent), current, total);
                 }
+                // Flush and sync before rename
+                file.flush().await.map_err(|e| {
+                    let _ = std::fs::remove_file(&temp);
+                    e.to_string()
+                })?;
+                // Atomic rename — same directory guarantees same filesystem
+                tokio::fs::rename(&temp, dest).await.map_err(|e| {
+                    let _ = std::fs::remove_file(&temp);
+                    e.to_string()
+                })?;
                 return Ok(());
             }
             Ok(resp) => {
@@ -1050,6 +1101,8 @@ async fn download_bytes_to_file(
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }
+    // Final cleanup
+    let _ = tokio::fs::remove_file(&temp).await;
     Err(format!(
         "Download failed after 3 attempts: {} for {}",
         last_err, label
@@ -4356,7 +4409,8 @@ mod tests {
     use super::apply_mrpack_overrides;
     use super::{
         curseforge_cdn_parts, curseforge_fingerprint_reader, official_server_pack_id,
-        parse_curseforge_source, validate_curseforge_file_for_profile, CurseFilesResponse,
+        parse_curseforge_source, validate_basename, validate_curseforge_file_for_profile,
+        CurseFilesResponse,
     };
     use crate::config::{ServerConfig, ServerType};
     use std::io::{Cursor, Write};
@@ -4483,5 +4537,58 @@ mod tests {
         );
         assert!(!dest.join("config/client.txt").exists());
         std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    // ── validate_basename tests ──────────────────────────────────────────────
+
+    #[test]
+    fn validate_basename_accepts_normal_filenames() {
+        assert_eq!(
+            validate_basename("sodium-fabric.jar").unwrap(),
+            "sodium-fabric.jar"
+        );
+        assert_eq!(validate_basename("mod_v2.1.jar").unwrap(), "mod_v2.1.jar");
+        assert_eq!(validate_basename("My Mod.tmod").unwrap(), "My Mod.tmod");
+        assert_eq!(validate_basename("非ASCII名.jar").unwrap(), "非ASCII名.jar");
+        assert_eq!(
+            validate_basename("has spaces.jar").unwrap(),
+            "has spaces.jar"
+        );
+    }
+
+    #[test]
+    fn validate_basename_rejects_empty() {
+        assert!(validate_basename("").is_err());
+    }
+
+    #[test]
+    fn validate_basename_rejects_dot_dot() {
+        assert!(validate_basename("../escape.jar").is_err());
+        assert!(validate_basename("foo/../../../etc/passwd").is_err());
+        assert!(validate_basename("..").is_err());
+    }
+
+    #[test]
+    fn validate_basename_rejects_path_separators() {
+        assert!(validate_basename("mods/evil.jar").is_err());
+        assert!(validate_basename("sub\\dir\\mod.jar").is_err());
+    }
+
+    #[test]
+    fn validate_basename_rejects_absolute_paths() {
+        assert!(validate_basename("/etc/passwd").is_err());
+        assert!(validate_basename("C:\\Windows\\system32\\evil.jar").is_err());
+    }
+
+    #[test]
+    fn validate_basename_rejects_dot_prefix() {
+        assert!(validate_basename(".hidden").is_err());
+        assert!(validate_basename(".gitconfig").is_err());
+    }
+
+    #[test]
+    fn validate_basename_rejects_nested_components() {
+        assert!(validate_basename("a/b").is_err());
+        assert!(validate_basename("a\\b").is_err());
     }
 }

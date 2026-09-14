@@ -10,7 +10,7 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::cloudflare::CloudflareTunnelState;
 use crate::playit::PlayitState;
-use crate::server::ServerManager;
+use crate::server::{ServerManager, ServerStatus};
 use crate::stats::ServerStats;
 
 const CONSOLE_BUFFER_CAP: usize = 2000;
@@ -32,6 +32,7 @@ pub enum OperationKind {
     BackingUp,
     Resetting,
     DeletingProfile,
+    ModMutation,
 }
 
 impl Default for OperationKind {
@@ -194,6 +195,38 @@ impl AppState {
             }
         }
     }
+
+    /// Acquire a mod-mutation guard. Rejects if:
+    ///   - Server is not Stopped or Error
+    ///   - Another operation is already in progress (Installing, Restoring, etc.)
+    ///   - Another mod mutation is already held
+    /// Closes TOCTOU by re-verifying server status after acquiring the guard.
+    pub async fn require_mod_mutation_ready(&self) -> Result<OperationGuard<'_>, String> {
+        // 1. Fast check: server must be stopped or in error
+        {
+            let srv = self.server.lock().await;
+            if !matches!(srv.status, ServerStatus::Stopped | ServerStatus::Error) {
+                return Err(format!(
+                    "Cannot modify mods while server is {:?}. Stop the server first.",
+                    srv.status
+                ));
+            }
+        }
+        // 2. Acquire exclusive mutation slot
+        let guard =
+            OperationGuard::acquire(&self.current_operation, OperationKind::ModMutation).await?;
+        // 3. Re-verify server status under guard (closes check-then-act race)
+        {
+            let srv = self.server.lock().await;
+            if !matches!(srv.status, ServerStatus::Stopped | ServerStatus::Error) {
+                return Err(format!(
+                    "Server state changed during mod operation setup: {:?}",
+                    srv.status
+                ));
+            }
+        }
+        Ok(guard)
+    }
 }
 
 /// Event sender — emits events via a broadcast channel.
@@ -240,6 +273,68 @@ mod tests {
             OperationGuard::acquire(&operation, OperationKind::BackingUp)
                 .await
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn mod_mutation_conflicts_with_installing() {
+        let operation = Mutex::new(OperationKind::None);
+        let _guard = OperationGuard::acquire(&operation, OperationKind::Installing)
+            .await
+            .unwrap();
+        assert!(
+            OperationGuard::acquire(&operation, OperationKind::ModMutation)
+                .await
+                .is_err(),
+            "ModMutation must be rejected while Installing is held"
+        );
+    }
+
+    #[tokio::test]
+    async fn installing_conflicts_with_mod_mutation() {
+        let operation = Mutex::new(OperationKind::None);
+        let _guard = OperationGuard::acquire(&operation, OperationKind::ModMutation)
+            .await
+            .unwrap();
+        assert!(
+            OperationGuard::acquire(&operation, OperationKind::Installing)
+                .await
+                .is_err(),
+            "Installing must be rejected while ModMutation is held"
+        );
+    }
+
+    #[tokio::test]
+    async fn mod_mutation_conflicts_with_restoring() {
+        let operation = Mutex::new(OperationKind::None);
+        let _guard = OperationGuard::acquire(&operation, OperationKind::Restoring)
+            .await
+            .unwrap();
+        assert!(
+            OperationGuard::acquire(&operation, OperationKind::ModMutation)
+                .await
+                .is_err(),
+            "ModMutation must be rejected while Restoring is held"
+        );
+    }
+
+    #[tokio::test]
+    async fn mod_mutation_allows_after_drop() {
+        let operation = Mutex::new(OperationKind::None);
+        let guard = OperationGuard::acquire(&operation, OperationKind::ModMutation)
+            .await
+            .unwrap();
+        assert!(
+            OperationGuard::acquire(&operation, OperationKind::ModMutation)
+                .await
+                .is_err()
+        );
+        drop(guard);
+        assert!(
+            OperationGuard::acquire(&operation, OperationKind::ModMutation)
+                .await
+                .is_ok(),
+            "ModMutation must be acquirable after previous guard is dropped"
         );
     }
 }
