@@ -284,6 +284,8 @@ struct AdoptiumBinary {
 struct AdoptiumPackage {
     name: String,
     link: String,
+    #[serde(default)]
+    checksum: String,
 }
 
 fn adoptium_os() -> &'static str {
@@ -357,6 +359,20 @@ async fn download_jre(
 
     crate::helpers::download_to_file(app, download_url, &temp_file, &format!("Java {}", major))
         .await?;
+
+    // Verify Adoptium checksum if available
+    let expected_sha256 = &asset.binary.package.checksum;
+    if !expected_sha256.is_empty() {
+        let actual = crate::helpers::sha256_hex_string(&temp_file)
+            .map_err(|e| format!("Failed to compute checksum: {}", e))?;
+        if actual != *expected_sha256 {
+            std::fs::remove_file(&temp_file).ok();
+            return Err(format!(
+                "Java {} download checksum mismatch: expected {}, got {}",
+                major, expected_sha256, actual
+            ));
+        }
+    }
 
     // Extract
     app.emit(

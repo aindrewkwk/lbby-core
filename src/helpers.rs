@@ -11,6 +11,22 @@ use tokio::io::AsyncWriteExt;
 
 use crate::app_state::AppEventSender;
 use crate::config::ServerConfig;
+use sha2::{Digest, Sha256};
+
+/// Compute SHA-256 of a file and return it as a lowercase hex string.
+pub fn sha256_hex_string(path: &Path) -> Result<String, std::io::Error> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
 
 /// Progress event for server installation / mod installation.
 #[derive(Debug, Clone, Serialize)]
@@ -48,15 +64,24 @@ pub fn hide_std_child_window(_cmd: &mut std::process::Command) {}
 /// `install-progress` / `InstallProgress` events by default; callers that
 /// need a different event type can wrap this function and emit their own
 /// events after it returns.
-pub async fn download_to_file(
+/// Download a file to a destination path with atomic-write semantics.
+///
+/// Streams to `<dest>.partial`, flushes/syncs, then renames to `dest`.
+/// On any failure the `.partial` file is cleaned up and `dest` is untouched.
+///
+/// If `expected_sha256` is `Some(hex)`, the downloaded file is verified
+/// against that digest before the final rename. A mismatch deletes the
+/// temp file and returns an error.
+pub async fn download_to_file_verified(
     app: &Arc<AppEventSender>,
     url: &str,
     dest: &Path,
     label: &str,
+    expected_sha256: Option<&str>,
 ) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .user_agent("Lbby")
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
@@ -78,7 +103,8 @@ pub async fn download_to_file(
             .await
             .map_err(|e| e.to_string())?;
     }
-    let mut file = tokio::fs::File::create(dest)
+    let partial = dest.with_extension("partial");
+    let mut file = tokio::fs::File::create(&partial)
         .await
         .map_err(|e| e.to_string())?;
     let mut downloaded: u64 = 0;
@@ -102,7 +128,43 @@ pub async fn download_to_file(
         )
         .ok();
     }
-    Ok(())
+    // Flush + sync before rename
+    file.flush().await.map_err(|e| e.to_string())?;
+    file.sync_all().await.map_err(|e| e.to_string())?;
+    drop(file);
+
+    // Verify checksum if provided
+    if let Some(expected) = expected_sha256 {
+        if !expected.is_empty() {
+            let actual = sha256_hex_string(&partial)
+                .map_err(|e| format!("Checksum computation failed: {}", e))?;
+            if actual != *expected {
+                tokio::fs::remove_file(&partial).await.ok();
+                return Err(format!(
+                    "{} checksum mismatch: expected {}, got {}",
+                    label, expected, actual
+                ));
+            }
+        }
+    }
+
+    // Atomic rename
+    tokio::fs::rename(&partial, dest).await.map_err(|e| {
+        // Clean up partial on rename failure
+        let _ = std::fs::remove_file(&partial);
+        format!("Failed to rename download: {}", e)
+    })
+}
+
+/// Download a file. Convenience wrapper around [`download_to_file_verified`]
+/// with no expected checksum.
+pub async fn download_to_file(
+    app: &Arc<AppEventSender>,
+    url: &str,
+    dest: &Path,
+    label: &str,
+) -> Result<(), String> {
+    download_to_file_verified(app, url, dest, label, None).await
 }
 
 /// Default server path value — used by config and mod_services.
