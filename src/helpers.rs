@@ -255,6 +255,7 @@ fn read_fabric_mod_info<R: Read + std::io::Seek>(
         authors,
         description,
         icon_data_url,
+        ..Default::default()
     })
 }
 
@@ -297,6 +298,7 @@ fn read_forge_mod_info<R: Read + std::io::Seek>(
         authors,
         description,
         icon_data_url,
+        ..Default::default()
     })
 }
 
@@ -389,10 +391,8 @@ pub fn read_mod_info(path: &std::path::Path) -> crate::app_state::ModInfo {
             .trim_end_matches(".tmod")
             .to_string(),
         file_name: file_name.clone(),
-        version: String::new(),
-        authors: Vec::new(),
-        description: String::new(),
-        icon_data_url: None,
+        status: crate::app_state::ModStatus::Unreadable,
+        ..Default::default()
     };
 
     let Ok(file) = std::fs::File::open(path) else {
@@ -402,13 +402,17 @@ pub fn read_mod_info(path: &std::path::Path) -> crate::app_state::ModInfo {
         return fallback;
     };
 
+    // JAR is readable — update fallback status
+    let mut readable_fallback = fallback.clone();
+    readable_fallback.status = crate::app_state::ModStatus::Readable;
+
     if let Some(info) = read_fabric_mod_info(&mut zip, &file_name) {
         return normalize_mod_info(info);
     }
     if let Some(info) = read_forge_mod_info(&mut zip, &file_name) {
         return normalize_mod_info(info);
     }
-    fallback
+    readable_fallback
 }
 
 /// Stub: start server — to be implemented by agent/app.

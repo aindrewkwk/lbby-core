@@ -115,6 +115,106 @@ pub struct BannedIp {
     pub reason: String,
 }
 
+/// Provider that originally delivered this mod artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModProvider {
+    Modrinth,
+    CurseForge,
+    Manual,
+    Unknown,
+}
+
+impl Default for ModProvider {
+    fn default() -> Self {
+        ModProvider::Unknown
+    }
+}
+
+/// Loader identified from the mod JAR's own metadata.
+/// Mirrors jar_metadata::LoaderMetadataKind but adds Unknown/MultiLoader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetectedLoader {
+    Fabric,
+    Quilt,
+    Forge,
+    NeoForge,
+    MultiLoader,
+    Unknown,
+}
+
+impl Default for DetectedLoader {
+    fn default() -> Self {
+        DetectedLoader::Unknown
+    }
+}
+
+/// Readability status of the mod artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModStatus {
+    Readable,
+    Unreadable,
+}
+
+impl Default for ModStatus {
+    fn default() -> Self {
+        ModStatus::Readable
+    }
+}
+
+/// Server compatibility classification.
+/// Re-exports mod_compat::ServerCompatibility for the ModInfo model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModCompatibility {
+    ServerOk,
+    ClientOnly,
+    Both,
+    Unknown,
+}
+
+impl Default for ModCompatibility {
+    fn default() -> Self {
+        ModCompatibility::Unknown
+    }
+}
+
+/// How confident the compatibility classification is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModCompatConfidence {
+    Explicit,
+    None,
+}
+
+impl Default for ModCompatConfidence {
+    fn default() -> Self {
+        ModCompatConfidence::None
+    }
+}
+
+/// Source of the compatibility determination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModCompatSource {
+    FabricMetadata,
+    QuiltMetadata,
+    ForgeMetadata,
+    NeoForgeMetadata,
+    ConflictingMetadata,
+    None,
+}
+
+impl Default for ModCompatSource {
+    fn default() -> Self {
+        ModCompatSource::None
+    }
+}
+
+/// Normalized dependency info for inventory display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InventoryDependency {
+    pub mod_id: String,
+    pub kind: String,
+    pub version_requirement: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModInfo {
     pub file_name: String,
@@ -123,6 +223,99 @@ pub struct ModInfo {
     pub authors: Vec<String>,
     pub description: String,
     pub icon_data_url: Option<String>,
+
+    // ── 4B.3B identity fields ──────────────────────────────────────────
+    /// Opaque stable identity within this profile inventory.
+    /// Backend-generated. Not a filesystem path.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub inventory_id: String,
+
+    /// Declared mod ID from loader metadata (fabric.mod.json id, mods.toml modId).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mod_id: Option<String>,
+
+    /// Loader detected from the JAR's own metadata.
+    #[serde(default)]
+    pub loader: DetectedLoader,
+
+    /// Provider that delivered this artifact.
+    #[serde(default)]
+    pub provider: ModProvider,
+
+    /// Provider project ID (e.g. Modrinth project slug/ID, CurseForge mod ID).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+
+    /// Provider file/version ID for update tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_version_id: Option<String>,
+
+    /// SHA-512 hash of the installed artifact, if computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+
+    /// Server compatibility classification.
+    #[serde(default)]
+    pub compatibility: ModCompatibility,
+
+    /// Confidence in the compatibility classification.
+    #[serde(default)]
+    pub compatibility_confidence: ModCompatConfidence,
+
+    /// Source metadata that produced the compatibility result.
+    #[serde(default)]
+    pub compatibility_source: ModCompatSource,
+
+    /// Human-readable reason for the compatibility classification.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub compatibility_reason: String,
+
+    /// Normalized dependency metadata from loader manifest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependency_metadata: Vec<InventoryDependency>,
+
+    /// Whether the JAR was readable.
+    #[serde(default)]
+    pub status: ModStatus,
+}
+
+impl Default for ModInfo {
+    fn default() -> Self {
+        Self {
+            file_name: String::new(),
+            display_name: String::new(),
+            version: String::new(),
+            authors: Vec::new(),
+            description: String::new(),
+            icon_data_url: None,
+            inventory_id: String::new(),
+            mod_id: None,
+            loader: DetectedLoader::Unknown,
+            provider: ModProvider::Unknown,
+            project_id: None,
+            file_version_id: None,
+            hash: None,
+            compatibility: ModCompatibility::Unknown,
+            compatibility_confidence: ModCompatConfidence::None,
+            compatibility_source: ModCompatSource::None,
+            compatibility_reason: String::new(),
+            dependency_metadata: Vec::new(),
+            status: ModStatus::Readable,
+        }
+    }
+}
+
+/// Result of a mod install operation.
+///
+/// `InstalledTracked`  = success + receipt persisted  → `warning == None`
+/// `InstalledUntracked` = success + receipt failure   → `warning == Some(msg)`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallResult {
+    pub mods: Vec<ModInfo>,
+    /// `None` = fully tracked. `Some(msg)` = installed but provider metadata
+    /// could not be saved.  Frontend should show the warning text to the user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

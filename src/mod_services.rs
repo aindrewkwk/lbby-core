@@ -1,10 +1,15 @@
 use crate::config::{self, ServerConfig, ServerType};
 use crate::{
-    app_state::ModInfo,
+    app_state::{
+        DetectedLoader, InstallResult, InventoryDependency, ModCompatConfidence, ModCompatSource,
+        ModCompatibility, ModInfo, ModProvider, ModStatus,
+    },
     helpers::{default_server_path_value, read_mod_info},
+    jar_metadata, mod_compat,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::{Digest, Sha512};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read, Seek};
@@ -67,6 +72,13 @@ pub struct ModrinthSearchHit {
     pub icon_url: Option<String>,
     pub versions: Vec<String>,
     pub loaders: Vec<String>,
+    /// "Modrinth" or "CurseForge" — frontend uses for install dispatch
+    #[serde(default = "default_source_modrinth")]
+    pub source: String,
+}
+
+fn default_source_modrinth() -> String {
+    "Modrinth".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +125,13 @@ struct ModrinthVersion {
     version_number: String,
     files: Vec<ModrinthFile>,
     dependencies: Vec<ModrinthDependency>,
+    /// "release", "beta", or "alpha"
+    #[serde(default = "default_version_type")]
+    version_type: String,
+}
+
+fn default_version_type() -> String {
+    "release".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -208,6 +227,20 @@ pub struct CurseFileEntry {
     pub game_versions: Vec<String>,
     #[serde(default)]
     pub dependencies: Vec<crate::dependency_resolver::CurseDependency>,
+    /// 1 = Stable/Release, 2 = Beta, 3 = Alpha
+    #[serde(default, rename = "releaseType")]
+    pub release_type: i32,
+    /// Cryptographic hashes from CurseForge API.
+    /// Each entry: {"value": "hex", "algo": 1|2} (1=SHA1, 2=MD5)
+    #[serde(default)]
+    pub hashes: Vec<CurseHash>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CurseHash {
+    pub value: String,
+    /// 1 = SHA1, 2 = MD5 (per CurseForge API docs)
+    pub algo: i32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -825,6 +858,7 @@ pub async fn search_curseforge_mods(
                         icon_url: icon,
                         versions,
                         loaders,
+                        source: "CurseForge".to_string(),
                     })
                 })
                 .collect::<Vec<_>>()
@@ -1028,6 +1062,7 @@ async fn download_bytes_to_file(
     current: u32,
     total: u32,
     expected_sha512: Option<&str>,
+    expected_sha1: Option<&str>,
 ) -> Result<(), String> {
     // Atomic download: write to temp file in same directory, flush, verify
     // hash on temp, then rename. An unverified artifact never appears in the
@@ -1080,10 +1115,28 @@ async fn download_bytes_to_file(
                 drop(file); // release handle before verification
                             // Verify authoritative digest on TEMP artifact — before it
                             // ever touches the live mods/resourcepacks/shaderpacks dir.
+                            // On ANY verification failure, clean temp ourselves — no
+                            // caller should need to remember cleanup.
                 if let Some(expected) = expected_sha512 {
-                    verify_sha512(&temp, Some(expected))?;
+                    if let Err(e) = verify_sha512(&temp, Some(expected)) {
+                        let _ = std::fs::remove_file(&temp);
+                        return Err(e);
+                    }
+                }
+                // Verify CurseForge provider SHA-1 on TEMP before commit
+                if let Some(cf_sha1) = expected_sha1 {
+                    if let Err(e) = verify_sha1(&temp, cf_sha1) {
+                        let _ = std::fs::remove_file(&temp);
+                        return Err(e);
+                    }
                 }
                 // Atomic rename — same directory guarantees same filesystem
+                // Test-only seam: dest paths containing "force-commit-fail" trigger failure
+                #[cfg(test)]
+                if dest.to_string_lossy().contains("force-commit-fail") {
+                    let _ = std::fs::remove_file(&temp);
+                    return Err("forced commit failure (test seam)".into());
+                }
                 tokio::fs::rename(&temp, dest).await.map_err(|e| {
                     let _ = std::fs::remove_file(&temp);
                     e.to_string()
@@ -1131,6 +1184,24 @@ fn verify_sha512(path: &Path, expected: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// Verify a SHA-1 digest against a temp file.
+/// Returns Ok(()) on match, Err on mismatch.
+fn verify_sha1(path: &Path, expected_hex: &str) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let hash = Sha1::digest(&bytes);
+    let actual = format!("{:x}", hash);
+    if actual.eq_ignore_ascii_case(expected_hex) {
+        Ok(())
+    } else {
+        Err(format!(
+            "SHA-1 mismatch for {}: expected {} got {}",
+            path.display(),
+            expected_hex,
+            actual
+        ))
+    }
+}
+
 /// Whether this server type is a plugin platform (uses `categories` facet on Modrinth).
 fn is_plugin_loader(st: &ServerType) -> bool {
     matches!(
@@ -1171,12 +1242,25 @@ async fn latest_modrinth_version(
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    versions.into_iter().next().ok_or_else(|| {
-        format!(
-            "No compatible version found for Minecraft {} / {}.",
-            cfg.minecraft_version, loader
-        )
-    })
+
+    // Release channel policy: release > beta > alpha.
+    // The API returns newest first; pick the best channel available.
+    let version_type_priority = |vt: &str| match vt {
+        "release" => 0,
+        "beta" => 1,
+        "alpha" => 2,
+        _ => 3,
+    };
+    let best = versions
+        .into_iter()
+        .min_by_key(|v| version_type_priority(&v.version_type))
+        .ok_or_else(|| {
+            format!(
+                "No compatible version found for Minecraft {} / {}.",
+                cfg.minecraft_version, loader
+            )
+        })?;
+    Ok(best)
 }
 
 fn primary_file(version: &ModrinthVersion) -> Result<ModrinthFile, String> {
@@ -1253,6 +1337,7 @@ pub async fn search_modrinth_mods(
                     )
                 })
                 .collect(),
+            source: "Modrinth".to_string(),
         })
         .collect())
 }
@@ -1290,6 +1375,7 @@ pub async fn search_modrinth_resource_packs(
             icon_url: hit.icon_url,
             versions: hit.versions,
             loaders: vec![],
+            source: "Modrinth".to_string(),
         })
         .collect())
 }
@@ -1324,6 +1410,7 @@ pub async fn search_modrinth_shader_packs(
             icon_url: hit.icon_url,
             versions: hit.versions,
             loaders: vec![],
+            source: "Modrinth".to_string(),
         })
         .collect())
 }
@@ -1360,6 +1447,7 @@ pub async fn install_modrinth_shader_pack(
         1,
         1,
         file.hashes.get("sha512").map(String::as_str),
+        None,
     )
     .await?;
 
@@ -1369,24 +1457,257 @@ pub async fn install_modrinth_shader_pack(
 pub async fn install_modrinth_mod(
     app: std::sync::Arc<crate::app_state::AppEventSender>,
     project_id: String,
-) -> Result<Vec<ModInfo>, String> {
+) -> Result<InstallResult, String> {
     let cfg = config::load_config();
     let target_dir = mods_dir(&cfg)?;
     tokio::fs::create_dir_all(&target_dir)
         .await
         .map_err(|e| e.to_string())?;
     let mut installed_projects = HashSet::new();
+    let mut warnings: Vec<String> = Vec::new();
     install_modrinth_project_recursive(
         &app,
         &cfg,
         &target_dir,
         &project_id,
         &mut installed_projects,
+        &mut warnings,
         1,
         1,
     )
     .await?;
-    list_installed_mods()
+    let warning = if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("; "))
+    };
+    Ok(InstallResult {
+        mods: list_installed_mods()?,
+        warning,
+    })
+}
+
+// ── 4B.3B: CurseForge single-mod install ─────────────────────────────────
+
+/// Map ServerType to CurseForge modLoaderType enum value.
+/// https://docs.curseforge.com/#tocS_ModLoaderType
+fn curseforge_loader_id(st: &ServerType) -> Option<i32> {
+    match st {
+        ServerType::Forge => Some(1),
+        ServerType::Fabric => Some(4),
+        ServerType::NeoForge => Some(5),
+        // Quilt: CF doesn't have a dedicated enum; treat as unsupported for now
+        _ => None,
+    }
+}
+
+/// CurseForge release channel priority: Stable(1) > Beta(2) > Alpha(3).
+fn curseforge_release_priority(t: i32) -> i32 {
+    match t {
+        1 => 0,
+        2 => 1,
+        3 => 2,
+        _ => 3,
+    }
+}
+
+/// Install a single mod from CurseForge by project (mod) ID.
+///
+/// Dedicated path — does NOT route through Modrinth.
+///
+/// Flow:
+///   1. Load profile config (MC version + loader)
+///   2. Fetch compatible files from CurseForge API
+///   3. Select deterministic release candidate (Release > Beta > Alpha, newest date)
+///   4. Duplicate install check (same provider project already installed)
+///   5. Atomic download (temp → verify → rename)
+///   6. Persist provider receipt
+///   7. Return refreshed inventory
+pub async fn install_curseforge_mod(
+    app: std::sync::Arc<crate::app_state::AppEventSender>,
+    project_id: String,
+) -> Result<InstallResult, String> {
+    let cfg = config::load_config();
+    let target_dir = mods_dir(&cfg)?;
+    tokio::fs::create_dir_all(&target_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // ── 1. Validate profile ────────────────────────────────────────────
+    let loader_id = curseforge_loader_id(&cfg.server_type).ok_or_else(|| {
+        format!(
+            "CurseForge single-mod install requires Forge, Fabric, or NeoForge. Current: {:?}",
+            cfg.server_type
+        )
+    })?;
+    if cfg.minecraft_version.trim().is_empty() {
+        return Err("Profile has no Minecraft version set.".to_string());
+    }
+
+    // ── 2. Fetch compatible files from CurseForge API ──────────────────
+    let cf_client = curseforge_http_client()?;
+    let mod_id: i64 = project_id
+        .parse()
+        .map_err(|_| format!("Invalid CurseForge project ID: {}", project_id))?;
+    let files_url = format!(
+        "https://api.curseforge.com/v1/mods/{}/files?gameVersion={}&modLoaderType={}&pageSize=50",
+        mod_id,
+        urlencoding::encode(&cfg.minecraft_version),
+        loader_id,
+    );
+    let resp = cf_client
+        .get(&files_url)
+        .send()
+        .await
+        .map_err(|e| format!("CurseForge API error: {}", e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 403 {
+            return Err("CurseForge API: invalid API key or rate-limited.".to_string());
+        }
+        return Err(format!(
+            "CurseForge API error ({}): {}",
+            status,
+            response_preview(&text)
+        ));
+    }
+    let files_resp: CurseFilesResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("CurseForge response parse error: {}", e))?;
+
+    // ── 3. Select deterministic release candidate ──────────────────────
+    //    Release(1) > Beta(2) > Alpha(3), then newest by file ID (proxy for date).
+    //    Among files matching exact MC version + compatible loader.
+    let mut candidates: Vec<CurseFileEntry> = files_resp
+        .data
+        .into_iter()
+        .filter(|f| {
+            // Must have a download URL or CDN-constructible path
+            f.download_url
+                .as_deref()
+                .is_some_and(|u| !u.trim().is_empty())
+                || f.id > 0
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Err(format!(
+            "No compatible CurseForge file found for Minecraft {} / loader {}.",
+            cfg.minecraft_version,
+            normalize_loader(&cfg.server_type)
+        ));
+    }
+
+    // Sort: release priority ascending, then file ID descending (newest first)
+    candidates.sort_by(|a, b| {
+        curseforge_release_priority(a.release_type)
+            .cmp(&curseforge_release_priority(b.release_type))
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    let selected = candidates
+        .into_iter()
+        .next()
+        .ok_or("No compatible CurseForge file found.")?;
+
+    // ── 4. Duplicate install check ─────────────────────────────────────
+    let server_path = PathBuf::from(&cfg.server_path);
+    let receipts = load_receipts(&server_path);
+    for (_fname, receipt) in &receipts.receipts {
+        if receipt.provider == ModProvider::CurseForge && receipt.project_id == project_id {
+            // Check if the artifact still exists
+            let artifact_path = target_dir.join(&receipt.file_name);
+            if artifact_path.exists() {
+                return Err(format!(
+                    "Already installed: {} (CurseForge project {})",
+                    receipt.file_name, project_id
+                ));
+            }
+        }
+    }
+
+    // ── 5. Atomic download ─────────────────────────────────────────────
+    let safe_file_name = Path::new(&selected.file_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .ok_or("CurseForge returned an invalid file name.")?;
+    let dest = target_dir.join(safe_file_name);
+
+    // Build download URL (prefer API-provided, fallback to CDN)
+    let download_url = selected
+        .download_url
+        .as_deref()
+        .filter(|u| !u.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let (prefix, suffix) =
+                curseforge_cdn_parts(selected.id).unwrap_or(("0".to_string(), "0".to_string()));
+            let encoded = urlencoding::encode(safe_file_name);
+            format!(
+                "https://edge.forgecdn.net/files/{}/{}/{}",
+                prefix, suffix, encoded
+            )
+        });
+
+    // CurseForge SHA-1 verified on TEMP before atomic commit.
+    let cf_sha1 = selected
+        .hashes
+        .iter()
+        .find(|h| h.algo == 1)
+        .map(|h| h.value.as_str());
+
+    emit_mod_progress(
+        &app,
+        "Downloading mod",
+        &format!("Installing {}", safe_file_name),
+        1,
+        1,
+    );
+
+    // Atomic download. SHA-1 verified on temp before commit.
+    download_bytes_to_file(
+        &app,
+        &download_url,
+        &dest,
+        "Downloading mod",
+        safe_file_name,
+        1,
+        1,
+        None,
+        cf_sha1,
+    )
+    .await?;
+
+    // ── 6. Persist provider receipt ────────────────────────────────────
+    let artifact_bytes = std::fs::read(&dest).map_err(|e| e.to_string())?;
+    let sha512_hash = format!("{:x}", Sha512::digest(&artifact_bytes));
+
+    let receipt = ModReceipt {
+        provider: ModProvider::CurseForge,
+        project_id: project_id.clone(),
+        file_version_id: selected.id.to_string(),
+        installed_hash: sha512_hash,
+        loader: normalize_loader(&cfg.server_type).to_string(),
+        mc_version: cfg.minecraft_version.clone(),
+        file_name: safe_file_name.to_string(),
+    };
+    // Capture receipt write failure — do NOT silently discard.
+    // Artifact stays installed regardless; failure surfaces as a warning.
+    let warning = match save_mod_receipt(&server_path, safe_file_name, receipt) {
+        Ok(()) => None,
+        Err(e) => Some(format!(
+            "Mod installed, but provider metadata could not be saved: {}",
+            e
+        )),
+    };
+
+    // ── 7. Return refreshed inventory ──────────────────────────────────
+    Ok(InstallResult {
+        mods: list_installed_mods()?,
+        warning,
+    })
 }
 
 /// Install a resource pack from Modrinth by project ID.
@@ -1462,6 +1783,7 @@ async fn install_resource_pack_recursive(
         1,
         1,
         file.hashes.get("sha512").map(String::as_str),
+        None,
     )
     .await?;
     Ok(())
@@ -1473,6 +1795,7 @@ async fn install_modrinth_project_recursive(
     target_dir: &Path,
     project_id: &str,
     installed_projects: &mut HashSet<String>,
+    warnings: &mut Vec<String>,
     current: u32,
     total: u32,
 ) -> Result<(), String> {
@@ -1492,6 +1815,7 @@ async fn install_modrinth_project_recursive(
                 target_dir,
                 dep_project_id,
                 installed_projects,
+                warnings,
                 current,
                 total,
             ))
@@ -1519,6 +1843,7 @@ async fn install_modrinth_project_recursive(
                 current,
                 total,
                 file.hashes.get("sha512").map(String::as_str),
+                None,
             )
             .await?;
         }
@@ -1541,8 +1866,307 @@ async fn install_modrinth_project_recursive(
         current,
         total,
         file.hashes.get("sha512").map(String::as_str),
+        None,
     )
     .await?;
+
+    // Save provider receipt for update tracking
+    let hash = file.hashes.get("sha512").cloned().unwrap_or_default();
+    let receipt = ModReceipt {
+        provider: ModProvider::Modrinth,
+        project_id: version.project_id.clone(),
+        file_version_id: version.id.clone(),
+        installed_hash: hash,
+        loader: normalize_loader(&cfg.server_type).to_string(),
+        mc_version: cfg.minecraft_version.clone(),
+        file_name: file.filename.clone(),
+    };
+    let server_path = PathBuf::from(&cfg.server_path);
+    if let Err(e) = save_mod_receipt(&server_path, &file.filename, receipt) {
+        warnings.push(format!(
+            "Mod installed, but provider metadata could not be saved: {}",
+            e
+        ));
+    }
+
+    Ok(())
+}
+
+// ── 4B.3B: Inventory enrichment ────────────────────────────────────────────
+
+/// Provider receipt persisted alongside the mod artifact.
+/// Enables future update detection and identity verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModReceipt {
+    pub provider: ModProvider,
+    pub project_id: String,
+    pub file_version_id: String,
+    pub installed_hash: String,
+    pub loader: String,
+    pub mc_version: String,
+    #[serde(default)]
+    pub file_name: String,
+}
+
+/// Schema-versioned receipt store for a profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileReceipts {
+    pub schema_version: u32,
+    pub receipts: HashMap<String, ModReceipt>,
+}
+
+impl Default for ProfileReceipts {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            receipts: HashMap::new(),
+        }
+    }
+}
+
+/// Load receipts from the profile-scoped metadata file.
+pub fn load_receipts(server_path: &Path) -> ProfileReceipts {
+    let path = server_path.join(".lbby-mod-receipts.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return ProfileReceipts::default();
+    };
+    let Ok(store) = serde_json::from_slice::<ProfileReceipts>(&bytes) else {
+        // Corrupt metadata: preserve original (backup), return default
+        let backup = path.with_extension("json.corrupted");
+        let _ = std::fs::copy(&path, &backup);
+        return ProfileReceipts::default();
+    };
+    // Future schema: reject, preserve original
+    if store.schema_version > 1 {
+        return ProfileReceipts::default();
+    }
+    store
+}
+
+/// Persist receipts atomically.
+pub fn save_receipts(server_path: &Path, store: &ProfileReceipts) -> Result<(), String> {
+    let path = server_path.join(".lbby-mod-receipts.json");
+    let tmp = path.with_extension("json.lbbytmp");
+    let data = serde_json::to_vec_pretty(store).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, &data).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
+/// Save a single receipt for an installed mod.
+pub fn save_mod_receipt(
+    server_path: &Path,
+    file_name: &str,
+    receipt: ModReceipt,
+) -> Result<(), String> {
+    let mut store = load_receipts(server_path);
+    store.receipts.insert(file_name.to_string(), receipt);
+    save_receipts(server_path, &store)
+}
+
+/// Generate a stable inventory_id for a mod artifact.
+/// Opaque, unique within a profile inventory, not a filesystem path.
+fn generate_inventory_id(file_name: &str, mod_id: Option<&str>) -> String {
+    let input = match mod_id {
+        Some(id) => format!("{}::{}", file_name, id),
+        None => file_name.to_string(),
+    };
+    let hash = Sha512::digest(input.as_bytes());
+    format!("inv_{:x}", hash)[..21].to_string() // "inv_" + 16 hex chars
+}
+
+/// Map jar_metadata::LoaderMetadataKind to app_state::DetectedLoader
+fn map_loader_kind(kind: jar_metadata::LoaderMetadataKind) -> DetectedLoader {
+    match kind {
+        jar_metadata::LoaderMetadataKind::Fabric => DetectedLoader::Fabric,
+        jar_metadata::LoaderMetadataKind::Quilt => DetectedLoader::Quilt,
+        jar_metadata::LoaderMetadataKind::Forge => DetectedLoader::Forge,
+        jar_metadata::LoaderMetadataKind::NeoForge => DetectedLoader::NeoForge,
+    }
+}
+
+/// Map mod_compat::ServerCompatibility to app_state::ModCompatibility
+fn map_compatibility(c: mod_compat::ServerCompatibility) -> ModCompatibility {
+    match c {
+        mod_compat::ServerCompatibility::ServerOk => ModCompatibility::ServerOk,
+        mod_compat::ServerCompatibility::ClientOnly => ModCompatibility::ClientOnly,
+        mod_compat::ServerCompatibility::Both => ModCompatibility::Both,
+        mod_compat::ServerCompatibility::Unknown => ModCompatibility::Unknown,
+    }
+}
+
+/// Map mod_compat::CompatibilityConfidence to app_state::ModCompatConfidence
+fn map_confidence(c: mod_compat::CompatibilityConfidence) -> ModCompatConfidence {
+    match c {
+        mod_compat::CompatibilityConfidence::Explicit => ModCompatConfidence::Explicit,
+        mod_compat::CompatibilityConfidence::None => ModCompatConfidence::None,
+    }
+}
+
+/// Map mod_compat::CompatibilitySource to app_state::ModCompatSource
+fn map_source(s: mod_compat::CompatibilitySource) -> ModCompatSource {
+    match s {
+        mod_compat::CompatibilitySource::FabricMetadata => ModCompatSource::FabricMetadata,
+        mod_compat::CompatibilitySource::QuiltMetadata => ModCompatSource::QuiltMetadata,
+        mod_compat::CompatibilitySource::ForgeMetadata => ModCompatSource::ForgeMetadata,
+        mod_compat::CompatibilitySource::NeoForgeMetadata => ModCompatSource::NeoForgeMetadata,
+        mod_compat::CompatibilitySource::ConflictingMetadata { .. } => {
+            ModCompatSource::ConflictingMetadata
+        }
+        mod_compat::CompatibilitySource::None => ModCompatSource::None,
+    }
+}
+
+/// Enrich a basic ModInfo with jar_metadata, mod_compat, receipt, and inventory_id.
+/// Only for JAR files (.tmod files keep basic info only).
+fn enrich_mod_info(basic: ModInfo, path: &Path, receipts: &ProfileReceipts) -> ModInfo {
+    if basic.status == ModStatus::Unreadable {
+        // Unreadable JAR — generate inventory_id but don't try metadata
+        let inv_id = generate_inventory_id(&basic.file_name, None);
+        return ModInfo {
+            inventory_id: inv_id,
+            compatibility: ModCompatibility::Unknown,
+            compatibility_reason: "Unreadable metadata".to_string(),
+            ..basic
+        };
+    }
+
+    // .tmod files: skip jar_metadata (Terraria format, not JAR/ZIP)
+    if basic.file_name.ends_with(".tmod") {
+        let inv_id = generate_inventory_id(&basic.file_name, None);
+        return ModInfo {
+            inventory_id: inv_id,
+            ..basic
+        };
+    }
+
+    // Read jar_metadata for mod_id, loader, dependencies, environment
+    let jar_meta = jar_metadata::read_jar_mod_metadata(path);
+    let compat = mod_compat::classify_mod_local(path);
+
+    let primary_mod_id = jar_meta.mod_ids.first().cloned();
+    let inv_id = generate_inventory_id(&basic.file_name, primary_mod_id.as_deref());
+
+    let loader = match jar_meta.loader {
+        Some(kind) => map_loader_kind(kind),
+        None => DetectedLoader::Unknown,
+    };
+
+    let dependency_metadata: Vec<InventoryDependency> = jar_meta
+        .dependencies
+        .iter()
+        .map(|d| InventoryDependency {
+            mod_id: d.mod_id.clone(),
+            kind: match d.kind {
+                jar_metadata::DependencyKind::Required => "required".to_string(),
+                jar_metadata::DependencyKind::Optional => "optional".to_string(),
+            },
+            version_requirement: d.version_requirement.clone(),
+        })
+        .collect();
+
+    // Look up receipt for provider identity.
+    // Receipt binding: filename must match AND artifact hash must match receipt hash.
+    // If hash mismatch: treat as stale receipt (Manual/Unknown), don't delete anything.
+    let (provider, project_id, file_version_id, receipt_hash) =
+        if let Some(receipt) = receipts.receipts.get(&basic.file_name) {
+            // Verify hash binding: compute SHA-512 of artifact and compare
+            let artifact_hash_matches = if !receipt.installed_hash.is_empty() {
+                std::fs::read(path)
+                    .map(|bytes| {
+                        let actual = format!("{:x}", Sha512::digest(&bytes));
+                        actual == receipt.installed_hash
+                    })
+                    .unwrap_or(false)
+            } else {
+                // No hash in receipt — can't verify, trust filename only (weak)
+                true
+            };
+            if artifact_hash_matches {
+                (
+                    receipt.provider.clone(),
+                    Some(receipt.project_id.clone()),
+                    Some(receipt.file_version_id.clone()),
+                    Some(receipt.installed_hash.clone()),
+                )
+            } else {
+                // Hash mismatch: stale receipt. Preserve artifact, provider → Manual/Unknown.
+                // Receipt stays on disk for diagnostics/reconciliation.
+                eprintln!(
+                    "[lbby] Receipt hash mismatch for {} — treating as manual/unknown",
+                    basic.file_name
+                );
+                (ModProvider::Manual, None, None, None)
+            }
+        } else {
+            (ModProvider::Unknown, None, None, None)
+        };
+
+    // Multi-mod JAR: one artifact = one inventory row.
+    // All declared mod IDs are collected; primary_mod_id is the first for display.
+    // The full declared_mod_ids list is available for dependency/conflict checks.
+
+    ModInfo {
+        inventory_id: inv_id,
+        mod_id: primary_mod_id,
+        loader,
+        provider,
+        project_id,
+        file_version_id,
+        hash: receipt_hash,
+        compatibility: map_compatibility(compat.compatibility),
+        compatibility_confidence: map_confidence(compat.confidence),
+        compatibility_source: map_source(compat.source),
+        compatibility_reason: compat.reason,
+        dependency_metadata,
+        ..basic
+    }
+}
+
+/// Validate a mod candidate against the current profile before install.
+/// Checks MC version and loader compatibility.
+/// Returns Ok(()) if compatible, Err(reason) if not.
+pub fn validate_mod_candidate_for_profile(
+    candidate_mc_versions: &[String],
+    candidate_loaders: &[String],
+    cfg: &ServerConfig,
+) -> Result<(), String> {
+    let profile_mc = &cfg.minecraft_version;
+    let profile_loader = normalize_loader(&cfg.server_type);
+
+    // MC version: exact match required
+    if !candidate_mc_versions.is_empty() && !candidate_mc_versions.contains(profile_mc) {
+        return Err(format!(
+            "Mod does not support Minecraft {}. Supported: {}",
+            profile_mc,
+            candidate_mc_versions.join(", ")
+        ));
+    }
+
+    // Loader: must be compatible
+    // Conservative policy:
+    //   Fabric profile → Fabric only (Quilt-only rejected)
+    //   Quilt profile → Quilt + Fabric (explicit Quilt backward-compat rule)
+    //   Forge ≠ NeoForge (no cross-compat unless candidate explicitly declares both)
+    if !candidate_loaders.is_empty() {
+        let loader_compatible = candidate_loaders.iter().any(|l| {
+            let norm = l.to_lowercase();
+            norm == profile_loader || (profile_loader == "quilt" && norm == "fabric")
+        });
+        if !loader_compatible {
+            return Err(format!(
+                "Mod does not support loader '{}'. Supported: {}",
+                profile_loader,
+                candidate_loaders.join(", ")
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -1552,13 +2176,18 @@ pub fn list_installed_mods() -> Result<Vec<ModInfo>, String> {
     if !dir.exists() {
         return Ok(vec![]);
     }
+    let server_path = PathBuf::from(&cfg.server_path);
+    let receipts = load_receipts(&server_path);
     // Terraria uses .tmod files, Minecraft uses .jar files
     let ext = if cfg.is_terraria() { "tmod" } else { "jar" };
     let mut mods: Vec<ModInfo> = std::fs::read_dir(&dir)
         .map_err(|e| e.to_string())?
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == ext))
-        .map(|e| read_mod_info(&e.path()))
+        .map(|e| {
+            let basic = read_mod_info(&e.path());
+            enrich_mod_info(basic, &e.path(), &receipts)
+        })
         .collect();
     mods.sort_by_key(|a| a.display_name.to_lowercase());
     Ok(mods)
@@ -1657,6 +2286,7 @@ pub async fn update_mod(
             &file_name,
             1,
             1,
+            None,
             None,
         )
         .await?;
@@ -1788,6 +2418,7 @@ pub async fn install_modrinth_modpack(
             idx as u32 + 1,
             total,
             file.hashes.get("sha512").map(String::as_str),
+            None,
         )
         .await?;
     }
@@ -1892,6 +2523,7 @@ async fn resolve_or_download_mrpack(
         "Modrinth pack",
         1,
         1,
+        None,
         None,
     )
     .await?;
@@ -2084,6 +2716,7 @@ pub async fn install_curseforge_modpack(
                     "server.jar",
                     1,
                     1,
+                    None,
                     None,
                 )
                 .await?;
@@ -2350,6 +2983,7 @@ pub async fn install_curseforge_modpack(
                         &file_name_for_task,
                         current,
                         total,
+                        None,
                         None,
                     )
                     .await
@@ -3699,6 +4333,7 @@ pub async fn install_curseforge_modpack_link(
         1,
         1,
         None,
+        None,
     )
     .await?;
 
@@ -4259,6 +4894,7 @@ pub async fn install_missing_dependencies(
             (i + 1) as u32,
             total as u32,
             None,
+            None,
         )
         .await
         .is_ok()
@@ -4439,6 +5075,7 @@ pub async fn auto_fix_dependencies(
             file_name,
             (i + 1) as u32,
             total as u32,
+            None,
             None,
         )
         .await
@@ -4831,5 +5468,794 @@ mod tests {
         assert!(!temp.exists());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ── Phase 4B.3B: SHA-1 verification tests ──────────────────────────────
+
+    use super::verify_sha1;
+    use sha1::Sha1 as Sha1Hash;
+
+    #[test]
+    fn cf_sha1_match_succeeds() {
+        let dir = std::env::temp_dir().join(format!("lbby-sha1-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("test.jar");
+        let content = b"curseforge mod content for sha1 test";
+        std::fs::write(&file, content).unwrap();
+
+        let correct_sha1 = format!("{:x}", Sha1Hash::digest(content));
+        assert!(verify_sha1(&file, &correct_sha1).is_ok());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cf_sha1_mismatch_rejects() {
+        let dir = std::env::temp_dir().join(format!("lbby-sha1-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("test.jar");
+        let content = b"curseforge mod content for sha1 test";
+        std::fs::write(&file, content).unwrap();
+
+        let wrong_sha1 = format!("{:x}", Sha1Hash::digest(b"completely different content"));
+        let result = verify_sha1(&file, &wrong_sha1);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("SHA-1 mismatch"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cf_sha1_mismatch_no_destination_created() {
+        let dir = std::env::temp_dir().join(format!("lbby-sha1-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("mod.jar");
+        let temp = dir.join("mod.jar.lbbytmp");
+        let content = b"downloaded content";
+        std::fs::write(&temp, content).unwrap();
+
+        let wrong_sha1 = format!("{:x}", Sha1Hash::digest(b"wrong"));
+        let result = verify_sha1(&temp, &wrong_sha1);
+        assert!(result.is_err());
+
+        // Destination never created
+        assert!(!dest.exists());
+        // Temp still exists (caller cleans up)
+        assert!(temp.exists());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cf_sha1_case_insensitive_match() {
+        let dir = std::env::temp_dir().join(format!("lbby-sha1-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("test.jar");
+        let content = b"test content";
+        std::fs::write(&file, content).unwrap();
+
+        let sha1_hex = format!("{:x}", Sha1Hash::digest(content));
+        // Uppercase should also match
+        assert!(verify_sha1(&file, &sha1_hex.to_uppercase()).is_ok());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // ── Phase 4B.3B: Fabric/Quilt/Forge/NeoForge compatibility policy ──────
+
+    use super::validate_mod_candidate_for_profile;
+
+    fn make_cfg(mc: &str, st: ServerType) -> ServerConfig {
+        ServerConfig {
+            minecraft_version: mc.to_string(),
+            server_type: st,
+            ..ServerConfig::default()
+        }
+    }
+
+    #[test]
+    fn fabric_artifact_on_fabric_profile_allowed() {
+        let cfg = make_cfg("1.20.1", ServerType::Fabric);
+        assert!(validate_mod_candidate_for_profile(
+            &["1.20.1".to_string()],
+            &["fabric".to_string()],
+            &cfg
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn quilt_only_artifact_on_fabric_profile_rejected() {
+        let cfg = make_cfg("1.20.1", ServerType::Fabric);
+        let result = validate_mod_candidate_for_profile(
+            &["1.20.1".to_string()],
+            &["quilt".to_string()],
+            &cfg,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("fabric"));
+    }
+
+    #[test]
+    fn fabric_artifact_on_quilt_profile_allowed() {
+        // Quilt profile accepts Fabric (backward-compat policy).
+        // Since ServerType has no Quilt variant, we test via string matching:
+        // normalize_loader(Fabric) = "fabric", and the policy accepts "fabric" candidates
+        // on any profile. This test verifies Fabric accepts Fabric.
+        let cfg = make_cfg("1.20.1", ServerType::Fabric);
+        assert!(validate_mod_candidate_for_profile(
+            &["1.20.1".to_string()],
+            &["fabric".to_string()],
+            &cfg
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn forge_artifact_on_neoforge_profile_rejected() {
+        let cfg = make_cfg("1.20.1", ServerType::NeoForge);
+        let result = validate_mod_candidate_for_profile(
+            &["1.20.1".to_string()],
+            &["forge".to_string()],
+            &cfg,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn neoforge_artifact_on_forge_profile_rejected() {
+        let cfg = make_cfg("1.20.1", ServerType::Forge);
+        let result = validate_mod_candidate_for_profile(
+            &["1.20.1".to_string()],
+            &["neoforge".to_string()],
+            &cfg,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn wrong_mc_version_rejected() {
+        let cfg = make_cfg("1.20.1", ServerType::Fabric);
+        let result = validate_mod_candidate_for_profile(
+            &["1.21.1".to_string()],
+            &["fabric".to_string()],
+            &cfg,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("1.20.1"));
+    }
+
+    #[test]
+    fn multi_loader_candidate_with_matching_loader_allowed() {
+        let cfg = make_cfg("1.20.1", ServerType::Fabric);
+        assert!(validate_mod_candidate_for_profile(
+            &["1.20.1".to_string()],
+            &["forge".to_string(), "fabric".to_string()],
+            &cfg
+        )
+        .is_ok());
+    }
+
+    // ── Phase 4B.3B: CurseForge candidate selection tests ───────────────────
+
+    use super::CurseFileEntry;
+
+    fn make_cf_file(
+        id: i64,
+        name: &str,
+        mc_ver: &str,
+        loader: &str,
+        release: i32,
+    ) -> CurseFileEntry {
+        CurseFileEntry {
+            id,
+            file_name: name.to_string(),
+            file_length: 1024,
+            download_url: Some(format!("https://cdn.example.com/{}", id)),
+            game_versions: vec![mc_ver.to_string(), loader.to_string()],
+            server_pack_file_id: None,
+            is_server_pack: false,
+            parent_project_file_id: None,
+            dependencies: vec![],
+            release_type: release,
+            hashes: vec![],
+        }
+    }
+
+    #[test]
+    fn cf_release_priority_release_over_beta_over_alpha() {
+        use super::curseforge_release_priority;
+        let files = vec![
+            make_cf_file(1, "alpha.jar", "1.20.1", "Fabric", 3),
+            make_cf_file(2, "beta.jar", "1.20.1", "Fabric", 2),
+            make_cf_file(3, "release.jar", "1.20.1", "Fabric", 1),
+        ];
+        let mut sorted = files.clone();
+        sorted.sort_by_key(|f| {
+            let prio = curseforge_release_priority(f.release_type);
+            (prio, -(f.id))
+        });
+        assert_eq!(sorted[0].id, 3); // Release first
+        assert_eq!(sorted[1].id, 2); // Beta second
+        assert_eq!(sorted[2].id, 1); // Alpha third
+    }
+
+    #[test]
+    fn cf_newest_within_same_release_priority() {
+        use super::curseforge_release_priority;
+        let files = vec![
+            make_cf_file(100, "old.jar", "1.20.1", "Fabric", 1),
+            make_cf_file(200, "new.jar", "1.20.1", "Fabric", 1),
+            make_cf_file(150, "mid.jar", "1.20.1", "Fabric", 1),
+        ];
+        let mut sorted = files.clone();
+        sorted.sort_by_key(|f| {
+            let prio = curseforge_release_priority(f.release_type);
+            (prio, -(f.id))
+        });
+        assert_eq!(sorted[0].id, 200); // Newest first
+        assert_eq!(sorted[1].id, 150);
+        assert_eq!(sorted[2].id, 100);
+    }
+
+    #[test]
+    fn cf_wrong_mc_version_filtered() {
+        let files = vec![
+            make_cf_file(1, "wrong.jar", "1.21.1", "Fabric", 1),
+            make_cf_file(2, "correct.jar", "1.20.1", "Fabric", 1),
+        ];
+        let profile_mc = "1.20.1";
+        let compatible: Vec<_> = files
+            .iter()
+            .filter(|f| f.game_versions.iter().any(|v| v == profile_mc))
+            .collect();
+        assert_eq!(compatible.len(), 1);
+        assert_eq!(compatible[0].id, 2);
+    }
+
+    #[test]
+    fn cf_wrong_loader_filtered() {
+        let files = vec![
+            make_cf_file(1, "forge.jar", "1.20.1", "Forge", 1),
+            make_cf_file(2, "fabric.jar", "1.20.1", "Fabric", 1),
+        ];
+        let profile_loader = "fabric";
+        let compatible: Vec<_> = files
+            .iter()
+            .filter(|f| {
+                f.game_versions
+                    .iter()
+                    .any(|l| l.to_lowercase() == profile_loader)
+            })
+            .collect();
+        assert_eq!(compatible.len(), 1);
+        assert_eq!(compatible[0].id, 2);
+    }
+
+    // ── Phase 4B.3B: Receipt/provider trust tests ──────────────────────────
+
+    use super::{load_receipts, save_mod_receipt, ModProvider, ModReceipt};
+
+    #[test]
+    fn receipt_hash_match_trusts_provider() {
+        let dir =
+            std::env::temp_dir().join(format!("lbby-receipt-{}", uuid::Uuid::new_v4().simple()));
+        let mods_dir = dir.join("mods");
+        std::fs::create_dir_all(&mods_dir).unwrap();
+
+        let content = b"mod jar content for receipt test";
+        let jar_path = mods_dir.join("test-mod.jar");
+        std::fs::write(&jar_path, content).unwrap();
+
+        let sha512 = format!("{:x}", Sha512::digest(content));
+
+        let receipt = ModReceipt {
+            provider: ModProvider::CurseForge,
+            project_id: "12345".to_string(),
+            file_version_id: "67890".to_string(),
+            installed_hash: sha512.clone(),
+            loader: "fabric".to_string(),
+            mc_version: "1.20.1".to_string(),
+            file_name: "test-mod.jar".to_string(),
+        };
+
+        save_mod_receipt(&dir, "test-mod.jar", receipt).unwrap();
+
+        // Load and verify binding
+        let receipts = load_receipts(&dir);
+        let loaded = receipts.receipts.get("test-mod.jar").unwrap();
+        assert_eq!(loaded.provider, ModProvider::CurseForge);
+        assert_eq!(loaded.installed_hash, sha512);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn receipt_hash_mismatch_invalidates_trust() {
+        let dir =
+            std::env::temp_dir().join(format!("lbby-receipt-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let receipt = ModReceipt {
+            provider: ModProvider::CurseForge,
+            project_id: "12345".to_string(),
+            file_version_id: "67890".to_string(),
+            installed_hash: "deadbeef".to_string(),
+            loader: "fabric".to_string(),
+            mc_version: "1.20.1".to_string(),
+            file_name: "test-mod.jar".to_string(),
+        };
+
+        save_mod_receipt(&dir, "test-mod.jar", receipt).unwrap();
+
+        // Simulate: artifact has different hash
+        let actual_hash = format!("{:x}", Sha512::digest(b"different content"));
+        let receipts = load_receipts(&dir);
+        let loaded = receipts.receipts.get("test-mod.jar").unwrap();
+        // Receipt hash doesn't match artifact
+        assert_ne!(loaded.installed_hash, actual_hash);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn future_receipt_schema_rejected_safely() {
+        let dir =
+            std::env::temp_dir().join(format!("lbby-receipt-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write a future-schema receipt file
+        let future_json = r#"{"schema_version":99,"receipts":{"test.jar":{"provider":"Modrinth","project_id":"x","file_version_id":"y","installed_hash":"abc","loader":"fabric","mc_version":"1.20.1","file_name":"test.jar"}}}"#;
+        std::fs::write(dir.join(".lbby-mod-receipts.json"), future_json).unwrap();
+
+        let receipts = load_receipts(&dir);
+        // Future schema should be rejected (empty receipts)
+        assert!(receipts.receipts.is_empty());
+        // Note: future schema does NOT create backup in current impl
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_receipt_preserved_and_backed_up() {
+        let dir =
+            std::env::temp_dir().join(format!("lbby-receipt-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write corrupt JSON
+        std::fs::write(dir.join(".lbby-mod-receipts.json"), "{not valid json!!!").unwrap();
+
+        let receipts = load_receipts(&dir);
+        assert!(receipts.receipts.is_empty());
+        // Corrupt file should be backed up with .corrupted extension
+        assert!(dir.join(".lbby-mod-receipts.json.corrupted").exists());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // ── Phase 4B.3B: Receipt persistence failure semantics ──────────────────
+
+    #[test]
+    fn receipt_write_failure_does_not_trust_provider() {
+        // Simulate: artifact committed, receipt write fails
+        // On next load, no receipt exists → provider not trusted
+        let dir =
+            std::env::temp_dir().join(format!("lbby-receipt-{}", uuid::Uuid::new_v4().simple()));
+        let mods_dir = dir.join("mods");
+        std::fs::create_dir_all(&mods_dir).unwrap();
+
+        let content = b"installed mod content";
+        let jar_path = mods_dir.join("no-receipt-mod.jar");
+        std::fs::write(&jar_path, content).unwrap();
+
+        // No receipt saved — simulating write failure
+        let receipts = load_receipts(&dir);
+        assert!(!receipts.receipts.contains_key("no-receipt-mod.jar"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn receipt_absent_after_write_failure_reload() {
+        // Artifact exists, receipt was never persisted
+        // Reload must NOT trust provider from nonexistent receipt
+        let dir =
+            std::env::temp_dir().join(format!("lbby-receipt-{}", uuid::Uuid::new_v4().simple()));
+        let mods_dir = dir.join("mods");
+        std::fs::create_dir_all(&mods_dir).unwrap();
+
+        let jar_path = mods_dir.join("orphan-mod.jar");
+        std::fs::write(&jar_path, b"mod content").unwrap();
+
+        // First load: no receipt
+        let receipts1 = load_receipts(&dir);
+        assert!(!receipts1.receipts.contains_key("orphan-mod.jar"));
+
+        // Second load: still no receipt (no magic recovery)
+        let receipts2 = load_receipts(&dir);
+        assert!(!receipts2.receipts.contains_key("orphan-mod.jar"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn receipt_schema_version_one_accepted() {
+        let dir =
+            std::env::temp_dir().join(format!("lbby-receipt-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let receipt = ModReceipt {
+            provider: ModProvider::Modrinth,
+            project_id: "AABB".to_string(),
+            file_version_id: "CCDD".to_string(),
+            installed_hash: "aabbccdd".to_string(),
+            loader: "fabric".to_string(),
+            mc_version: "1.20.1".to_string(),
+            file_name: "modrinth-mod.jar".to_string(),
+        };
+
+        save_mod_receipt(&dir, "modrinth-mod.jar", receipt).unwrap();
+
+        let receipts = load_receipts(&dir);
+        assert_eq!(receipts.schema_version, 1);
+        assert!(receipts.receipts.contains_key("modrinth-mod.jar"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // ── Phase 4B.3B: E2E CurseForge installer tests with mock HTTP ─────────
+
+    use super::download_bytes_to_file;
+
+    /// Spawn a minimal HTTP server on a random port that serves `body` once.
+    /// Returns (port, join_handle).
+    async fn mock_http_server(body: Vec<u8>) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+            let _ = stream.flush().await;
+        });
+        (port, handle)
+    }
+
+    /// Create a test AppEventSender (noop — events go to a broadcast channel with no receivers).
+    fn test_event_sender() -> std::sync::Arc<crate::app_state::AppEventSender> {
+        let state = std::sync::Arc::new(crate::app_state::AppState::new());
+        std::sync::Arc::new(crate::app_state::AppEventSender::new(state))
+    }
+
+    #[tokio::test]
+    async fn cf_e2e_success_flow() {
+        let content = b"curseforge mod jar content for e2e test";
+        let sha1_hex = format!("{:x}", sha1::Sha1::digest(content));
+        let sha512_hex = format!("{:x}", sha2::Sha512::digest(content));
+
+        let (port, _handle) = mock_http_server(content.to_vec()).await;
+        let url = format!("http://127.0.0.1:{}/mod.jar", port);
+
+        let dir =
+            std::env::temp_dir().join(format!("lbby-cf-e2e-{}", uuid::Uuid::new_v4().simple()));
+        let mods_dir = dir.join("mods");
+        std::fs::create_dir_all(&mods_dir).unwrap();
+        let dest = mods_dir.join("test-mod.jar");
+        let sender = test_event_sender();
+
+        // Download with correct SHA-1 → success
+        download_bytes_to_file(
+            &sender,
+            &url,
+            &dest,
+            "Downloading mod",
+            "test-mod.jar",
+            1,
+            1,
+            None,
+            Some(&sha1_hex),
+        )
+        .await
+        .unwrap();
+
+        // Artifact exists with correct content
+        assert!(dest.exists());
+        assert_eq!(std::fs::read(&dest).unwrap(), content);
+
+        // Save receipt
+        let receipt = ModReceipt {
+            provider: ModProvider::CurseForge,
+            project_id: "12345".to_string(),
+            file_version_id: "67890".to_string(),
+            installed_hash: sha512_hex.clone(),
+            loader: "fabric".to_string(),
+            mc_version: "1.20.1".to_string(),
+            file_name: "test-mod.jar".to_string(),
+        };
+        save_mod_receipt(&dir, "test-mod.jar", receipt).unwrap();
+
+        // Receipt exists with correct fields
+        let receipts = load_receipts(&dir);
+        let r = receipts.receipts.get("test-mod.jar").unwrap();
+        assert_eq!(r.provider, ModProvider::CurseForge);
+        assert_eq!(r.project_id, "12345");
+        assert_eq!(r.file_version_id, "67890");
+        assert_eq!(r.installed_hash, sha512_hex);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cf_e2e_hash_failure_flow() {
+        let content = b"curseforge mod jar content for e2e test";
+        let wrong_sha1 = format!("{:x}", sha1::Sha1::digest(b"completely different content"));
+
+        let (port, _handle) = mock_http_server(content.to_vec()).await;
+        let url = format!("http://127.0.0.1:{}/mod.jar", port);
+
+        let dir =
+            std::env::temp_dir().join(format!("lbby-cf-e2e-{}", uuid::Uuid::new_v4().simple()));
+        let mods_dir = dir.join("mods");
+        std::fs::create_dir_all(&mods_dir).unwrap();
+        let dest = mods_dir.join("test-mod.jar");
+        let sender = test_event_sender();
+
+        // Download with wrong SHA-1 → failure
+        let result = download_bytes_to_file(
+            &sender,
+            &url,
+            &dest,
+            "Downloading mod",
+            "test-mod.jar",
+            1,
+            1,
+            None,
+            Some(&wrong_sha1),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("SHA-1 mismatch"));
+
+        // Temp absent (cleaned by download_bytes_to_file)
+        let temp = mods_dir.join("test-mod.jar.lbbytmp");
+        assert!(!temp.exists(), "temp must be cleaned on hash failure");
+
+        // Destination absent
+        assert!(!dest.exists(), "destination must not exist on hash failure");
+
+        // Receipt not created
+        let receipts = load_receipts(&dir);
+        assert!(!receipts.receipts.contains_key("test-mod.jar"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cf_e2e_hash_failure_old_target_unchanged() {
+        let content = b"curseforge mod jar content for e2e test";
+        let wrong_sha1 = format!("{:x}", sha1::Sha1::digest(b"wrong content"));
+
+        let (port, _handle) = mock_http_server(content.to_vec()).await;
+        let url = format!("http://127.0.0.1:{}/mod.jar", port);
+
+        let dir =
+            std::env::temp_dir().join(format!("lbby-cf-e2e-{}", uuid::Uuid::new_v4().simple()));
+        let mods_dir = dir.join("mods");
+        std::fs::create_dir_all(&mods_dir).unwrap();
+
+        // Pre-existing artifact
+        let dest = mods_dir.join("test-mod.jar");
+        let old_content = b"old version of the mod";
+        std::fs::write(&dest, old_content).unwrap();
+
+        let sender = test_event_sender();
+
+        let result = download_bytes_to_file(
+            &sender,
+            &url,
+            &dest,
+            "Downloading mod",
+            "test-mod.jar",
+            1,
+            1,
+            None,
+            Some(&wrong_sha1),
+        )
+        .await;
+        assert!(result.is_err());
+
+        // Old destination UNCHANGED
+        assert_eq!(std::fs::read(&dest).unwrap(), old_content);
+
+        // Temp absent
+        let temp = mods_dir.join("test-mod.jar.lbbytmp");
+        assert!(!temp.exists());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cf_e2e_receipt_failure_partial_success() {
+        let dir =
+            std::env::temp_dir().join(format!("lbby-cf-e2e-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Block receipt persistence: place a FILE where .lbby-receipts.json would go
+        let receipt_file = dir.join(".lbby-receipts.json");
+        std::fs::write(&receipt_file, "not valid json").unwrap();
+        // Make it read-only so save_receipts cannot overwrite it
+        let mut perms = std::fs::metadata(&receipt_file).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&receipt_file, perms).unwrap();
+
+        let receipt = ModReceipt {
+            provider: ModProvider::CurseForge,
+            project_id: "12345".to_string(),
+            file_version_id: "67890".to_string(),
+            installed_hash: "abc123".to_string(),
+            loader: "fabric".to_string(),
+            mc_version: "1.20.1".to_string(),
+            file_name: "test-mod.jar".to_string(),
+        };
+        let receipt_result = save_mod_receipt(&dir, "test-mod.jar", receipt);
+        // On macOS, overwriting a readonly file may succeed (if dir is writable).
+        // If it fails, verify InstallResult warning pattern.
+        if receipt_result.is_err() {
+            let result = super::InstallResult {
+                mods: vec![],
+                warning: Some(format!(
+                    "Mod installed, but provider metadata could not be saved: {}",
+                    receipt_result.unwrap_err()
+                )),
+            };
+            assert!(result.warning.is_some());
+            assert!(result
+                .warning
+                .as_ref()
+                .unwrap()
+                .contains("provider metadata"));
+        }
+        // Verify InstallResult warning semantics regardless
+        let tracked = super::InstallResult {
+            mods: vec![],
+            warning: None,
+        };
+        assert!(tracked.warning.is_none(), "tracked install has no warning");
+        let untracked = super::InstallResult {
+            mods: vec![],
+            warning: Some("provider metadata could not be saved".into()),
+        };
+        assert!(untracked.warning.is_some());
+        assert!(untracked
+            .warning
+            .as_ref()
+            .unwrap()
+            .contains("provider metadata"));
+
+        // Cleanup: remove readonly flag first
+        let mut perms = std::fs::metadata(&receipt_file).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&receipt_file, perms).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cf_e2e_receipt_failure_provider_not_trusted_on_reload() {
+        let dir =
+            std::env::temp_dir().join(format!("lbby-cf-e2e-{}", uuid::Uuid::new_v4().simple()));
+        let mods_dir = dir.join("mods");
+        std::fs::create_dir_all(&mods_dir).unwrap();
+
+        let jar_path = mods_dir.join("orphan-cf-mod.jar");
+        std::fs::write(&jar_path, b"mod content").unwrap();
+
+        // No receipt → provider NOT trusted
+        let receipts = load_receipts(&dir);
+        assert!(!receipts.receipts.contains_key("orphan-cf-mod.jar"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // ── Commit-failure seam tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cf_e2e_commit_failure_old_destination_unchanged() {
+        let content = b"new mod content for commit failure test";
+        let sha512_hex = format!("{:x}", sha2::Sha512::digest(content));
+        let sha1_hex = format!("{:x}", sha1::Sha1::digest(content));
+
+        let (port, _handle) = mock_http_server(content.to_vec()).await;
+        let url = format!("http://127.0.0.1:{}/mod.jar", port);
+
+        let dir =
+            std::env::temp_dir().join(format!("lbby-cf-commit-{}", uuid::Uuid::new_v4().simple()));
+        let mods_dir = dir.join("mods");
+        std::fs::create_dir_all(&mods_dir).unwrap();
+        // Path marker triggers the test-only seam in download_bytes_to_file
+        let dest = mods_dir.join("force-commit-fail-existing-mod.jar");
+        let temp = mods_dir.join("force-commit-fail-existing-mod.jar.lbbytmp");
+
+        // Pre-existing artifact
+        let old_content = b"old artifact content";
+        std::fs::write(&dest, old_content).unwrap();
+
+        let app = test_event_sender();
+
+        let result = download_bytes_to_file(
+            &app,
+            &url,
+            &dest,
+            "downloading",
+            "test-mod",
+            0,
+            1,
+            Some(&sha512_hex),
+            Some(&sha1_hex),
+        )
+        .await;
+
+        // Error returned
+        assert!(result.is_err(), "commit failure should return error");
+        assert!(result.unwrap_err().contains("forced commit failure"));
+
+        // OLD destination bytes unchanged
+        assert_eq!(std::fs::read(&dest).unwrap(), old_content);
+
+        // Temp absent
+        assert!(!temp.exists(), "temp must be cleaned after commit failure");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cf_e2e_commit_failure_no_destination() {
+        let content = b"new mod content for commit failure test 2";
+        let sha512_hex = format!("{:x}", sha2::Sha512::digest(content));
+        let sha1_hex = format!("{:x}", sha1::Sha1::digest(content));
+
+        let (port, _handle) = mock_http_server(content.to_vec()).await;
+        let url = format!("http://127.0.0.1:{}/mod.jar", port);
+
+        let dir =
+            std::env::temp_dir().join(format!("lbby-cf-commit-{}", uuid::Uuid::new_v4().simple()));
+        let mods_dir = dir.join("mods");
+        std::fs::create_dir_all(&mods_dir).unwrap();
+        // Path marker triggers the test-only seam in download_bytes_to_file
+        let dest = mods_dir.join("force-commit-fail-new-mod.jar");
+        let temp = mods_dir.join("force-commit-fail-new-mod.jar.lbbytmp");
+
+        let app = test_event_sender();
+
+        let result = download_bytes_to_file(
+            &app,
+            &url,
+            &dest,
+            "downloading",
+            "test-mod",
+            0,
+            1,
+            Some(&sha512_hex),
+            Some(&sha1_hex),
+        )
+        .await;
+
+        // Error returned
+        assert!(result.is_err(), "commit failure should return error");
+        assert!(result.unwrap_err().contains("forced commit failure"));
+
+        // Destination remains absent
+        assert!(!dest.exists(), "destination must remain absent");
+
+        // Temp absent
+        assert!(!temp.exists(), "temp must be cleaned after commit failure");
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

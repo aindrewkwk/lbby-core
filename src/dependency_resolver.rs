@@ -545,6 +545,8 @@ pub async fn download_resolved_dependency(
         parent_project_file_id: None,
         game_versions: vec![resolved.minecraft_version.clone()],
         dependencies: vec![],
+        release_type: 1, // assume stable for resolved dependencies
+        hashes: vec![],
     };
 
     // Reuse existing download infrastructure.
@@ -656,6 +658,8 @@ mod tests {
             parent_project_file_id: None,
             game_versions: vec![mc_ver.to_string()],
             dependencies: vec![],
+            release_type: 1,
+            hashes: vec![],
         }
     }
 
