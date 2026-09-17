@@ -302,7 +302,40 @@ fn read_forge_mod_info<R: Read + std::io::Seek>(
     })
 }
 
-/// Extract dependencies from a Forge mod JAR's META-INF/mods.toml.
+/// Read ALL declared mod IDs from a Forge/NeoForge JAR (multi-mod JARs
+/// declare multiple `[[mods]]` entries). Returns deduplicated list.
+pub fn read_all_forge_mod_ids(path: &std::path::Path) -> Vec<String> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(mut zip) = zip::ZipArchive::new(file) else {
+        return Vec::new();
+    };
+    let text = match read_zip_text(&mut zip, "META-INF/neoforge.mods.toml")
+        .or_else(|| read_zip_text(&mut zip, "META-INF/mods.toml"))
+        .or_else(|| read_zip_text(&mut zip, "mods.toml"))
+    {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    let Ok(value) = text.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    let Some(mods) = value.get("mods").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    for entry in mods {
+        if let Some(mid) = entry.get("modId").and_then(|v| v.as_str()) {
+            let trimmed = mid.trim().to_string();
+            if !trimmed.is_empty() && !ids.contains(&trimmed) {
+                ids.push(trimmed);
+            }
+        }
+    }
+    ids
+}
+
 /// Returns a list of (mod_id, version_range) tuples.
 pub fn read_forge_dependencies(path: &std::path::Path) -> Vec<(String, String)> {
     let Ok(file) = std::fs::File::open(path) else {

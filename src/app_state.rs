@@ -161,6 +161,86 @@ impl Default for ModStatus {
     }
 }
 
+// ── 4B.3C: Update & removal types ────────────────────────────────────────
+
+/// Status of an update check for a single mod.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateStatus {
+    /// Provider receipt confirmed, no newer compatible version found.
+    UpToDate,
+    /// A newer compatible version is available from the trusted provider.
+    UpdateAvailable,
+    /// No provider receipt; identity could not be resolved to a provider.
+    ProviderUnknown,
+    /// Provider receipt exists but the provider API call failed.
+    ProviderUnavailable,
+    /// Provider queried successfully but no compatible update exists.
+    NoCompatibleUpdate,
+    /// Artifact metadata unreadable; cannot determine update status.
+    Unreadable,
+    /// A conflict was detected (e.g., loader mismatch, version constraint).
+    Conflict,
+}
+
+impl Default for UpdateStatus {
+    fn default() -> Self {
+        UpdateStatus::UpToDate
+    }
+}
+
+/// Outcome of a single-mod update attempt within update-all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateOutcome {
+    Updated,
+    /// Artifact updated but receipt metadata could not be persisted.
+    UpdatedUntracked,
+    Skipped,
+    Failed,
+    UpToDate,
+    Conflict,
+    ProviderUnavailable,
+}
+
+impl Default for UpdateOutcome {
+    fn default() -> Self {
+        UpdateOutcome::UpToDate
+    }
+}
+
+/// Per-item result from update_all_mods.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateItemResult {
+    pub file_name: String,
+    pub display_name: String,
+    pub outcome: UpdateOutcome,
+    pub detail: String,
+}
+
+/// Structured result from update_all_mods.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateAllResult {
+    pub mods: Vec<ModInfo>,
+    pub results: Vec<UpdateItemResult>,
+    pub warning: Option<String>,
+}
+
+/// A mod that depends on a target mod (used for removal conflict display).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependentInfo {
+    pub file_name: String,
+    pub display_name: String,
+    pub mod_id: String,
+    pub kind: String, // "required"
+}
+
+/// Result of a remove_mod attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveResult {
+    pub success: bool,
+    pub dependents: Vec<DependentInfo>,
+    pub warning: Option<String>,
+}
+
 /// Server compatibility classification.
 /// Re-exports mod_compat::ServerCompatibility for the ModInfo model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

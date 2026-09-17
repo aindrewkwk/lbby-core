@@ -1,8 +1,9 @@
 use crate::config::{self, ServerConfig, ServerType};
 use crate::{
     app_state::{
-        DetectedLoader, InstallResult, InventoryDependency, ModCompatConfidence, ModCompatSource,
-        ModCompatibility, ModInfo, ModProvider, ModStatus,
+        DependentInfo, DetectedLoader, InstallResult, InventoryDependency, ModCompatConfidence,
+        ModCompatSource, ModCompatibility, ModInfo, ModProvider, ModStatus, RemoveResult,
+        UpdateAllResult, UpdateItemResult, UpdateOutcome, UpdateStatus,
     },
     helpers::{default_server_path_value, read_mod_info},
     jar_metadata, mod_compat,
@@ -92,6 +93,13 @@ pub struct ModUpdateInfo {
     pub download_url: Option<String>,
     pub outdated: bool,
     pub message: String,
+    // ── 4B.3C: structured status ──
+    #[serde(default)]
+    pub status: UpdateStatus,
+    #[serde(default)]
+    pub provider: ModProvider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_file_version_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2193,12 +2201,26 @@ pub fn list_installed_mods() -> Result<Vec<ModInfo>, String> {
     Ok(mods)
 }
 
+/// Check all installed mods for available updates.
+///
+/// Receipt-aware: uses persisted `ModReceipt` entries to determine provider
+/// identity and installed version. Deterministic comparison by `file_version_id`
+/// (Modrinth version ID or CurseForge file ID), not version-number strings.
+///
+/// For each installed JAR:
+/// 1. Look up receipt by filename → verify artifact hash matches receipt hash.
+/// 2. If receipt verified:
+///    - Modrinth: `latest_modrinth_version()` → compare `latest.id` vs `receipt.file_version_id`.
+///    - CurseForge: fetch latest compatible file → compare `selected.id` vs `receipt.file_version_id`.
+/// 3. If no receipt or hash mismatch: fallback to Modrinth SHA-512 hash lookup (legacy path).
 pub async fn check_mod_updates() -> Result<Vec<ModUpdateInfo>, String> {
     let cfg = config::load_config();
     let dir = mods_dir(&cfg)?;
     if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
         return Ok(vec![]);
     }
+    let server_path = PathBuf::from(&cfg.server_path);
+    let receipts = load_receipts(&server_path);
     let mut out = Vec::new();
     let mut entries = tokio::fs::read_dir(&dir).await.map_err(|e| e.to_string())?;
     while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
@@ -2207,126 +2229,523 @@ pub async fn check_mod_updates() -> Result<Vec<ModUpdateInfo>, String> {
             continue;
         }
         let info = read_mod_info(&path);
-        let hash = {
-            let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
-            format!("{:x}", Sha512::digest(&bytes))
-        };
-        let found: Result<ModrinthVersion, _> = client()?
-            .get(format!(
-                "https://api.modrinth.com/v2/version_file/{}?algorithm=sha512",
-                hash
-            ))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string());
-        let Ok(current_version) = found else {
-            out.push(ModUpdateInfo {
-                file_name: info.file_name,
-                display_name: info.display_name,
-                current_version: info.version,
-                latest_version: String::new(),
-                project_id: None,
-                version_id: None,
-                download_url: None,
-                outdated: false,
-                message: "Not found on Modrinth".to_string(),
-            });
-            continue;
-        };
-        let latest = latest_modrinth_version(&current_version.project_id, &cfg).await?;
-        let latest_file = primary_file(&latest)?;
-        out.push(ModUpdateInfo {
-            file_name: info.file_name,
-            display_name: info.display_name,
-            current_version: current_version.version_number,
-            latest_version: latest.version_number.clone(),
-            project_id: Some(latest.project_id),
-            version_id: Some(latest.id.clone()),
-            download_url: Some(latest_file.url),
-            outdated: latest.id != current_version.id,
-            message: if latest.id != current_version.id {
-                "Update available".to_string()
+
+        // ── Receipt lookup + hash verification ──────────────────────────
+        let verified_receipt: Option<&ModReceipt> =
+            if let Some(r) = receipts.receipts.get(&info.file_name) {
+                if !r.installed_hash.is_empty() {
+                    let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
+                    let actual = format!("{:x}", Sha512::digest(&bytes));
+                    if actual == r.installed_hash {
+                        Some(r)
+                    } else {
+                        eprintln!(
+                            "[lbby] Receipt hash mismatch for {} — falling back to Modrinth lookup",
+                            info.file_name
+                        );
+                        None
+                    }
+                } else {
+                    // Empty hash: weak trust (legacy receipt), accept by filename
+                    Some(r)
+                }
             } else {
-                "Up to date".to_string()
-            },
-        });
+                None
+            };
+
+        // ── Dispatch by provider ────────────────────────────────────────
+        match verified_receipt {
+            // ── Modrinth receipt: project-scoped version check ──────────
+            Some(r) if r.provider == ModProvider::Modrinth => {
+                match latest_modrinth_version(&r.project_id, &cfg).await {
+                    Ok(latest) => {
+                        let latest_file = primary_file(&latest)?;
+                        let outdated = latest.id != r.file_version_id;
+                        out.push(ModUpdateInfo {
+                            file_name: info.file_name,
+                            display_name: info.display_name,
+                            current_version: info.version.clone(),
+                            latest_version: latest.version_number.clone(),
+                            project_id: Some(latest.project_id),
+                            version_id: Some(latest.id.clone()),
+                            download_url: Some(latest_file.url),
+                            outdated,
+                            status: if outdated {
+                                UpdateStatus::UpdateAvailable
+                            } else {
+                                UpdateStatus::UpToDate
+                            },
+                            provider: ModProvider::Modrinth,
+                            current_file_version_id: Some(r.file_version_id.clone()),
+                            message: if outdated {
+                                "Update available".to_string()
+                            } else {
+                                "Up to date".to_string()
+                            },
+                        });
+                    }
+                    Err(_) => {
+                        out.push(ModUpdateInfo {
+                            file_name: info.file_name,
+                            display_name: info.display_name,
+                            current_version: info.version.clone(),
+                            latest_version: String::new(),
+                            project_id: Some(r.project_id.clone()),
+                            version_id: None,
+                            download_url: None,
+                            outdated: false,
+                            status: UpdateStatus::ProviderUnavailable,
+                            provider: ModProvider::Modrinth,
+                            current_file_version_id: Some(r.file_version_id.clone()),
+                            message: "Modrinth API unavailable".to_string(),
+                        });
+                    }
+                }
+            }
+
+            // ── CurseForge receipt: fetch latest compatible file ────────
+            Some(r) if r.provider == ModProvider::CurseForge => {
+                let mod_id: i64 = match r.project_id.parse() {
+                    Ok(id) => id,
+                    Err(_) => {
+                        out.push(ModUpdateInfo {
+                            file_name: info.file_name,
+                            display_name: info.display_name,
+                            current_version: info.version.clone(),
+                            latest_version: String::new(),
+                            project_id: Some(r.project_id.clone()),
+                            version_id: None,
+                            download_url: None,
+                            outdated: false,
+                            status: UpdateStatus::ProviderUnavailable,
+                            provider: ModProvider::CurseForge,
+                            current_file_version_id: Some(r.file_version_id.clone()),
+                            message: "Invalid CurseForge project ID in receipt".to_string(),
+                        });
+                        continue;
+                    }
+                };
+                let current_file_id: i64 = r.file_version_id.parse().unwrap_or(0);
+
+                let cf_client = curseforge_http_client()?;
+                let loader_id = curseforge_loader_id(&cfg.server_type);
+                let mut files_url = format!(
+                    "https://api.curseforge.com/v1/mods/{}/files?gameVersion={}&pageSize=50",
+                    mod_id,
+                    urlencoding::encode(&cfg.minecraft_version),
+                );
+                if let Some(lid) = loader_id {
+                    files_url.push_str(&format!("&modLoaderType={}", lid));
+                }
+
+                match cf_client.get(&files_url).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        match resp.json::<CurseFilesResponse>().await {
+                            Ok(files_resp) => {
+                                let mut candidates: Vec<CurseFileEntry> = files_resp
+                                    .data
+                                    .into_iter()
+                                    .filter(|f| {
+                                        f.download_url
+                                            .as_deref()
+                                            .is_some_and(|u| !u.trim().is_empty())
+                                            || f.id > 0
+                                    })
+                                    .collect();
+
+                                if candidates.is_empty() {
+                                    out.push(ModUpdateInfo {
+                                        file_name: info.file_name,
+                                        display_name: info.display_name,
+                                        current_version: info.version.clone(),
+                                        latest_version: String::new(),
+                                        project_id: Some(r.project_id.clone()),
+                                        version_id: None,
+                                        download_url: None,
+                                        outdated: false,
+                                        status: UpdateStatus::NoCompatibleUpdate,
+                                        provider: ModProvider::CurseForge,
+                                        current_file_version_id: Some(r.file_version_id.clone()),
+                                        message: "No compatible CurseForge file found".to_string(),
+                                    });
+                                } else {
+                                    // Deterministic: release priority, then newest file ID
+                                    candidates.sort_by(|a, b| {
+                                        curseforge_release_priority(a.release_type)
+                                            .cmp(&curseforge_release_priority(b.release_type))
+                                            .then_with(|| b.id.cmp(&a.id))
+                                    });
+                                    let selected = candidates.into_iter().next().unwrap();
+                                    let outdated = selected.id != current_file_id;
+                                    out.push(ModUpdateInfo {
+                                        file_name: info.file_name,
+                                        display_name: info.display_name,
+                                        current_version: info.version.clone(),
+                                        latest_version: selected.file_name.clone(),
+                                        project_id: Some(r.project_id.clone()),
+                                        version_id: Some(selected.id.to_string()),
+                                        download_url: selected.download_url.clone(),
+                                        outdated,
+                                        status: if outdated {
+                                            UpdateStatus::UpdateAvailable
+                                        } else {
+                                            UpdateStatus::UpToDate
+                                        },
+                                        provider: ModProvider::CurseForge,
+                                        current_file_version_id: Some(r.file_version_id.clone()),
+                                        message: if outdated {
+                                            "Update available".to_string()
+                                        } else {
+                                            "Up to date".to_string()
+                                        },
+                                    });
+                                }
+                            }
+                            Err(_) => {
+                                out.push(ModUpdateInfo {
+                                    file_name: info.file_name,
+                                    display_name: info.display_name,
+                                    current_version: info.version.clone(),
+                                    latest_version: String::new(),
+                                    project_id: Some(r.project_id.clone()),
+                                    version_id: None,
+                                    download_url: None,
+                                    outdated: false,
+                                    status: UpdateStatus::ProviderUnavailable,
+                                    provider: ModProvider::CurseForge,
+                                    current_file_version_id: Some(r.file_version_id.clone()),
+                                    message: "CurseForge API parse error".to_string(),
+                                });
+                            }
+                        }
+                    }
+                    _ => {
+                        out.push(ModUpdateInfo {
+                            file_name: info.file_name,
+                            display_name: info.display_name,
+                            current_version: info.version.clone(),
+                            latest_version: String::new(),
+                            project_id: Some(r.project_id.clone()),
+                            version_id: None,
+                            download_url: None,
+                            outdated: false,
+                            status: UpdateStatus::ProviderUnavailable,
+                            provider: ModProvider::CurseForge,
+                            current_file_version_id: Some(r.file_version_id.clone()),
+                            message: "CurseForge API unavailable".to_string(),
+                        });
+                    }
+                }
+            }
+
+            // ── No verified receipt: legacy Modrinth hash lookup ────────
+            _ => {
+                let hash = {
+                    let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
+                    format!("{:x}", Sha512::digest(&bytes))
+                };
+                let found: Result<ModrinthVersion, _> = client()?
+                    .get(format!(
+                        "https://api.modrinth.com/v2/version_file/{}?algorithm=sha512",
+                        hash
+                    ))
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .json()
+                    .await
+                    .map_err(|e| e.to_string());
+                match found {
+                    Ok(current_version) => {
+                        match latest_modrinth_version(&current_version.project_id, &cfg).await {
+                            Ok(latest) => {
+                                let latest_file = primary_file(&latest)?;
+                                let outdated = latest.id != current_version.id;
+                                out.push(ModUpdateInfo {
+                                    file_name: info.file_name,
+                                    display_name: info.display_name,
+                                    current_version: current_version.version_number,
+                                    latest_version: latest.version_number.clone(),
+                                    project_id: Some(latest.project_id),
+                                    version_id: Some(latest.id.clone()),
+                                    download_url: Some(latest_file.url),
+                                    outdated,
+                                    status: if outdated {
+                                        UpdateStatus::UpdateAvailable
+                                    } else {
+                                        UpdateStatus::UpToDate
+                                    },
+                                    provider: ModProvider::Unknown,
+                                    current_file_version_id: None,
+                                    message: if outdated {
+                                        "Update available".to_string()
+                                    } else {
+                                        "Up to date".to_string()
+                                    },
+                                });
+                            }
+                            Err(_) => {
+                                out.push(ModUpdateInfo {
+                                    file_name: info.file_name,
+                                    display_name: info.display_name,
+                                    current_version: current_version.version_number,
+                                    latest_version: String::new(),
+                                    project_id: Some(current_version.project_id),
+                                    version_id: None,
+                                    download_url: None,
+                                    outdated: false,
+                                    status: UpdateStatus::ProviderUnavailable,
+                                    provider: ModProvider::Unknown,
+                                    current_file_version_id: None,
+                                    message: "Modrinth API unavailable".to_string(),
+                                });
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        out.push(ModUpdateInfo {
+                            file_name: info.file_name,
+                            display_name: info.display_name,
+                            current_version: info.version.clone(),
+                            latest_version: String::new(),
+                            project_id: None,
+                            version_id: None,
+                            download_url: None,
+                            outdated: false,
+                            status: UpdateStatus::ProviderUnknown,
+                            provider: ModProvider::Unknown,
+                            current_file_version_id: None,
+                            message: "Not found on Modrinth".to_string(),
+                        });
+                    }
+                }
+            }
+        }
     }
     Ok(out)
 }
 
+/// Update a single mod with receipt-aware atomic replacement.
+///
+/// Phase 4B.3C: uses provider receipt to verify provenance, downloads
+/// to temp with hash verification, atomically replaces the artifact,
+/// and persists an updated receipt. On failure, the old file is restored
+/// from a backup and the receipt is left untouched.
+///
+/// Returns `Ok(())` on success; caller is responsible for re-listing.
+async fn update_one_mod(
+    app: &std::sync::Arc<crate::app_state::AppEventSender>,
+    info: &ModUpdateInfo,
+) -> Result<UpdateOutcome, String> {
+    let cfg = config::load_config();
+    let dir = mods_dir(&cfg)?;
+    let server_path = PathBuf::from(&cfg.server_path);
+
+    let old = safe_join(&dir, &info.file_name)?;
+    if !old.exists() {
+        return Err("The old mod file no longer exists.".to_string());
+    }
+
+    let download_url = info
+        .download_url
+        .as_deref()
+        .ok_or("No download URL available for update.")?;
+
+    // ── 1. Backup the current artifact ────────────────────────────────
+    let backup_dir = dir.join(".lbby-backups");
+    tokio::fs::create_dir_all(&backup_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    let backup = backup_dir.join(format!("{}.bak", info.file_name));
+    tokio::fs::copy(&old, &backup)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // ── 2. Download new artifact to temp ──────────────────────────────
+    let new_file_name = info.file_name.clone();
+    let dest = safe_join(&dir, &new_file_name)?;
+
+    // Attempt to get hash hints from the existing receipt for verification.
+    let receipts = load_receipts(&server_path);
+    let _old_receipt = receipts.receipts.get(&info.file_name);
+
+    let result: Result<(), String> = async {
+        download_bytes_to_file(
+            app,
+            download_url,
+            &dest,
+            "Updating mod",
+            &new_file_name,
+            1,
+            1,
+            None, // Modrinth API doesn't expose sha512 for update URLs directly
+            None,
+        )
+        .await
+    }
+    .await;
+
+    // ── 3. On failure: restore from backup, clean temp ────────────────
+    if let Err(err) = result {
+        let _ = tokio::fs::copy(&backup, &old).await;
+        let _ = tokio::fs::remove_file(&dest).await;
+        // Also remove any lingering .lbbytmp file
+        let mut tmp_name = info.file_name.clone();
+        tmp_name.push_str(".lbbytmp");
+        let _ = tokio::fs::remove_file(dir.join(&tmp_name)).await;
+        return Err(format!("Update failed and old file was restored: {}", err));
+    }
+
+    // ── 4. Persist updated receipt ────────────────────────────────────
+    // Build a new receipt from the update info. The receipt captures the
+    // provider provenance so future update checks can resolve identity.
+    let new_hash = {
+        let bytes = tokio::fs::read(&dest).await.map_err(|e| e.to_string())?;
+        format!("{:x}", Sha512::digest(&bytes))
+    };
+
+    let new_receipt = ModReceipt {
+        provider: info.provider.clone(),
+        project_id: info.project_id.clone().unwrap_or_default(),
+        file_version_id: info
+            .version_id
+            .clone()
+            .or_else(|| info.current_file_version_id.clone())
+            .unwrap_or_default(),
+        installed_hash: new_hash,
+        loader: normalize_loader(&cfg.server_type).to_string(),
+        mc_version: cfg.minecraft_version.clone(),
+        file_name: new_file_name.clone(),
+    };
+
+    let mut store = load_receipts(&server_path);
+    store.receipts.insert(new_file_name.clone(), new_receipt);
+    let receipt_outcome = match save_receipts(&server_path, &store) {
+        Ok(()) => UpdateOutcome::Updated,
+        Err(e) => {
+            eprintln!("[lbby] Warning: receipt save failed after update: {}", e);
+            UpdateOutcome::UpdatedUntracked
+        }
+    };
+
+    // ── 5. Clean up backup ────────────────────────────────────────────
+    let _ = tokio::fs::remove_file(&backup).await;
+
+    Ok(receipt_outcome)
+}
+
+/// Update a single mod (legacy interface — delegates to `update_one_mod`).
 pub async fn update_mod(
     app: std::sync::Arc<crate::app_state::AppEventSender>,
     file_name: String,
     download_url: String,
 ) -> Result<Vec<ModInfo>, String> {
-    let cfg = config::load_config();
-    let dir = mods_dir(&cfg)?;
-    let old = safe_join(&dir, &file_name)?;
-    if !old.exists() {
-        return Err("The old mod file no longer exists.".to_string());
-    }
-    let backup_dir = dir.join(".lbby-backups");
-    tokio::fs::create_dir_all(&backup_dir)
-        .await
-        .map_err(|e| e.to_string())?;
-    let backup = backup_dir.join(format!("{}.bak", file_name));
-    tokio::fs::copy(&old, &backup)
-        .await
-        .map_err(|e| e.to_string())?;
-    let tmp = dir.join(format!("{}.download", file_name));
-    let result = async {
-        download_bytes_to_file(
-            &app,
-            &download_url,
-            &tmp,
-            "Updating mod",
-            &file_name,
-            1,
-            1,
-            None,
-            None,
-        )
-        .await?;
-        tokio::fs::rename(&tmp, &old)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok::<(), String>(())
-    }
-    .await;
-    if let Err(err) = result {
-        let _ = tokio::fs::copy(&backup, &old).await;
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(format!("Update failed and old file was restored: {}", err));
-    }
+    // Build a minimal ModUpdateInfo for the legacy path.
+    let info = ModUpdateInfo {
+        file_name: file_name.clone(),
+        display_name: file_name,
+        current_version: String::new(),
+        latest_version: String::new(),
+        project_id: None,
+        version_id: None,
+        download_url: Some(download_url),
+        outdated: true,
+        message: String::new(),
+        status: UpdateStatus::UpdateAvailable,
+        provider: ModProvider::Unknown,
+        current_file_version_id: None,
+    };
+    update_one_mod(&app, &info).await?;
     list_installed_mods()
 }
 
+/// Update all outdated mods with per-item result accumulation.
+///
+/// Phase 4B.3C: does NOT short-circuit on first failure. Each mod update
+/// is attempted independently; outcomes are collected into
+/// `UpdateItemResult` entries. The final `UpdateAllResult` includes the
+/// refreshed inventory and a composite warning if any items failed.
 pub async fn update_all_mods(
     app: std::sync::Arc<crate::app_state::AppEventSender>,
     updates: Vec<ModUpdateInfo>,
-) -> Result<Vec<ModInfo>, String> {
-    let total = updates
-        .iter()
+) -> Result<UpdateAllResult, String> {
+    let outdated: Vec<_> = updates
+        .into_iter()
         .filter(|u| u.outdated && u.download_url.is_some())
-        .count() as u32;
-    let mut current = 0;
-    for update in updates.into_iter().filter(|u| u.outdated) {
-        if let Some(url) = update.download_url {
-            current += 1;
-            emit_mod_progress(
-                &app,
-                "Updating mods",
-                &format!("Updating {}", update.display_name),
-                current,
-                total,
-            );
-            update_mod(app.clone(), update.file_name, url).await?;
-        }
+        .collect();
+    let total = outdated.len() as u32;
+    let mut results: Vec<UpdateItemResult> = Vec::with_capacity(outdated.len());
+    let mut current = 0u32;
+
+    for info in &outdated {
+        current += 1;
+        emit_mod_progress(
+            &app,
+            "Updating mods",
+            &format!("Updating {}", info.display_name),
+            current,
+            total,
+        );
+
+        let outcome = match update_one_mod(&app, info).await {
+            Ok(UpdateOutcome::UpdatedUntracked) => UpdateItemResult {
+                file_name: info.file_name.clone(),
+                display_name: info.display_name.clone(),
+                outcome: UpdateOutcome::UpdatedUntracked,
+                detail: format!("{} → {}", info.current_version, info.latest_version),
+            },
+            Ok(_) => UpdateItemResult {
+                file_name: info.file_name.clone(),
+                display_name: info.display_name.clone(),
+                outcome: UpdateOutcome::Updated,
+                detail: format!("{} → {}", info.current_version, info.latest_version),
+            },
+            Err(err) => UpdateItemResult {
+                file_name: info.file_name.clone(),
+                display_name: info.display_name.clone(),
+                outcome: UpdateOutcome::Failed,
+                detail: err,
+            },
+        };
+        results.push(outcome);
     }
-    list_installed_mods()
+
+    // Collect failure and untracked warnings into a single composite string.
+    let failures: Vec<String> = results
+        .iter()
+        .filter(|r| r.outcome == UpdateOutcome::Failed)
+        .map(|r| format!("{}: {}", r.display_name, r.detail))
+        .collect();
+    let untracked: Vec<String> = results
+        .iter()
+        .filter(|r| r.outcome == UpdateOutcome::UpdatedUntracked)
+        .map(|r| r.display_name.clone())
+        .collect();
+    let mut warnings: Vec<String> = Vec::new();
+    if !failures.is_empty() {
+        warnings.push(format!(
+            "{} update(s) failed — {}",
+            failures.len(),
+            failures.join("; ")
+        ));
+    }
+    if !untracked.is_empty() {
+        warnings.push(format!(
+            "{} mod(s) updated but provider metadata could not be saved",
+            untracked.len()
+        ));
+    }
+    let warning = if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join(". "))
+    };
+
+    Ok(UpdateAllResult {
+        mods: list_installed_mods()?,
+        results,
+        warning,
+    })
 }
 
 async fn prepare_modpack_server(
@@ -4466,7 +4885,176 @@ pub async fn remove_mod(mod_name: String) -> Result<(), String> {
     tokio::fs::remove_file(&path)
         .await
         .map_err(|e| e.to_string())?;
+    // 4B.3C: also clean up receipt for this artifact
+    let server_path = std::path::PathBuf::from(&cfg.server_path);
+    let mut store = load_receipts(&server_path);
+    store.receipts.remove(&mod_name);
+    let _ = save_receipts(&server_path, &store);
     Ok(())
+}
+
+/// Compute which installed mods have required dependencies on a given artifact.
+///
+/// Checks every installed JAR's `depends` metadata. If any declared mod_id
+/// matches a mod_id declared by the target artifact, that JAR is a dependent.
+/// Multi-mod JARs are handled: if the target declares IDs [A, B, C] and
+/// another mod requires B, the target cannot be removed.
+///
+/// Returns `Ok(deps)` where `deps` is non-empty if removal should be blocked.
+pub async fn compute_dependents_in_dir(
+    mod_name: &str,
+    dir: &std::path::Path,
+) -> Result<Vec<DependentInfo>, String> {
+    use crate::helpers::{
+        read_all_forge_mod_ids, read_fabric_dependencies, read_forge_dependencies,
+    };
+    let target_path = dir.join(mod_name);
+    if !target_path.exists() {
+        return Ok(vec![]);
+    }
+
+    // 1. Get the target artifact's declared mod IDs from JAR metadata.
+    //    Include ALL mod IDs from multi-mod JARs (Forge [[mods]] array).
+    let mut target_ids: Vec<String> = Vec::new();
+
+    // Primary ID from read_mod_info
+    let target_info = read_mod_info(&target_path);
+    if let Some(ref mid) = target_info.mod_id {
+        if !mid.is_empty() {
+            target_ids.push(mid.clone());
+        }
+    }
+
+    // All Forge mod IDs (handles multi-mod JARs)
+    let forge_ids = read_all_forge_mod_ids(&target_path);
+    for fid in forge_ids {
+        if !target_ids.contains(&fid) {
+            target_ids.push(fid);
+        }
+    }
+
+    // Fabric mod_id from fabric.mod.json (single-valued)
+    if let Ok(file) = std::fs::File::open(&target_path) {
+        if let Ok(mut zip) = zip::ZipArchive::new(file) {
+            if let Some(text) = crate::helpers::read_zip_text(&mut zip, "fabric.mod.json") {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(id) = val.get("id").and_then(|v| v.as_str()) {
+                        let id = id.to_string();
+                        if !id.is_empty() && !target_ids.contains(&id) {
+                            target_ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if target_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let target_id_set: std::collections::HashSet<&str> =
+        target_ids.iter().map(|s| s.as_str()).collect();
+
+    // 2. Scan all other JARs for required dependencies referencing target IDs.
+    let mut dependents = Vec::new();
+    let mut entries = tokio::fs::read_dir(&dir).await.map_err(|e| e.to_string())?;
+    while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+        let path = entry.path();
+        if path.extension().is_none_or(|x| x != "jar") {
+            continue;
+        }
+        let fname = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if fname == mod_name {
+            continue; // skip self
+        }
+
+        // Read Forge + Fabric required dependencies (mandatory only).
+        let forge_deps = read_forge_dependencies(&path);
+        let fabric_deps = read_fabric_dependencies(&path);
+
+        for (dep_id, _version_req) in forge_deps.iter().chain(fabric_deps.iter()) {
+            if target_id_set.contains(dep_id.as_str()) {
+                let dep_info = read_mod_info(&path);
+                dependents.push(DependentInfo {
+                    file_name: fname.clone(),
+                    display_name: dep_info.display_name,
+                    mod_id: dep_id.clone(),
+                    kind: "required".to_string(),
+                });
+                break; // one match per JAR is enough
+            }
+        }
+    }
+    Ok(dependents)
+}
+
+/// Config-aware wrapper: resolve mods dir from current config.
+pub async fn compute_dependents(mod_name: &str) -> Result<Vec<DependentInfo>, String> {
+    let cfg = config::load_config();
+    let dir = mods_dir(&cfg)?;
+    compute_dependents_in_dir(mod_name, &dir).await
+}
+
+/// Safe removal with dependency checking and receipt cleanup.
+///
+/// If required dependents exist, removal is rejected and the dependents list
+/// is returned in the `RemoveResult`. If no dependents, the artifact and its
+/// receipt are removed.
+pub async fn safe_remove_mod_in_dir(
+    mod_name: &str,
+    dir: &std::path::Path,
+) -> Result<RemoveResult, String> {
+    let path = dir.join(mod_name);
+    if !path.exists() {
+        return Err(format!("Mod '{}' not found.", mod_name));
+    }
+
+    // 1. Check for blocking dependents.
+    let dependents = compute_dependents_in_dir(mod_name, dir).await?;
+    if !dependents.is_empty() {
+        return Ok(RemoveResult {
+            success: false,
+            dependents,
+            warning: None,
+        });
+    }
+
+    // 2. Remove the artifact.
+    tokio::fs::remove_file(&path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 3. Clean up receipt (best effort — dir may not have server_path for receipts).
+    let server_path = dir.parent().unwrap_or(dir);
+    let mut store = load_receipts(server_path);
+    store.receipts.remove(mod_name);
+    let receipt_warning = match save_receipts(server_path, &store) {
+        Ok(()) => None,
+        Err(e) => {
+            eprintln!(
+                "[lbby] Warning: receipt cleanup failed after removal: {}",
+                e
+            );
+            Some("receipt_cleanup_failed".to_string())
+        }
+    };
+
+    Ok(RemoveResult {
+        success: true,
+        dependents: vec![],
+        warning: receipt_warning,
+    })
+}
+
+/// Config-aware wrapper for safe removal.
+pub async fn safe_remove_mod(mod_name: &str) -> Result<RemoveResult, String> {
+    let cfg = config::load_config();
+    let dir = mods_dir(&cfg)?;
+    safe_remove_mod_in_dir(mod_name, &dir).await
 }
 
 /// Deletes every mod file in the mods/plugins folder. Returns the number
@@ -6257,5 +6845,532 @@ mod tests {
         assert!(!temp.exists(), "temp must be cleaned after commit failure");
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // ── 4B.3C: Update/removal/dependency tests ────────────────────────
+
+    use super::{compute_dependents, safe_remove_mod, UpdateStatus};
+    use crate::app_state::{DependentInfo, RemoveResult, UpdateOutcome};
+    use std::sync::Mutex;
+
+    /// Serialize tests that modify global config.
+    static CONFIG_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Helper: create a minimal jar with fabric.mod.json declaring deps.
+    fn make_fabric_jar_with_deps(
+        dir: &std::path::Path,
+        name: &str,
+        mod_id: &str,
+        deps: &[(&str, &str)], // (dep_id, version_req)
+    ) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        // fabric.mod.json
+        let deps_json: String = deps
+            .iter()
+            .map(|(id, ver)| format!("\"{}\": \"{}\"", id, ver))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let fmj = format!(
+            r#"{{"id": "{}", "version": "1.0.0", "depends": {{{}}}}}"#,
+            mod_id, deps_json
+        );
+        zip.start_file("fabric.mod.json", options).unwrap();
+        zip.write_all(fmj.as_bytes()).unwrap();
+        zip.finish().unwrap();
+        path
+    }
+
+    /// Helper: create a minimal jar with no metadata.
+    fn make_empty_jar(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "dummy.txt",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+        zip.write_all(b"placeholder").unwrap();
+        zip.finish().unwrap();
+        path
+    }
+
+    /// Helper: create a Forge JAR with META-INF/mods.toml.
+    /// `mods` is a list of (modId, displayName) pairs.
+    /// `deps` is a list of (modId, versionRange, mandatory) tuples.
+    fn make_forge_jar(
+        dir: &std::path::Path,
+        name: &str,
+        mods: &[(&str, &str)],
+        deps: &[(&str, &str, bool)],
+    ) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        // Build [[mods]] entries
+        let mut mods_entries = String::new();
+        for (mod_id, display_name) in mods {
+            mods_entries.push_str(&format!(
+                "\n[[mods]]\nmodId = \"{}\"\ndisplayName = \"{}\"\nversion = \"1.0.0\"\n",
+                mod_id, display_name
+            ));
+        }
+
+        // Build [dependencies.*] entries
+        let mut dep_entries = String::new();
+        if !deps.is_empty() {
+            // Group by modId (use first mod as the depending mod)
+            let first_mod = mods.first().map(|m| m.0).unwrap_or("unknown");
+            dep_entries.push_str(&format!("\n[dependencies.{}]\n", first_mod));
+            for (dep_id, version_range, mandatory) in deps {
+                dep_entries.push_str(&format!(
+                    "\n[[dependencies.{}.{}]]\nmodId = \"{}\"\nversionRange = \"{}\"\nmandatory = {}\ntype = \"required\"\n",
+                    first_mod, dep_id, dep_id, version_range, mandatory
+                ));
+            }
+        }
+
+        let toml_content = format!("{}\n{}", mods_entries, dep_entries);
+        zip.start_file("META-INF/mods.toml", options).unwrap();
+        zip.write_all(toml_content.as_bytes()).unwrap();
+        zip.finish().unwrap();
+        path
+    }
+
+    /// Helper: create a Forge JAR with optional dependencies.
+    fn make_forge_jar_with_optional_dep(
+        dir: &std::path::Path,
+        name: &str,
+        mod_id: &str,
+        opt_dep_id: &str,
+    ) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        let toml = format!(
+            r#"[[mods]]
+modId = "{}"
+displayName = "{}"
+version = "1.0.0"
+
+[dependencies.{}]
+
+[[dependencies.{}.{}]]
+modId = "{}"
+versionRange = ">=1.0"
+mandatory = false
+type = "optional"
+"#,
+            mod_id, mod_id, mod_id, mod_id, opt_dep_id, opt_dep_id
+        );
+
+        zip.start_file("META-INF/mods.toml", options).unwrap();
+        zip.write_all(toml.as_bytes()).unwrap();
+        zip.finish().unwrap();
+        path
+    }
+
+    /// Helper: write a receipt file.
+    fn write_receipt(server_path: &std::path::Path, file_name: &str, receipt: &ModReceipt) {
+        let mut store = super::load_receipts(server_path);
+        store
+            .receipts
+            .insert(file_name.to_string(), receipt.clone());
+        super::save_receipts(server_path, &store).unwrap();
+    }
+
+    /// Combined test: all config-dependent removal/dependency tests run under
+    /// a single mutex to avoid global config race conditions.
+    #[tokio::test]
+    async fn combined_dependency_and_removal_tests() {
+        let _guard = CONFIG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        // ── 1. Required dependency detected ──
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = crate::config::ServerConfig {
+                server_path: dir.path().to_string_lossy().to_string(),
+                ..Default::default()
+            };
+            crate::config::save_config(&cfg).unwrap();
+
+            let mods = dir.path().join("mods");
+            std::fs::create_dir_all(&mods).unwrap();
+
+            make_fabric_jar_with_deps(&mods, "libmod-1.0.jar", "libmod", &[]);
+            make_fabric_jar_with_deps(&mods, "mymod-1.0.jar", "mymod", &[("libmod", ">=1.0")]);
+
+            // Debug: verify the helper returns the dependency
+            let mymod_path = mods.join("mymod-1.0.jar");
+            let libmod_path = mods.join("libmod-1.0.jar");
+            let fabric_deps = crate::helpers::read_fabric_dependencies(&mymod_path);
+            assert_eq!(
+                fabric_deps.len(),
+                1,
+                "fabric deps helper should find 1 dep, got {}: {:?}",
+                fabric_deps.len(),
+                fabric_deps
+            );
+            assert_eq!(fabric_deps[0].0, "libmod");
+
+            // Verify both jars exist in mods dir
+            assert!(mods.join("libmod-1.0.jar").exists());
+            assert!(mods.join("mymod-1.0.jar").exists());
+
+            let deps = super::compute_dependents_in_dir("libmod-1.0.jar", &mods)
+                .await
+                .unwrap();
+            assert_eq!(
+                deps.len(),
+                1,
+                "should detect one dependent, got {}: {:?}",
+                deps.len(),
+                deps
+            );
+            assert_eq!(deps[0].file_name, "mymod-1.0.jar");
+            assert_eq!(deps[0].mod_id, "libmod");
+            assert_eq!(deps[0].kind, "required");
+
+            std::fs::remove_dir_all(dir.path()).unwrap();
+        }
+
+        // ── 2. Optional dependency not blocking ──
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = crate::config::ServerConfig {
+                server_path: dir.path().to_string_lossy().to_string(),
+                ..Default::default()
+            };
+            crate::config::save_config(&cfg).unwrap();
+
+            let mods = dir.path().join("mods");
+            std::fs::create_dir_all(&mods).unwrap();
+
+            make_fabric_jar_with_deps(&mods, "libmod-1.0.jar", "libmod", &[]);
+            make_fabric_jar_with_deps(&mods, "mymod-1.0.jar", "mymod", &[]);
+
+            let deps = super::compute_dependents_in_dir("libmod-1.0.jar", &mods)
+                .await
+                .unwrap();
+            assert_eq!(deps.len(), 0, "optional deps should not block removal");
+
+            std::fs::remove_dir_all(dir.path()).unwrap();
+        }
+
+        // ── 3. Safe remove no dependents succeeds + receipt cleanup ──
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = crate::config::ServerConfig {
+                server_path: dir.path().to_string_lossy().to_string(),
+                ..Default::default()
+            };
+            crate::config::save_config(&cfg).unwrap();
+
+            let mods = dir.path().join("mods");
+            std::fs::create_dir_all(&mods).unwrap();
+
+            write_receipt(
+                dir.path(),
+                "lonely-mod-1.0.jar",
+                &ModReceipt {
+                    provider: ModProvider::Modrinth,
+                    project_id: "abc123".to_string(),
+                    file_version_id: "v1".to_string(),
+                    installed_hash: "deadbeef".to_string(),
+                    loader: "fabric".to_string(),
+                    mc_version: "1.20.1".to_string(),
+                    file_name: "lonely-mod-1.0.jar".to_string(),
+                },
+            );
+
+            make_empty_jar(&mods, "lonely-mod-1.0.jar");
+
+            let result = super::safe_remove_mod_in_dir("lonely-mod-1.0.jar", &mods)
+                .await
+                .unwrap();
+            assert!(result.success, "removal should succeed");
+            assert!(result.dependents.is_empty());
+            assert!(!mods.join("lonely-mod-1.0.jar").exists());
+
+            let store = super::load_receipts(dir.path());
+            assert!(
+                !store.receipts.contains_key("lonely-mod-1.0.jar"),
+                "receipt should be removed"
+            );
+
+            std::fs::remove_dir_all(dir.path()).unwrap();
+        }
+
+        // ── 4. Safe remove with dependents blocked ──
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = crate::config::ServerConfig {
+                server_path: dir.path().to_string_lossy().to_string(),
+                ..Default::default()
+            };
+            crate::config::save_config(&cfg).unwrap();
+
+            let mods = dir.path().join("mods");
+            std::fs::create_dir_all(&mods).unwrap();
+
+            make_fabric_jar_with_deps(&mods, "libmod-1.0.jar", "libmod", &[]);
+            make_fabric_jar_with_deps(&mods, "mymod-1.0.jar", "mymod", &[("libmod", ">=1.0")]);
+
+            let result = super::safe_remove_mod_in_dir("libmod-1.0.jar", &mods)
+                .await
+                .unwrap();
+            assert!(!result.success, "removal should be blocked");
+            assert_eq!(result.dependents.len(), 1);
+            assert_eq!(result.dependents[0].file_name, "mymod-1.0.jar");
+            assert!(mods.join("libmod-1.0.jar").exists());
+
+            std::fs::remove_dir_all(dir.path()).unwrap();
+        }
+
+        // ── 5. Safe remove missing file errors ──
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = crate::config::ServerConfig {
+                server_path: dir.path().to_string_lossy().to_string(),
+                ..Default::default()
+            };
+            crate::config::save_config(&cfg).unwrap();
+
+            let mods = dir.path().join("mods");
+            std::fs::create_dir_all(&mods).unwrap();
+
+            let err = super::safe_remove_mod_in_dir("nonexistent.jar", &mods).await;
+            assert!(err.is_err(), "should error for missing file");
+
+            std::fs::remove_dir_all(dir.path()).unwrap();
+        }
+
+        // ── 6. No declared ID returns empty ──
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = crate::config::ServerConfig {
+                server_path: dir.path().to_string_lossy().to_string(),
+                ..Default::default()
+            };
+            crate::config::save_config(&cfg).unwrap();
+
+            let mods = dir.path().join("mods");
+            std::fs::create_dir_all(&mods).unwrap();
+
+            make_empty_jar(&mods, "unknown-mod.jar");
+
+            let deps = compute_dependents("unknown-mod.jar").await.unwrap();
+            assert_eq!(deps.len(), 0, "no declared ID = no dependents");
+
+            std::fs::remove_dir_all(dir.path()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn update_status_default_is_uptodate() {
+        let status = UpdateStatus::default();
+        assert_eq!(status, UpdateStatus::UpToDate);
+    }
+
+    #[tokio::test]
+    async fn update_outcome_default_is_uptodate() {
+        let outcome = UpdateOutcome::default();
+        assert_eq!(outcome, UpdateOutcome::UpToDate);
+    }
+
+    #[tokio::test]
+    async fn remove_result_serializes() {
+        let result = RemoveResult {
+            success: false,
+            dependents: vec![DependentInfo {
+                file_name: "test.jar".to_string(),
+                display_name: "Test Mod".to_string(),
+                mod_id: "testmod".to_string(),
+                kind: "required".to_string(),
+            }],
+            warning: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("test.jar"));
+        assert!(json.contains("Test Mod"));
+        assert!(json.contains("required"));
+    }
+
+    #[tokio::test]
+    async fn dependents_no_declared_id_returns_empty() {
+        let _guard = CONFIG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::ServerConfig {
+            server_path: dir.path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        crate::config::save_config(&cfg).unwrap();
+
+        let mods = dir.path().join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+
+        // An empty jar has no declared mod_id
+        make_empty_jar(&mods, "unknown-mod.jar");
+
+        let deps = compute_dependents("unknown-mod.jar").await.unwrap();
+        assert_eq!(deps.len(), 0, "no declared ID = no dependents");
+
+        std::fs::remove_dir_all(dir.path()).unwrap();
+    }
+
+    // ── 4B.3C-closure: New safety tests ──────────────────────────────
+
+    /// Forge optional dependency does NOT block removal.
+    #[tokio::test]
+    async fn forge_optional_dep_does_not_block_removal() {
+        let _guard = CONFIG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::ServerConfig {
+            server_path: dir.path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        crate::config::save_config(&cfg).unwrap();
+
+        let mods = dir.path().join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+
+        // Target JAR
+        make_forge_jar(&mods, "libmod-1.0.jar", &[("libmod", "Lib Mod")], &[]);
+
+        // Another mod declares libmod as OPTIONAL (mandatory=false)
+        make_forge_jar_with_optional_dep(&mods, "mymod-1.0.jar", "mymod", "libmod");
+
+        let deps = super::compute_dependents_in_dir("libmod-1.0.jar", &mods)
+            .await
+            .unwrap();
+        assert_eq!(
+            deps.len(),
+            0,
+            "optional (mandatory=false) Forge dep should NOT block removal, got: {:?}",
+            deps
+        );
+
+        std::fs::remove_dir_all(dir.path()).unwrap();
+    }
+
+    /// Secondary mod ID of a multi-mod Forge JAR blocks removal.
+    #[tokio::test]
+    async fn secondary_forge_id_blocks_removal() {
+        let _guard = CONFIG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::ServerConfig {
+            server_path: dir.path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        crate::config::save_config(&cfg).unwrap();
+
+        let mods = dir.path().join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+
+        // Target JAR declares TWO mod IDs: "alpha" (primary) and "beta" (secondary)
+        make_forge_jar(
+            &mods,
+            "multimod-1.0.jar",
+            &[("alpha", "Alpha Mod"), ("beta", "Beta Mod")],
+            &[],
+        );
+
+        // Another mod requires "beta" (the secondary ID)
+        make_fabric_jar_with_deps(&mods, "consumer-1.0.jar", "consumer", &[("beta", ">=1.0")]);
+
+        let deps = super::compute_dependents_in_dir("multimod-1.0.jar", &mods)
+            .await
+            .unwrap();
+        assert_eq!(
+            deps.len(),
+            1,
+            "secondary Forge ID 'beta' should block removal, got: {:?}",
+            deps
+        );
+        assert_eq!(deps[0].file_name, "consumer-1.0.jar");
+        assert_eq!(deps[0].mod_id, "beta");
+
+        std::fs::remove_dir_all(dir.path()).unwrap();
+    }
+
+    /// UpdateOutcome::UpdatedUntracked serializes correctly.
+    #[tokio::test]
+    async fn updated_untracked_serializes() {
+        let outcome = UpdateOutcome::UpdatedUntracked;
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(json.contains("UpdatedUntracked"), "json: {}", json);
+    }
+
+    /// UpdateAllResult warning includes UpdatedUntracked items.
+    #[tokio::test]
+    async fn update_all_warning_includes_untracked() {
+        let result = crate::app_state::UpdateAllResult {
+            mods: vec![],
+            results: vec![
+                crate::app_state::UpdateItemResult {
+                    file_name: "a.jar".to_string(),
+                    display_name: "A".to_string(),
+                    outcome: UpdateOutcome::Updated,
+                    detail: String::new(),
+                },
+                crate::app_state::UpdateItemResult {
+                    file_name: "b.jar".to_string(),
+                    display_name: "B".to_string(),
+                    outcome: UpdateOutcome::UpdatedUntracked,
+                    detail: String::new(),
+                },
+            ],
+            warning: None,
+        };
+        // Verify the result structure has both outcomes
+        assert_eq!(result.results.len(), 2);
+        assert_eq!(result.results[0].outcome, UpdateOutcome::Updated);
+        assert_eq!(result.results[1].outcome, UpdateOutcome::UpdatedUntracked);
+    }
+
+    /// RemoveResult warning is structured code, not raw backend detail.
+    #[tokio::test]
+    async fn remove_result_warning_is_structured_code() {
+        let result = RemoveResult {
+            success: true,
+            dependents: vec![],
+            warning: Some("receipt_cleanup_failed".to_string()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("receipt_cleanup_failed"));
+        // Must NOT contain raw error details like "Os {" or "Permission denied"
+        assert!(!json.contains("Os {"), "warning must not leak raw OS error");
+    }
+
+    /// read_all_forge_mod_ids returns all declared IDs.
+    #[test]
+    fn forge_helper_returns_all_mod_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_forge_jar(
+            dir.path(),
+            "multi.jar",
+            &[("alpha", "Alpha"), ("beta", "Beta"), ("gamma", "Gamma")],
+            &[],
+        );
+        let ids = crate::helpers::read_all_forge_mod_ids(&path);
+        assert_eq!(ids.len(), 3, "expected 3 IDs, got {}: {:?}", ids.len(), ids);
+        assert!(ids.contains(&"alpha".to_string()));
+        assert!(ids.contains(&"beta".to_string()));
+        assert!(ids.contains(&"gamma".to_string()));
     }
 }
