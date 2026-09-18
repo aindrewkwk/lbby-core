@@ -104,6 +104,26 @@ impl ServerType {
         }
     }
 
+    /// Parse a ServerType from its label string (case-insensitive).
+    pub fn from_label(label: &str) -> Option<ServerType> {
+        match label.to_ascii_lowercase().as_str() {
+            "vanilla" => Some(ServerType::Vanilla),
+            "paper" => Some(ServerType::Paper),
+            "forge" => Some(ServerType::Forge),
+            "fabric" => Some(ServerType::Fabric),
+            "neoforge" => Some(ServerType::NeoForge),
+            "bukkit" => Some(ServerType::Bukkit),
+            "spigot" => Some(ServerType::Spigot),
+            "folia" => Some(ServerType::Folia),
+            "purpur" => Some(ServerType::Purpur),
+            "spongevanilla" => Some(ServerType::SpongeVanilla),
+            "spongeforge" => Some(ServerType::SpongeForge),
+            "terraria" => Some(ServerType::Terraria),
+            "tmodloader" => Some(ServerType::TModLoader),
+            _ => None,
+        }
+    }
+
     /// Which game this server type belongs to.
     pub fn game(&self) -> Game {
         match self {

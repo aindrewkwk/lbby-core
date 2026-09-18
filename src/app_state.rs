@@ -456,6 +456,12 @@ pub enum PluginCompatibility {
     FoliaCompatible,
     FoliaIncompatible,
     ProxyPlugin,
+    /// Candidate is for a proxy server (Velocity/Bungee) but current server is not proxy.
+    ProxyMismatch,
+    /// Provider MC version does not match the profile MC version.
+    MinecraftVersionMismatch,
+    /// Provider identity conflicts with an already-installed plugin.
+    IdentityConflict,
     Unknown,
     Unreadable,
 }
@@ -560,6 +566,88 @@ pub struct PluginCompatResult {
     pub compatible: PluginCompatibility,
     pub source: String,
     pub reason: String,
+}
+
+// ── 4B.4B: Provider-aware plugin types ────────────────────────────────
+
+/// Release channel priority for candidate selection.
+/// Deterministic ordering: Release > Beta > Alpha.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ReleaseChannel {
+    Release,
+    Beta,
+    Alpha,
+}
+
+impl Default for ReleaseChannel {
+    fn default() -> Self {
+        ReleaseChannel::Release
+    }
+}
+
+/// Normalized plugin candidate from any provider.
+/// Uses Option for fields that not all providers supply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginCandidate {
+    pub provider: PluginProvider,
+    pub project_id: String,
+    pub file_version_id: Option<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub authors: Vec<String>,
+    pub download_url: String,
+    pub filename: String,
+    pub hashes: PluginCandidateHashes,
+    pub game_versions: Vec<String>,
+    pub platforms: Vec<PluginPlatform>,
+    pub release_channel: ReleaseChannel,
+    pub published_at: Option<String>,
+    pub icon_url: Option<String>,
+    /// Pre-computed compatibility with the current server config.
+    /// None when not yet computed (e.g. direct construction in tests).
+    #[serde(default)]
+    pub compatibility: Option<PluginCompatibility>,
+}
+
+/// Hashes from a provider. Strongest documented hash first.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PluginCandidateHashes {
+    pub sha512: Option<String>,
+    pub sha256: Option<String>,
+    pub sha1: Option<String>,
+}
+
+/// Structured install result from provider install.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PluginInstallResult {
+    Installed(PluginInfo),
+    AlreadyInstalled,
+    Conflict(String),
+    Incompatible(PluginCompatResult),
+    InstalledUntracked(PluginInfo),
+    ProviderUnavailable(String),
+}
+
+/// Provider capability flags — what a provider actually supports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginProviderCapabilities {
+    pub provider: PluginProvider,
+    pub search: bool,
+    pub project_lookup: bool,
+    pub version_resolution: bool,
+    pub direct_download: bool,
+    pub hash_verification: bool,
+    pub platform_filtering: bool,
+    pub mc_version_filtering: bool,
+}
+
+/// Search result from a plugin provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginSearchResult {
+    pub candidates: Vec<PluginCandidate>,
+    pub provider: PluginProvider,
+    pub has_more: bool,
+    pub total_hits: Option<u32>,
 }
 
 pub struct AppState {
