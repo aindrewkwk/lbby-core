@@ -33,6 +33,7 @@ pub mod player_actions;
 #[cfg(feature = "sqlite")]
 pub mod player_stats;
 pub mod playit;
+pub mod plugin_services;
 pub mod reconciliation;
 pub mod recovery_actions;
 pub mod remote;

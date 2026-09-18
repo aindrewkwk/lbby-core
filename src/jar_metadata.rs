@@ -417,6 +417,345 @@ fn parse_forge_deps(
     }
 }
 
+// -- Plugin descriptor types -------------------------------------------------
+
+/// Unified plugin descriptor extracted from a JAR.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginDescriptor {
+    /// Source file in the JAR (plugin.yml, paper-plugin.yml, velocity-plugin.json, bungee.yml)
+    pub source: String,
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub main_class: Option<String>,
+    pub api_version: Option<String>,
+    pub authors: Vec<String>,
+    pub description: Option<String>,
+    pub website: Option<String>,
+    pub depend: Vec<String>,
+    pub soft_depend: Vec<String>,
+    pub load_before: Vec<String>,
+    /// Explicit Folia compatibility evidence from descriptor metadata.
+    /// None = no evidence, Some(true) = explicitly supported, Some(false) = explicitly unsupported.
+    pub folia_supported: Option<bool>,
+}
+
+/// Read plugin descriptor(s) from a JAR file.
+///
+/// Inspects: plugin.yml, paper-plugin.yml, velocity-plugin.json, bungee.yml.
+/// Returns all found descriptors (multi-descriptor JARs produce multiple entries).
+pub fn read_jar_plugin_descriptors(path: &Path) -> Vec<PluginDescriptor> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut jar = match zip::ZipArchive::new(file) {
+        Ok(j) => j,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut descriptors = Vec::new();
+
+    // plugin.yml (Bukkit/Spigot/Paper/Purpur/Folia)
+    if let Some(text) = read_zip_text(&mut jar, "plugin.yml") {
+        if let Some(desc) = parse_bukkit_plugin_yml(&text) {
+            descriptors.push(desc);
+        }
+    }
+
+    // paper-plugin.yml (Paper plugin)
+    if let Some(text) = read_zip_text(&mut jar, "paper-plugin.yml") {
+        if let Some(desc) = parse_paper_plugin_yml(&text) {
+            descriptors.push(desc);
+        }
+    }
+
+    // velocity-plugin.json (Velocity proxy)
+    if let Some(text) = read_zip_text(&mut jar, "velocity-plugin.json") {
+        if let Some(desc) = parse_velocity_plugin_json(&text) {
+            descriptors.push(desc);
+        }
+    }
+
+    // bungee.yml (BungeeCord/Waterfall)
+    if let Some(text) = read_zip_text(&mut jar, "bungee.yml") {
+        if let Some(desc) = parse_bungee_yml(&text) {
+            descriptors.push(desc);
+        }
+    }
+
+    descriptors
+}
+
+fn parse_bukkit_plugin_yml(text: &str) -> Option<PluginDescriptor> {
+    let v: serde_yaml::Value = serde_yaml::from_str(text).ok()?;
+    let name = v.get("name").and_then(|v| v.as_str()).map(String::from);
+    let version = yaml_as_str(v.get("version"));
+    let main_class = v.get("main").and_then(|v| v.as_str()).map(String::from);
+    let api_version = yaml_as_str(v.get("api-version"));
+    let description = v
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let website = v.get("website").and_then(|v| v.as_str()).map(String::from);
+
+    let mut authors = Vec::new();
+    if let Some(author) = v.get("author").and_then(|v| v.as_str()) {
+        authors.push(author.to_string());
+    }
+    if let Some(arr) = v.get("authors").and_then(|v| v.as_sequence()) {
+        for a in arr {
+            if let Some(s) = a.as_str() {
+                authors.push(s.to_string());
+            }
+        }
+    }
+
+    let depend = parse_yaml_string_list(v.get("depend"));
+    let soft_depend = parse_yaml_string_list(v.get("softdepend"));
+    let load_before = parse_yaml_string_list(v.get("loadbefore"));
+
+    // Folia evidence: explicit "folia-supported" or "folia" boolean field
+    let folia_supported = v
+        .get("folia-supported")
+        .or_else(|| v.get("folia"))
+        .and_then(|v| v.as_bool());
+
+    // Must have at least a name or main to be a valid descriptor
+    if name.is_none() && main_class.is_none() {
+        return None;
+    }
+
+    Some(PluginDescriptor {
+        source: "plugin.yml".to_string(),
+        name,
+        version,
+        main_class,
+        api_version,
+        authors,
+        description,
+        website,
+        depend,
+        soft_depend,
+        load_before,
+        folia_supported,
+    })
+}
+
+fn parse_paper_plugin_yml(text: &str) -> Option<PluginDescriptor> {
+    let v: serde_yaml::Value = serde_yaml::from_str(text).ok()?;
+
+    // Paper plugin format: top-level name, version, api-version
+    // Dependencies under "dependencies" with "load" key (BEFORE/AFTER/REQUIRED/OPTIONAL)
+    let name = v.get("name").and_then(|v| v.as_str()).map(String::from);
+    let version = yaml_as_str(v.get("version"));
+    let api_version = yaml_as_str(v.get("api-version"));
+
+    let description = v
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let website = v.get("website").and_then(|v| v.as_str()).map(String::from);
+
+    let mut authors = Vec::new();
+    if let Some(author) = v.get("author").and_then(|v| v.as_str()) {
+        authors.push(author.to_string());
+    }
+    if let Some(arr) = v.get("authors").and_then(|v| v.as_sequence()) {
+        for a in arr {
+            if let Some(s) = a.as_str() {
+                authors.push(s.to_string());
+            }
+        }
+    }
+
+    // Paper plugin.yml: main class is under "main" or bootstrapper/loader
+    let main_class = v.get("main").and_then(|v| v.as_str()).map(String::from);
+
+    // Dependencies: "dependencies" → map of name → { load: BEFORE|AFTER|REQUIRED|OPTIONAL }
+    let mut depend = Vec::new();
+    let mut soft_depend = Vec::new();
+    let mut load_before = Vec::new();
+
+    if let Some(deps) = v.get("dependencies").and_then(|d| d.as_mapping()) {
+        for (key, val) in deps {
+            let dep_name = match key.as_str() {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let load = val
+                .get("load")
+                .and_then(|v| v.as_str())
+                .unwrap_or("REQUIRED");
+            match load {
+                "REQUIRED" => depend.push(dep_name),
+                "OPTIONAL" => soft_depend.push(dep_name),
+                "BEFORE" => load_before.push(dep_name),
+                "AFTER" => soft_depend.push(dep_name),
+                _ => {}
+            }
+        }
+    }
+
+    if name.is_none() && main_class.is_none() {
+        return None;
+    }
+
+    // Folia evidence: explicit "folia-supported" or "folia" boolean field
+    let folia_supported = v
+        .get("folia-supported")
+        .or_else(|| v.get("folia"))
+        .and_then(|v| v.as_bool());
+
+    Some(PluginDescriptor {
+        source: "paper-plugin.yml".to_string(),
+        name,
+        version,
+        main_class,
+        api_version,
+        authors,
+        description,
+        website,
+        depend,
+        soft_depend,
+        load_before,
+        folia_supported,
+    })
+}
+
+fn parse_velocity_plugin_json(text: &str) -> Option<PluginDescriptor> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+
+    // Velocity format: { "id": "...", "name": "...", "version": "...", "main": "...",
+    //   "authors": [...], "dependencies": [{ "id": "...", "optional": false }] }
+    let id = v.get("id").and_then(|v| v.as_str()).map(String::from);
+    let name = v
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or(id);
+    let version = v.get("version").and_then(|v| v.as_str()).map(String::from);
+    let main_class = v.get("main").and_then(|v| v.as_str()).map(String::from);
+
+    let mut authors = Vec::new();
+    if let Some(arr) = v.get("authors").and_then(|v| v.as_array()) {
+        for a in arr {
+            if let Some(s) = a.as_str() {
+                authors.push(s.to_string());
+            }
+        }
+    }
+
+    let mut depend = Vec::new();
+    let mut soft_depend = Vec::new();
+    if let Some(arr) = v.get("dependencies").and_then(|v| v.as_array()) {
+        for dep in arr {
+            let dep_id = dep.get("id").and_then(|v| v.as_str());
+            if let Some(dep_name) = dep_id {
+                let optional = dep
+                    .get("optional")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if optional {
+                    soft_depend.push(dep_name.to_string());
+                } else {
+                    depend.push(dep_name.to_string());
+                }
+            }
+        }
+    }
+
+    if name.is_none() && main_class.is_none() {
+        return None;
+    }
+
+    Some(PluginDescriptor {
+        source: "velocity-plugin.json".to_string(),
+        name,
+        version,
+        main_class,
+        api_version: None,
+        authors,
+        description: None,
+        website: None,
+        depend,
+        soft_depend,
+        load_before: Vec::new(),
+        folia_supported: None, // Proxy plugins don't have Folia concept
+    })
+}
+
+fn parse_bungee_yml(text: &str) -> Option<PluginDescriptor> {
+    let v: serde_yaml::Value = serde_yaml::from_str(text).ok()?;
+    let name = v.get("name").and_then(|v| v.as_str()).map(String::from);
+    let version = yaml_as_str(v.get("version"));
+    let main_class = v.get("main").and_then(|v| v.as_str()).map(String::from);
+    let description = v
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let author = v.get("author").and_then(|v| v.as_str()).map(String::from);
+    let authors: Vec<String> = author.into_iter().collect();
+
+    let depend = parse_yaml_string_list(v.get("depend"));
+    let soft_depend = parse_yaml_string_list(v.get("softDepends"));
+    let load_before = parse_yaml_string_list(v.get("loadBefore"));
+
+    if name.is_none() && main_class.is_none() {
+        return None;
+    }
+
+    Some(PluginDescriptor {
+        source: "bungee.yml".to_string(),
+        name,
+        version,
+        main_class,
+        api_version: None,
+        authors,
+        description,
+        website: None,
+        depend,
+        soft_depend,
+        load_before,
+        folia_supported: None, // Proxy plugins don't have Folia concept
+    })
+}
+
+fn yaml_as_str(val: Option<&serde_yaml::Value>) -> Option<String> {
+    match val {
+        Some(v) => {
+            if let Some(s) = v.as_str() {
+                Some(s.to_string())
+            } else if let Some(f) = v.as_f64() {
+                // Check if it's an integer-valued float (e.g. YAML 1.0, 2.0)
+                let i = f as i64;
+                if (f - i as f64).abs() < f64::EPSILON && f >= 0.0 && f <= i64::MAX as f64 {
+                    // It's an integer-like float — but check if integer parsing
+                    // would also work (meaning the original was truly ambiguous).
+                    // For safety, use decimal notation since as_f64 matched first.
+                    Some(format!("{:.1}", f))
+                } else {
+                    Some(format!("{}", f))
+                }
+            } else if let Some(i) = v.as_i64() {
+                Some(i.to_string())
+            } else {
+                None
+            }
+        }
+        None => None,
+    }
+}
+
+fn parse_yaml_string_list(val: Option<&serde_yaml::Value>) -> Vec<String> {
+    match val.and_then(|v| v.as_sequence()) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
 // -- Tests ---------------------------------------------------------------
 
 #[cfg(test)]

@@ -33,6 +33,7 @@ pub enum OperationKind {
     Resetting,
     DeletingProfile,
     ModMutation,
+    PluginMutation,
 }
 
 impl Default for OperationKind {
@@ -409,6 +410,158 @@ pub struct ActionResult {
     pub error: Option<String>,
 }
 
+// ── 4B.4A: Plugin types ──────────────────────────────────────────────────
+
+/// Plugin platform — NOT reusing ServerType for classification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum PluginPlatform {
+    Bukkit,
+    Spigot,
+    Paper,
+    Purpur,
+    Folia,
+    Velocity,
+    Waterfall,
+    BungeeCord,
+    Unknown,
+}
+
+impl Default for PluginPlatform {
+    fn default() -> Self {
+        PluginPlatform::Unknown
+    }
+}
+
+/// Plugin status — NOT reusing mod ServerCompatibility.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PluginStatus {
+    Readable,
+    Unreadable,
+    UnknownMetadata,
+}
+
+impl Default for PluginStatus {
+    fn default() -> Self {
+        PluginStatus::UnknownMetadata
+    }
+}
+
+/// Plugin compatibility with current server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PluginCompatibility {
+    Compatible,
+    PlatformMismatch,
+    VersionUnknown,
+    FoliaUnknown,
+    FoliaCompatible,
+    FoliaIncompatible,
+    ProxyPlugin,
+    Unknown,
+    Unreadable,
+}
+
+impl Default for PluginCompatibility {
+    fn default() -> Self {
+        PluginCompatibility::Unknown
+    }
+}
+
+/// Plugin provider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PluginProvider {
+    Modrinth,
+    Hangar,
+    SpigotMC,
+    CurseForge,
+    Manual,
+    Unknown,
+}
+
+impl Default for PluginProvider {
+    fn default() -> Self {
+        PluginProvider::Unknown
+    }
+}
+
+/// Plugin dependency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginDependency {
+    pub name: String,
+    /// true = hard (depend), false = soft (softdepend)
+    pub required: bool,
+    /// from loadbefore field
+    pub load_before: bool,
+}
+
+/// Plugin inventory entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginInfo {
+    pub inventory_id: String,
+    pub file_name: String,
+    pub display_name: Option<String>,
+    pub plugin_name: Option<String>,
+    pub version: Option<String>,
+    pub main_class: Option<String>,
+    pub authors: Vec<String>,
+    pub description: Option<String>,
+    pub website: Option<String>,
+    pub api_version: Option<String>,
+    pub platforms: Vec<PluginPlatform>,
+    pub provider: Option<PluginProvider>,
+    pub project_id: Option<String>,
+    pub file_version_id: Option<String>,
+    pub artifact_hash: Option<String>,
+    pub status: PluginStatus,
+    pub dependencies: Vec<PluginDependency>,
+    pub folia_supported: Option<bool>,
+}
+
+impl Default for PluginInfo {
+    fn default() -> Self {
+        Self {
+            inventory_id: String::new(),
+            file_name: String::new(),
+            display_name: None,
+            plugin_name: None,
+            version: None,
+            main_class: None,
+            authors: Vec::new(),
+            description: None,
+            website: None,
+            api_version: None,
+            platforms: Vec::new(),
+            provider: None,
+            project_id: None,
+            file_version_id: None,
+            artifact_hash: None,
+            status: PluginStatus::UnknownMetadata,
+            dependencies: Vec::new(),
+            folia_supported: None,
+        }
+    }
+}
+
+/// Plugin receipt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginReceipt {
+    pub schema_version: u32,
+    pub provider: PluginProvider,
+    pub project_id: String,
+    pub file_version_id: Option<String>,
+    pub filename: String,
+    pub artifact_hash: String,
+    pub platforms: Vec<PluginPlatform>,
+    pub mc_version: Option<String>,
+}
+
+/// Plugin compatibility result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginCompatResult {
+    pub compatible: PluginCompatibility,
+    pub source: String,
+    pub reason: String,
+}
+
 pub struct AppState {
     pub server: Mutex<ServerManager>,
     pub playit: Mutex<PlayitState>,
@@ -494,6 +647,31 @@ impl AppState {
             if !matches!(srv.status, ServerStatus::Stopped | ServerStatus::Error) {
                 return Err(format!(
                     "Server state changed during mod operation setup: {:?}",
+                    srv.status
+                ));
+            }
+        }
+        Ok(guard)
+    }
+    /// Acquire a plugin-mutation guard. Same server-status and overlap checks as mod mutation.
+    /// ModMutation and PluginMutation conflict (both change server-owned content).
+    pub async fn require_plugin_mutation_ready(&self) -> Result<OperationGuard<'_>, String> {
+        {
+            let srv = self.server.lock().await;
+            if !matches!(srv.status, ServerStatus::Stopped | ServerStatus::Error) {
+                return Err(format!(
+                    "Cannot modify plugins while server is {:?}. Stop the server first.",
+                    srv.status
+                ));
+            }
+        }
+        let guard =
+            OperationGuard::acquire(&self.current_operation, OperationKind::PluginMutation).await?;
+        {
+            let srv = self.server.lock().await;
+            if !matches!(srv.status, ServerStatus::Stopped | ServerStatus::Error) {
+                return Err(format!(
+                    "Server state changed during plugin operation setup: {:?}",
                     srv.status
                 ));
             }
@@ -609,5 +787,25 @@ mod tests {
                 .is_ok(),
             "ModMutation must be acquirable after previous guard is dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn plugin_mutation_rejected_while_running() {
+        let state = AppState::new();
+        {
+            let mut srv = state.server.lock().await;
+            srv.set_status(ServerStatus::Running, None);
+        }
+        let result = state.require_plugin_mutation_ready().await;
+        match result {
+            Ok(_) => panic!("require_plugin_mutation_ready must reject while server is Running"),
+            Err(e) => {
+                let msg = e.to_lowercase();
+                assert!(
+                    msg.contains("running"),
+                    "Error must mention the Running state, got: {msg}"
+                );
+            }
+        }
     }
 }
