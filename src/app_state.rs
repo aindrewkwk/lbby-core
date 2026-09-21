@@ -473,7 +473,7 @@ impl Default for PluginCompatibility {
 }
 
 /// Plugin provider.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum PluginProvider {
     Modrinth,
     Hangar,
@@ -610,7 +610,7 @@ pub struct PluginCandidate {
 }
 
 /// Hashes from a provider. Strongest documented hash first.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct PluginCandidateHashes {
     pub sha512: Option<String>,
     pub sha256: Option<String>,
@@ -790,6 +790,157 @@ impl AppEventSender {
     pub fn state(&self) -> Arc<AppState> {
         self.state.clone()
     }
+}
+
+// ── 4B.4C: Update, Remove, Runtime types ────────────────────────────────
+
+/// Update status for an installed plugin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PluginUpdateStatus {
+    /// A compatible newer version is available.
+    UpdateAvailable {
+        current_version: Option<String>,
+        target_version: Option<String>,
+        target_filename: String,
+        /// Direct download URL for the target artifact.
+        download_url: String,
+        /// Provider cryptographic hashes for verification.
+        hashes: PluginCandidateHashes,
+        /// Supported platforms from the candidate.
+        platforms: Vec<PluginPlatform>,
+        /// Supported MC versions from the candidate.
+        game_versions: Vec<String>,
+        /// Release channel label (release/beta/alpha).
+        release_channel: Option<String>,
+    },
+    /// The installed version is the latest compatible.
+    UpToDate,
+    /// Provider request failed (network error, rate limit, etc.).
+    ProviderUnavailable(String),
+    /// Provider does not support trusted update resolution (SpigotMC, Manual, etc.).
+    ProviderUnknown,
+    /// Provider works but has no compatible version for current MC/platform.
+    NoCompatibleUpdate,
+    /// Cannot determine compatibility (missing metadata).
+    CompatibilityUnknown,
+    /// Identity conflict with another installed plugin.
+    Conflict(String),
+    /// Plugin JAR is unreadable / no valid descriptors.
+    Unreadable,
+}
+
+impl PluginUpdateStatus {
+    pub fn clone_target_version(&self) -> Option<String> {
+        match self {
+            Self::UpdateAvailable { target_version, .. } => target_version.clone(),
+            _ => None,
+        }
+    }
+    pub fn clone_target_filename(&self) -> Option<String> {
+        match self {
+            Self::UpdateAvailable {
+                target_filename, ..
+            } => Some(target_filename.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Per-item outcome of a plugin update operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PluginUpdateOutcome {
+    /// Successfully updated; receipt updated.
+    Updated(PluginInfo),
+    /// Artifact updated but receipt persistence failed.
+    UpdatedUntracked(PluginInfo),
+    /// Skipped (already up-to-date).
+    Skipped,
+    /// Update failed; old artifact preserved.
+    Failed(String),
+    /// No compatible update available.
+    UpToDate,
+    /// Identity conflict detected during update.
+    Conflict(String),
+    /// Provider unavailable.
+    ProviderUnavailable(String),
+    /// Candidate incompatible with current server.
+    Incompatible(PluginCompatResult),
+}
+
+/// Per-item outcome of a plugin removal operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PluginRemoveOutcome {
+    /// Successfully removed; receipt cleaned up.
+    Removed,
+    /// Artifact removed but receipt cleanup failed.
+    RemovedUntracked,
+    /// Removal blocked by hard dependents.
+    BlockedByDependents { dependents: Vec<String> },
+    /// Identity conflict (duplicate installed).
+    Conflict(String),
+    /// Plugin not found in inventory.
+    NotFound,
+}
+
+/// Batch update result preserving per-item outcomes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginBatchUpdateResult {
+    pub items: Vec<(String, PluginUpdateOutcome)>,
+    pub updated_count: u32,
+    pub failed_count: u32,
+    pub skipped_count: u32,
+}
+
+/// Runtime compatibility of an installed plugin against current server config.
+/// Separate from descriptor metadata — reflects runtime interpretation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PluginRuntimeCompatibility {
+    Compatible,
+    PlatformMismatch,
+    FoliaUnknown,
+    FoliaCompatible,
+    FoliaIncompatible,
+    ProxyPlugin,
+    ProxyMismatch,
+    MinecraftVersionMismatch,
+    Unknown,
+    Unreadable,
+    Ambiguous,
+}
+
+/// Update check result for a single installed plugin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginUpdateCheckResult {
+    pub inventory_id: String,
+    pub plugin_name: Option<String>,
+    pub current_version: Option<String>,
+    pub status: PluginUpdateStatus,
+    pub provider: PluginProvider,
+}
+
+/// Dependency graph node for an installed plugin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginDependencyNode {
+    pub inventory_id: String,
+    pub plugin_name: Option<String>,
+    pub hard_dependencies: Vec<String>,
+    pub soft_dependencies: Vec<String>,
+    pub load_before: Vec<String>,
+}
+
+/// Full dependency graph for installed plugins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginDependencyGraph {
+    pub nodes: Vec<PluginDependencyNode>,
+    pub conflicts: Vec<String>,
+}
+
+/// Installed plugin info enriched with runtime compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginInventoryEntry {
+    pub info: PluginInfo,
+    pub runtime_compat: PluginRuntimeCompatibility,
+    pub update_status: Option<PluginUpdateStatus>,
 }
 
 #[cfg(test)]

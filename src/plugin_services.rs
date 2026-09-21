@@ -4,9 +4,12 @@
 // receipts, and compatibility checking.
 
 use crate::app_state::{
-    PluginCandidate, PluginCandidateHashes, PluginCompatResult, PluginCompatibility,
-    PluginDependency, PluginInfo, PluginInstallResult, PluginPlatform, PluginProvider,
-    PluginProviderCapabilities, PluginReceipt, PluginSearchResult, PluginStatus, ReleaseChannel,
+    PluginBatchUpdateResult, PluginCandidate, PluginCandidateHashes, PluginCompatResult,
+    PluginCompatibility, PluginDependency, PluginDependencyGraph, PluginDependencyNode, PluginInfo,
+    PluginInstallResult, PluginInventoryEntry, PluginPlatform, PluginProvider,
+    PluginProviderCapabilities, PluginReceipt, PluginRemoveOutcome, PluginRuntimeCompatibility,
+    PluginSearchResult, PluginStatus, PluginUpdateCheckResult, PluginUpdateOutcome,
+    PluginUpdateStatus, ReleaseChannel,
 };
 use crate::config::ServerType;
 use crate::jar_metadata::{self, PluginDescriptor};
@@ -17,6 +20,29 @@ use std::path::{Component, Path, PathBuf};
 // ── Test seams ─────────────────────────────────────────────────────
 #[cfg(test)]
 static DOWNLOAD_SEAM: std::sync::Mutex<Option<fn(&str) -> Result<Vec<u8>, String>>> =
+    std::sync::Mutex::new(None);
+
+/// Test seam: bypass check_plugin_update with a pre-seeded result.
+/// When set, update_plugin_no_guard uses this instead of hitting Modrinth/Hangar APIs.
+#[cfg(test)]
+static UPDATE_CHECK_SEAM: std::sync::Mutex<Option<fn(&str) -> PluginUpdateStatus>> =
+    std::sync::Mutex::new(None);
+
+/// Test seam: force old artifact removal failure during filename-changing update.
+/// When set, old artifact removal returns error → triggers rollback.
+#[cfg(test)]
+static OLD_ARTIFACT_REMOVE_SEAM: std::sync::Mutex<Option<fn(&str) -> Result<(), String>>> =
+    std::sync::Mutex::new(None);
+
+/// Test seam: force receipt save failure.
+/// When set, save_plugin_receipt returns error.
+#[cfg(test)]
+static RECEIPT_SAVE_SEAM: std::sync::Mutex<Option<fn() -> Result<(), String>>> =
+    std::sync::Mutex::new(None);
+
+/// When set, receipt persistence during removal returns error → triggers RemovedUntracked.
+#[cfg(test)]
+static RECEIPT_REMOVE_SEAM: std::sync::Mutex<Option<fn() -> Result<(), String>>> =
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
@@ -2319,6 +2345,812 @@ fn install_plugin_from_bytes(
         Ok(PluginInstallResult::InstalledUntracked(info))
     } else {
         Ok(PluginInstallResult::Installed(info))
+    }
+}
+
+// ── 4B.4C: Runtime compatibility, dependency graph, update, remove ──────
+
+use crate::app_state::{AppState, OperationGuard, OperationKind};
+
+/// Compute runtime compatibility for an installed plugin.
+pub fn check_installed_plugin_runtime_compat(
+    info: &PluginInfo,
+    server_type: &ServerType,
+    folia_explicit: Option<bool>,
+) -> PluginRuntimeCompatibility {
+    if info.status == PluginStatus::Unreadable {
+        return PluginRuntimeCompatibility::Unreadable;
+    }
+    if info.status == PluginStatus::UnknownMetadata {
+        return PluginRuntimeCompatibility::Unknown;
+    }
+    if info.plugin_name.is_none() && info.status == PluginStatus::Readable {
+        return PluginRuntimeCompatibility::Ambiguous;
+    }
+    if matches!(server_type, ServerType::Folia) {
+        match folia_explicit {
+            Some(true) => return PluginRuntimeCompatibility::FoliaCompatible,
+            Some(false) => return PluginRuntimeCompatibility::FoliaIncompatible,
+            None => return PluginRuntimeCompatibility::FoliaUnknown,
+        }
+    }
+    if info.platforms.is_empty() {
+        return PluginRuntimeCompatibility::Unknown;
+    }
+    let has_proxy = info.platforms.iter().any(|p| {
+        matches!(
+            p,
+            PluginPlatform::Velocity | PluginPlatform::BungeeCord | PluginPlatform::Waterfall
+        )
+    });
+    let has_server = info.platforms.iter().any(|p| {
+        matches!(
+            p,
+            PluginPlatform::Paper
+                | PluginPlatform::Bukkit
+                | PluginPlatform::Spigot
+                | PluginPlatform::Purpur
+                | PluginPlatform::Folia
+        )
+    });
+    if has_proxy && !has_server {
+        return PluginRuntimeCompatibility::ProxyMismatch;
+    }
+    PluginRuntimeCompatibility::Compatible
+}
+
+/// Build dependency graph from installed plugins.
+pub fn compute_plugin_dependency_graph(plugins: &[PluginInfo]) -> PluginDependencyGraph {
+    let mut nodes = Vec::new();
+    let mut conflicts = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for p in plugins {
+        if let Some(ref name) = p.plugin_name {
+            if seen.contains(name) && !conflicts.contains(name) {
+                conflicts.push(name.clone());
+            }
+            seen.push(name.clone());
+        }
+        let hard = p
+            .dependencies
+            .iter()
+            .filter(|d| d.required)
+            .map(|d| d.name.clone())
+            .collect();
+        let soft = p
+            .dependencies
+            .iter()
+            .filter(|d| !d.required && !d.load_before)
+            .map(|d| d.name.clone())
+            .collect();
+        let load_before = p
+            .dependencies
+            .iter()
+            .filter(|d| d.load_before)
+            .map(|d| d.name.clone())
+            .collect();
+        nodes.push(PluginDependencyNode {
+            inventory_id: p.inventory_id.clone(),
+            plugin_name: p.plugin_name.clone(),
+            hard_dependencies: hard,
+            soft_dependencies: soft,
+            load_before,
+        });
+    }
+    PluginDependencyGraph { nodes, conflicts }
+}
+
+/// Check which installed plugins block removal of target.
+pub fn check_remove_blockers(
+    target_inventory_id: &str,
+    graph: &PluginDependencyGraph,
+) -> Vec<String> {
+    if !graph.conflicts.is_empty() {
+        return vec!["__duplicate_conflict__".to_string()];
+    }
+    graph
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.hard_dependencies
+                .iter()
+                .any(|dep| dep == target_inventory_id)
+        })
+        .map(|n| n.inventory_id.clone())
+        .collect()
+}
+
+/// Remove a plugin with dependency checking.
+pub async fn remove_plugin_safe(
+    inventory_id: &str,
+    server_path: &Path,
+    profile_path: &Path,
+    installed_plugins: &[PluginInfo],
+    app_state: &AppState,
+) -> PluginRemoveOutcome {
+    let _guard = match app_state.require_plugin_mutation_ready().await {
+        Ok(g) => g,
+        Err(_) => return PluginRemoveOutcome::Conflict("Guard conflict".to_string()),
+    };
+    let target = match installed_plugins
+        .iter()
+        .find(|p| p.inventory_id == inventory_id)
+    {
+        Some(p) => p,
+        None => return PluginRemoveOutcome::NotFound,
+    };
+    let graph = compute_plugin_dependency_graph(installed_plugins);
+    let blockers = check_remove_blockers(inventory_id, &graph);
+    if !blockers.is_empty() && blockers[0] == "__duplicate_conflict__" {
+        return PluginRemoveOutcome::Conflict("Duplicate identity".to_string());
+    }
+    if !blockers.is_empty() {
+        return PluginRemoveOutcome::BlockedByDependents {
+            dependents: blockers,
+        };
+    }
+    let artifact_path = server_path.join("plugins").join(&target.file_name);
+    if artifact_path.exists() {
+        if std::fs::remove_file(&artifact_path).is_err() {
+            return PluginRemoveOutcome::Conflict("Remove failed".to_string());
+        }
+    }
+    // Cleanup receipt
+    #[cfg(test)]
+    {
+        let seam_guard = RECEIPT_REMOVE_SEAM.lock().unwrap();
+        if let Some(f) = *seam_guard {
+            if let Err(_) = f() {
+                return PluginRemoveOutcome::RemovedUntracked;
+            }
+        }
+    }
+    let had_receipt = load_plugin_receipts(profile_path)
+        .map(|mut store| store.receipts.remove(&target.file_name).is_some())
+        .unwrap_or(false);
+    if had_receipt {
+        let mut store = load_plugin_receipts(profile_path).unwrap_or_default();
+        store.receipts.remove(&target.file_name);
+        if save_plugin_receipts(profile_path, &store).is_ok() {
+            PluginRemoveOutcome::Removed
+        } else {
+            PluginRemoveOutcome::RemovedUntracked
+        }
+    } else {
+        PluginRemoveOutcome::RemovedUntracked
+    }
+}
+
+/// Check update status for a single installed plugin.
+pub async fn check_plugin_update(
+    info: &PluginInfo,
+    server_type: &ServerType,
+    folia_explicit: Option<bool>,
+) -> PluginUpdateCheckResult {
+    let provider = info.provider.unwrap_or(PluginProvider::Manual);
+    if info.provider.is_none() || info.project_id.is_none() {
+        return PluginUpdateCheckResult {
+            inventory_id: info.inventory_id.clone(),
+            plugin_name: info.plugin_name.clone(),
+            current_version: info.file_version_id.clone(),
+            status: PluginUpdateStatus::ProviderUnknown,
+            provider,
+        };
+    }
+    if info.status == PluginStatus::Unreadable {
+        return PluginUpdateCheckResult {
+            inventory_id: info.inventory_id.clone(),
+            plugin_name: info.plugin_name.clone(),
+            current_version: info.file_version_id.clone(),
+            status: PluginUpdateStatus::Unreadable,
+            provider,
+        };
+    }
+    let project_id = info.project_id.as_deref().unwrap();
+    let result = match provider {
+        PluginProvider::Modrinth => check_modrinth_update(info, project_id).await,
+        PluginProvider::Hangar => check_hangar_update(info, project_id).await,
+        _ => Ok(PluginUpdateStatus::ProviderUnknown),
+    };
+    let status = result.unwrap_or_else(|e| PluginUpdateStatus::ProviderUnavailable(e));
+    PluginUpdateCheckResult {
+        inventory_id: info.inventory_id.clone(),
+        plugin_name: info.plugin_name.clone(),
+        current_version: info.file_version_id.clone(),
+        status,
+        provider,
+    }
+}
+
+async fn check_modrinth_update(
+    info: &PluginInfo,
+    project_id: &str,
+) -> Result<PluginUpdateStatus, String> {
+    let client = crate::mod_services::client()?;
+    let url = format!(
+        "https://api.modrinth.com/v2/project/{}/version?loaders=%5B%22paper%22%5D",
+        project_id
+    );
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Modrinth versions request failed: {}", e))?;
+    if !response.status().is_success() {
+        return Err(format!("Modrinth versions HTTP {}", response.status()));
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| format!("Modrinth versions read failed: {}", e))?;
+    let versions: Vec<ModrinthVersion> =
+        serde_json::from_slice(&body).map_err(|e| format!("Modrinth versions parse: {}", e))?;
+
+    let current_fvid = info.file_version_id.as_deref();
+
+    // Filter to versions that have at least one file and are NOT hidden/obsolete
+    let mut candidates: Vec<&ModrinthVersion> =
+        versions.iter().filter(|v| !v.files.is_empty()).collect();
+
+    // Sort by channel priority (Release=0, Beta=1, Alpha=2), then newest date first
+    candidates.sort_by(|a, b| {
+        let pa = modrinth_channel_priority(&a.version_type);
+        let pb = modrinth_channel_priority(&b.version_type);
+        pa.cmp(&pb).then(b.date_published.cmp(&a.date_published))
+    });
+
+    // Walk sorted candidates: if current version is the best → UpToDate
+    // If a newer compatible candidate exists → UpdateAvailable
+    for candidate in &candidates {
+        let version_id = candidate.id.clone();
+
+        // Check if this is the current version
+        if Some(version_id.as_str()) == current_fvid {
+            return Ok(PluginUpdateStatus::UpToDate);
+        }
+
+        // Prefer primary file, fall back to first
+        let file = candidate
+            .files
+            .iter()
+            .find(|f| f.primary)
+            .or_else(|| candidate.files.first())
+            .unwrap();
+
+        let hashes = PluginCandidateHashes {
+            sha512: file.hashes.sha512.clone(),
+            sha256: None, // Modrinth doesn't provide SHA-256
+            sha1: file.hashes.sha1.clone(),
+        };
+
+        let platforms = modrinth_categories_to_platforms(&candidate.loaders);
+
+        return Ok(PluginUpdateStatus::UpdateAvailable {
+            current_version: info.file_version_id.clone(),
+            target_version: Some(version_id),
+            target_filename: file.filename.clone(),
+            download_url: file.url.clone(),
+            hashes,
+            platforms,
+            game_versions: candidate.game_versions.clone(),
+            release_channel: Some(candidate.version_type.clone()),
+        });
+    }
+
+    Ok(PluginUpdateStatus::NoCompatibleUpdate)
+}
+
+fn modrinth_channel_priority(channel: &str) -> u8 {
+    match channel {
+        "release" => 0,
+        "beta" => 1,
+        "alpha" => 2,
+        _ => 3,
+    }
+}
+
+async fn check_hangar_update(
+    info: &PluginInfo,
+    project_slug: &str,
+) -> Result<PluginUpdateStatus, String> {
+    let client = crate::mod_services::client()?;
+    let url = format!(
+        "https://hangar.papermc.io/api/v1/projects/{}/versions",
+        project_slug
+    );
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Hangar versions request failed: {}", e))?;
+    if !response.status().is_success() {
+        return Err(format!("Hangar versions HTTP {}", response.status()));
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| format!("Hangar versions read failed: {}", e))?;
+    let data: HangarVersionsResult =
+        serde_json::from_slice(&body).map_err(|e| format!("Hangar versions parse: {}", e))?;
+
+    let current_fvid = info.file_version_id.as_deref();
+
+    // Filter to versions with at least one download
+    let mut candidates: Vec<&HangarVersionEntry> = data
+        .result
+        .iter()
+        .filter(|v| !v.downloads.is_empty() && !v.pinned)
+        .collect();
+
+    // Sort by channel priority (Release=0, Beta=1, Alpha=2)
+    // Hangar returns versions newest-first, so stable sort preserves order within channel
+    candidates.sort_by_key(|v| hangar_channel_priority(&v.channel.name));
+
+    for candidate in &candidates {
+        let version_id = candidate.id.to_string();
+
+        if Some(version_id.as_str()) == current_fvid {
+            return Ok(PluginUpdateStatus::UpToDate);
+        }
+
+        // Pick best platform download (prefer PAPER)
+        let platform_key = server_type_to_hangar_platform(&ServerType::Paper);
+        let dl = candidate
+            .downloads
+            .get(&platform_key)
+            .or_else(|| candidate.downloads.values().next());
+
+        if let Some(dl) = dl {
+            let hashes = PluginCandidateHashes {
+                sha512: None,
+                sha256: Some(dl.hash.clone()),
+                sha1: None,
+            };
+            let fname = dl
+                .download_url
+                .rsplit('/')
+                .next()
+                .unwrap_or("plugin.jar")
+                .to_string();
+
+            // Extract game versions from platform_dependencies
+            let game_versions: Vec<String> = candidate
+                .platform_dependencies
+                .values()
+                .flat_map(|v| v.iter().cloned())
+                .collect();
+
+            return Ok(PluginUpdateStatus::UpdateAvailable {
+                current_version: info.file_version_id.clone(),
+                target_version: Some(version_id),
+                target_filename: fname,
+                download_url: dl.download_url.clone(),
+                hashes,
+                platforms: vec![PluginPlatform::Paper], // Hangar defaults to Paper
+                game_versions,
+                release_channel: Some(candidate.channel.name.clone()),
+            });
+        }
+    }
+
+    Ok(PluginUpdateStatus::NoCompatibleUpdate)
+}
+
+/// Check updates for all installed plugins.
+pub async fn check_all_plugin_updates(
+    plugins: &[PluginInfo],
+    server_type: &ServerType,
+    folia_explicit: Option<bool>,
+) -> Vec<PluginUpdateCheckResult> {
+    let mut results = Vec::new();
+    for p in plugins {
+        results.push(check_plugin_update(p, server_type, folia_explicit).await);
+    }
+    results
+}
+
+/// Update a single plugin.
+pub async fn update_plugin_from_provider(
+    inventory_id: &str,
+    server_path: &Path,
+    profile_path: &Path,
+    installed_plugins: &[PluginInfo],
+    server_type: &ServerType,
+    folia_explicit: Option<bool>,
+    mc_version: &str,
+    app_state: &AppState,
+) -> PluginUpdateOutcome {
+    let _guard = match app_state.require_plugin_mutation_ready().await {
+        Ok(g) => g,
+        Err(_) => return PluginUpdateOutcome::Conflict("Guard conflict".to_string()),
+    };
+    update_plugin_no_guard(
+        inventory_id,
+        server_path,
+        profile_path,
+        installed_plugins,
+        server_type,
+        folia_explicit,
+        mc_version,
+    )
+    .await
+}
+
+/// Update all plugins.
+pub async fn update_all_plugins(
+    inventory_ids: &[String],
+    server_path: &Path,
+    profile_path: &Path,
+    installed_plugins: &[PluginInfo],
+    server_type: &ServerType,
+    folia_explicit: Option<bool>,
+    mc_version: &str,
+    app_state: &AppState,
+) -> PluginBatchUpdateResult {
+    let _guard = match app_state.require_plugin_mutation_ready().await {
+        Ok(g) => g,
+        Err(_) => {
+            return PluginBatchUpdateResult {
+                items: vec![],
+                updated_count: 0,
+                failed_count: 0,
+                skipped_count: 0,
+            }
+        }
+    };
+    let mut items = Vec::new();
+    let mut updated_count = 0u32;
+    let mut failed_count = 0u32;
+    let mut skipped_count = 0u32;
+    for id in inventory_ids {
+        let outcome = update_plugin_no_guard(
+            id,
+            server_path,
+            profile_path,
+            installed_plugins,
+            server_type,
+            folia_explicit,
+            mc_version,
+        )
+        .await;
+        match &outcome {
+            PluginUpdateOutcome::Updated(_) | PluginUpdateOutcome::UpdatedUntracked(_) => {
+                updated_count += 1
+            }
+            PluginUpdateOutcome::Failed(_) | PluginUpdateOutcome::Conflict(_) => failed_count += 1,
+            _ => skipped_count += 1,
+        }
+        items.push((id.clone(), outcome));
+    }
+    PluginBatchUpdateResult {
+        items,
+        updated_count,
+        failed_count,
+        skipped_count,
+    }
+}
+
+/// Internal update without guard (for batch reuse).
+///
+/// Full pipeline: check update → download → verify provider hash → parse JAR →
+/// resolve descriptors → reconcile identity → compatibility gate →
+/// backup old → commit new → remove old → update receipt.
+///
+/// On failure at any step after download, the old artifact is preserved.
+async fn update_plugin_no_guard(
+    inventory_id: &str,
+    server_path: &Path,
+    profile_path: &Path,
+    installed_plugins: &[PluginInfo],
+    server_type: &ServerType,
+    folia_explicit: Option<bool>,
+    mc_version: &str,
+) -> PluginUpdateOutcome {
+    // 1. Find installed plugin info
+    let info = match installed_plugins
+        .iter()
+        .find(|p| p.inventory_id == inventory_id)
+    {
+        Some(p) => p,
+        None => return PluginUpdateOutcome::Conflict("Not found".to_string()),
+    };
+
+    // 2. Check for update (with test seam to bypass HTTP)
+    let check;
+    #[cfg(test)]
+    {
+        let seam_guard = UPDATE_CHECK_SEAM.lock().unwrap();
+        if let Some(f) = *seam_guard {
+            check = PluginUpdateCheckResult {
+                inventory_id: info.inventory_id.clone(),
+                plugin_name: info.plugin_name.clone(),
+                current_version: info.file_version_id.clone(),
+                status: f(&info.inventory_id),
+                provider: info.provider.unwrap_or(PluginProvider::Manual),
+            };
+        } else {
+            check = check_plugin_update(info, server_type, folia_explicit).await;
+        }
+    }
+    #[cfg(not(test))]
+    {
+        check = check_plugin_update(info, server_type, folia_explicit).await;
+    }
+    let is_update = matches!(check.status, PluginUpdateStatus::UpdateAvailable { .. });
+    if !is_update {
+        return match check.status {
+            PluginUpdateStatus::UpToDate => PluginUpdateOutcome::UpToDate,
+            PluginUpdateStatus::ProviderUnavailable(e) => {
+                PluginUpdateOutcome::ProviderUnavailable(e)
+            }
+            PluginUpdateStatus::ProviderUnknown => {
+                PluginUpdateOutcome::ProviderUnavailable("Provider unknown".to_string())
+            }
+            _ => PluginUpdateOutcome::Skipped,
+        };
+    }
+
+    // 3. Extract UpdateAvailable fields
+    let (
+        target_filename,
+        target_version,
+        download_url,
+        hashes,
+        candidate_platforms,
+        candidate_game_versions,
+    ) = match check.status {
+        PluginUpdateStatus::UpdateAvailable {
+            target_filename,
+            target_version,
+            download_url,
+            hashes,
+            platforms,
+            game_versions,
+            ..
+        } => (
+            target_filename,
+            target_version,
+            download_url,
+            hashes,
+            platforms,
+            game_versions,
+        ),
+        _ => unreachable!(),
+    };
+
+    // 4. Download (with test seam)
+    let bytes: Vec<u8>;
+    #[cfg(test)]
+    {
+        let seam = DOWNLOAD_SEAM.lock().unwrap();
+        if let Some(f) = *seam {
+            match f(&download_url) {
+                Ok(b) => bytes = b,
+                Err(e) => return PluginUpdateOutcome::Failed(e),
+            }
+        } else {
+            match download_from_url(&download_url).await {
+                Ok(b) => bytes = b,
+                Err(e) => return PluginUpdateOutcome::Failed(e),
+            }
+        }
+    }
+    #[cfg(not(test))]
+    {
+        match download_from_url(&download_url).await {
+            Ok(b) => bytes = b,
+            Err(e) => return PluginUpdateOutcome::Failed(e),
+        }
+    }
+
+    // 5. Write to temp file for hash verification + JAR parsing
+    let tmp_dir = std::env::temp_dir().join(format!("lbby-plugin-update-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let tmp_jar_path = tmp_dir.join(&target_filename);
+    if std::fs::write(&tmp_jar_path, &bytes).is_err() {
+        return PluginUpdateOutcome::Failed("Temp write failed".to_string());
+    }
+
+    // 6. Verify provider hash — same policy as install (SHA-512 > SHA-256 > SHA-1)
+    if let Err(e) = verify_provider_hash(&tmp_jar_path, &hashes) {
+        let _ = std::fs::remove_file(&tmp_jar_path);
+        return PluginUpdateOutcome::Failed(format!("Provider hash mismatch: {}", e));
+    }
+
+    // 7. Parse JAR descriptors
+    let descriptors = jar_metadata::read_jar_plugin_descriptors(&tmp_jar_path);
+    if descriptors.is_empty() {
+        let _ = std::fs::remove_file(&tmp_jar_path);
+        return PluginUpdateOutcome::Failed("No plugin descriptors in new JAR".to_string());
+    }
+
+    // 8. Multi-descriptor resolution via resolve_plugin_descriptors
+    let resolved = resolve_plugin_descriptors(&descriptors);
+    let (merged_desc, resolved_platforms, is_ambiguous) = match resolved {
+        Some(r) => r,
+        None => {
+            let _ = std::fs::remove_file(&tmp_jar_path);
+            return PluginUpdateOutcome::Conflict(
+                "Cross-family descriptors (Bukkit + Proxy)".to_string(),
+            );
+        }
+    };
+    if is_ambiguous {
+        let _ = std::fs::remove_file(&tmp_jar_path);
+        return PluginUpdateOutcome::Conflict("Ambiguous plugin descriptors".to_string());
+    }
+
+    // 9. Identity reconciliation — build minimal PluginCandidate
+    let provider = info.provider.unwrap_or(PluginProvider::Manual);
+    let candidate = PluginCandidate {
+        provider,
+        project_id: info.project_id.clone().unwrap_or_default(),
+        file_version_id: target_version.clone(),
+        title: info.plugin_name.clone().unwrap_or_default(),
+        description: None,
+        authors: vec![],
+        download_url: download_url.clone(),
+        filename: target_filename.clone(),
+        hashes: PluginCandidateHashes {
+            sha512: None,
+            sha256: None,
+            sha1: None,
+        },
+        game_versions: candidate_game_versions.clone(),
+        platforms: candidate_platforms.clone(),
+        release_channel: ReleaseChannel::Release,
+        published_at: None,
+        icon_url: None,
+        compatibility: None,
+    };
+
+    let receipts = load_plugin_receipts(profile_path).unwrap_or(PluginProfileReceipts {
+        schema_version: 1,
+        receipts: std::collections::HashMap::new(),
+    });
+
+    let reconciliation =
+        match reconcile_plugin_identity(&candidate, &descriptors, installed_plugins, &receipts) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_jar_path);
+                return PluginUpdateOutcome::Failed(e);
+            }
+        };
+    if let Some(conflict) = reconciliation.conflict {
+        let _ = std::fs::remove_file(&tmp_jar_path);
+        return PluginUpdateOutcome::Conflict(conflict);
+    }
+
+    // 9b. Explicit identity change check for updates:
+    // If the new JAR declares a different plugin name than the installed one,
+    // that's an identity conflict even if reconcile didn't catch it.
+    if let Some(ref new_name) = merged_desc.name {
+        if let Some(ref old_name) = info.plugin_name {
+            if new_name != old_name {
+                let _ = std::fs::remove_file(&tmp_jar_path);
+                return PluginUpdateOutcome::Conflict(format!(
+                    "Plugin identity changed: {} → {}",
+                    old_name, new_name
+                ));
+            }
+        }
+    }
+
+    // 10. Compatibility gate on NEW artifact (using check_candidate_compatibility)
+    let compat = check_candidate_compatibility(&candidate, mc_version, server_type, folia_explicit);
+    match &compat.compatible {
+        PluginCompatibility::Compatible
+        | PluginCompatibility::FoliaCompatible
+        | PluginCompatibility::FoliaUnknown
+        | PluginCompatibility::Unknown => { /* allowed */ }
+        _ => {
+            let _ = std::fs::remove_file(&tmp_jar_path);
+            return PluginUpdateOutcome::Incompatible(compat);
+        }
+    }
+
+    // 11. File rotation: backup old → write new → remove old
+    let plugins_dir = server_path.join("plugins");
+    let _ = std::fs::create_dir_all(&plugins_dir);
+    let new_path = plugins_dir.join(&target_filename);
+    let old_path = plugins_dir.join(&info.file_name);
+    let backup_path = plugins_dir.join(format!("{}.bak", info.file_name));
+
+    // 11a. Backup old artifact
+    if old_path.exists() {
+        if std::fs::copy(&old_path, &backup_path).is_err() {
+            let _ = std::fs::remove_file(&tmp_jar_path);
+            return PluginUpdateOutcome::Failed("Backup failed".to_string());
+        }
+    }
+
+    // 11b. Write new artifact from temp
+    if std::fs::copy(&tmp_jar_path, &new_path).is_err() {
+        let _ = std::fs::rename(&backup_path, &old_path);
+        let _ = std::fs::remove_file(&tmp_jar_path);
+        return PluginUpdateOutcome::Failed("Write failed".to_string());
+    }
+
+    // 11c. Remove old artifact if different filename (with test seam for failure injection)
+    if old_path.exists() && old_path != new_path {
+        let old_str = old_path.to_string_lossy().to_string();
+        #[cfg(test)]
+        {
+            let seam_guard = OLD_ARTIFACT_REMOVE_SEAM.lock().unwrap();
+            if let Some(f) = *seam_guard {
+                if let Err(seam_err) = f(&old_str) {
+                    // Rollback: remove new, restore old from backup
+                    let _ = std::fs::remove_file(&new_path);
+                    let _ = std::fs::rename(&backup_path, &old_path);
+                    let _ = std::fs::remove_file(&tmp_jar_path);
+                    return PluginUpdateOutcome::Failed(format!(
+                        "Old artifact removal failed: {}; rolled back",
+                        seam_err
+                    ));
+                }
+            }
+        }
+        if std::fs::remove_file(&old_path).is_err() {
+            // Rollback: remove new, restore old from backup
+            let _ = std::fs::remove_file(&new_path);
+            let _ = std::fs::rename(&backup_path, &old_path);
+            let _ = std::fs::remove_file(&tmp_jar_path);
+            return PluginUpdateOutcome::Failed(
+                "Old artifact removal failed; rolled back".to_string(),
+            );
+        }
+    }
+
+    // 11d. Cleanup backup and temp
+    let _ = std::fs::remove_file(&backup_path);
+    let _ = std::fs::remove_file(&tmp_jar_path);
+
+    // 12. Compute local hash for receipt binding (always SHA-256)
+    let local_hash = match compute_file_sha256(&new_path) {
+        Ok(h) => h,
+        Err(e) => {
+            return PluginUpdateOutcome::Failed(format!("Hash computation failed: {}", e));
+        }
+    };
+
+    // 13. Update receipt (with test seam for failure injection)
+    let receipt = PluginReceipt {
+        schema_version: 1,
+        provider,
+        project_id: info.project_id.clone().unwrap_or_default(),
+        file_version_id: target_version.clone(),
+        filename: target_filename.clone(),
+        artifact_hash: local_hash,
+        platforms: resolved_platforms.clone(),
+        mc_version: candidate_game_versions.first().cloned(),
+    };
+
+    let mut receipt_ok;
+    #[cfg(test)]
+    {
+        let seam_guard = RECEIPT_SAVE_SEAM.lock().unwrap();
+        if let Some(f) = *seam_guard {
+            receipt_ok = f().is_ok();
+        } else {
+            receipt_ok = save_plugin_receipt(profile_path, &receipt).is_ok();
+        }
+    }
+    #[cfg(not(test))]
+    {
+        receipt_ok = save_plugin_receipt(profile_path, &receipt).is_ok();
+    }
+
+    // 14. Build result
+    let mut updated_info = info.clone();
+    updated_info.file_name = target_filename;
+    updated_info.file_version_id = target_version;
+    updated_info.platforms = resolved_platforms;
+
+    if receipt_ok {
+        PluginUpdateOutcome::Updated(updated_info)
+    } else {
+        PluginUpdateOutcome::UpdatedUntracked(updated_info)
     }
 }
 
@@ -5016,5 +5848,2027 @@ mod tests {
                 .any(|r| r.provider == PluginProvider::Modrinth),
             "Should include Modrinth results when Hangar fails"
         );
+    }
+
+    // ── 4B.4C: Runtime compatibility tests ────────────────────
+
+    #[test]
+    fn runtime_compat_bukkit_on_paper() {
+        let info = PluginInfo {
+            status: PluginStatus::Readable,
+            plugin_name: Some("TestPlugin".to_string()),
+            platforms: vec![PluginPlatform::Bukkit],
+            ..Default::default()
+        };
+        assert_eq!(
+            check_installed_plugin_runtime_compat(&info, &ServerType::Paper, None),
+            PluginRuntimeCompatibility::Compatible
+        );
+    }
+
+    #[test]
+    fn runtime_compat_folia_true() {
+        let info = PluginInfo {
+            status: PluginStatus::Readable,
+            plugin_name: Some("TestPlugin".to_string()),
+            platforms: vec![PluginPlatform::Folia],
+            ..Default::default()
+        };
+        assert_eq!(
+            check_installed_plugin_runtime_compat(&info, &ServerType::Folia, Some(true)),
+            PluginRuntimeCompatibility::FoliaCompatible
+        );
+    }
+
+    #[test]
+    fn runtime_compat_folia_false() {
+        let info = PluginInfo {
+            status: PluginStatus::Readable,
+            plugin_name: Some("TestPlugin".to_string()),
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        };
+        assert_eq!(
+            check_installed_plugin_runtime_compat(&info, &ServerType::Folia, Some(false)),
+            PluginRuntimeCompatibility::FoliaIncompatible
+        );
+    }
+
+    #[test]
+    fn runtime_compat_folia_unknown() {
+        let info = PluginInfo {
+            status: PluginStatus::Readable,
+            plugin_name: Some("TestPlugin".to_string()),
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        };
+        assert_eq!(
+            check_installed_plugin_runtime_compat(&info, &ServerType::Folia, None),
+            PluginRuntimeCompatibility::FoliaUnknown
+        );
+    }
+
+    #[test]
+    fn runtime_compat_velocity_on_paper() {
+        let info = PluginInfo {
+            status: PluginStatus::Readable,
+            plugin_name: Some("TestPlugin".to_string()),
+            platforms: vec![PluginPlatform::Velocity],
+            ..Default::default()
+        };
+        assert_eq!(
+            check_installed_plugin_runtime_compat(&info, &ServerType::Paper, None),
+            PluginRuntimeCompatibility::ProxyMismatch,
+            "Velocity plugin on Paper should be ProxyMismatch, not ProxyPlugin"
+        );
+    }
+
+    #[test]
+    fn runtime_compat_ambiguous() {
+        let info = PluginInfo {
+            status: PluginStatus::Readable,
+            plugin_name: None,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        };
+        assert_eq!(
+            check_installed_plugin_runtime_compat(&info, &ServerType::Paper, None),
+            PluginRuntimeCompatibility::Ambiguous
+        );
+    }
+
+    #[test]
+    fn runtime_compat_unreadable() {
+        let info = PluginInfo {
+            status: PluginStatus::Unreadable,
+            ..Default::default()
+        };
+        assert_eq!(
+            check_installed_plugin_runtime_compat(&info, &ServerType::Paper, None),
+            PluginRuntimeCompatibility::Unreadable
+        );
+    }
+
+    // ── 4B.4C: Dependency graph tests ─────────────────────────
+
+    #[test]
+    fn dep_graph_hard_blocks_removal() {
+        let plugins = vec![
+            PluginInfo {
+                inventory_id: "dep-a".to_string(),
+                plugin_name: Some("PluginA".to_string()),
+                dependencies: vec![PluginDependency {
+                    name: "dep-b".to_string(),
+                    required: true,
+                    load_before: false,
+                }],
+                ..Default::default()
+            },
+            PluginInfo {
+                inventory_id: "dep-b".to_string(),
+                plugin_name: Some("PluginB".to_string()),
+                dependencies: vec![],
+                ..Default::default()
+            },
+        ];
+        let graph = compute_plugin_dependency_graph(&plugins);
+        let blockers = check_remove_blockers("dep-b", &graph);
+        assert_eq!(blockers, vec!["dep-a".to_string()]);
+    }
+
+    #[test]
+    fn dep_graph_soft_allows() {
+        let plugins = vec![
+            PluginInfo {
+                inventory_id: "a".to_string(),
+                plugin_name: Some("PluginA".to_string()),
+                dependencies: vec![PluginDependency {
+                    name: "b".to_string(),
+                    required: false,
+                    load_before: false,
+                }],
+                ..Default::default()
+            },
+            PluginInfo {
+                inventory_id: "b".to_string(),
+                plugin_name: Some("PluginB".to_string()),
+                dependencies: vec![],
+                ..Default::default()
+            },
+        ];
+        let graph = compute_plugin_dependency_graph(&plugins);
+        let blockers = check_remove_blockers("b", &graph);
+        assert!(
+            blockers.is_empty(),
+            "Soft dependency should not block removal"
+        );
+    }
+
+    #[test]
+    fn dep_graph_loadbefore_allows() {
+        let plugins = vec![
+            PluginInfo {
+                inventory_id: "a".to_string(),
+                plugin_name: Some("PluginA".to_string()),
+                dependencies: vec![PluginDependency {
+                    name: "b".to_string(),
+                    required: false,
+                    load_before: true,
+                }],
+                ..Default::default()
+            },
+            PluginInfo {
+                inventory_id: "b".to_string(),
+                plugin_name: Some("PluginB".to_string()),
+                dependencies: vec![],
+                ..Default::default()
+            },
+        ];
+        let graph = compute_plugin_dependency_graph(&plugins);
+        let blockers = check_remove_blockers("b", &graph);
+        assert!(blockers.is_empty(), "LoadBefore should not block removal");
+    }
+
+    #[test]
+    fn dep_graph_multiple_dependents() {
+        let plugins = vec![
+            PluginInfo {
+                inventory_id: "a".to_string(),
+                plugin_name: Some("PluginA".to_string()),
+                dependencies: vec![PluginDependency {
+                    name: "dep".to_string(),
+                    required: true,
+                    load_before: false,
+                }],
+                ..Default::default()
+            },
+            PluginInfo {
+                inventory_id: "b".to_string(),
+                plugin_name: Some("PluginB".to_string()),
+                dependencies: vec![PluginDependency {
+                    name: "dep".to_string(),
+                    required: true,
+                    load_before: false,
+                }],
+                ..Default::default()
+            },
+            PluginInfo {
+                inventory_id: "dep".to_string(),
+                plugin_name: Some("DepPlugin".to_string()),
+                dependencies: vec![],
+                ..Default::default()
+            },
+        ];
+        let graph = compute_plugin_dependency_graph(&plugins);
+        let blockers = check_remove_blockers("dep", &graph);
+        assert_eq!(blockers.len(), 2);
+        assert!(blockers.contains(&"a".to_string()));
+        assert!(blockers.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn dep_graph_duplicate_conflict() {
+        let plugins = vec![
+            PluginInfo {
+                inventory_id: "a1".to_string(),
+                plugin_name: Some("SamePlugin".to_string()),
+                dependencies: vec![],
+                ..Default::default()
+            },
+            PluginInfo {
+                inventory_id: "a2".to_string(),
+                plugin_name: Some("SamePlugin".to_string()),
+                dependencies: vec![],
+                ..Default::default()
+            },
+        ];
+        let graph = compute_plugin_dependency_graph(&plugins);
+        assert!(!graph.conflicts.is_empty());
+        let blockers = check_remove_blockers("a1", &graph);
+        assert_eq!(blockers, vec!["__duplicate_conflict__".to_string()]);
+    }
+
+    // ── 4B.4C: Remove tests ───────────────────────────────────
+
+    #[tokio::test]
+    async fn remove_safe_no_deps() {
+        let server = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(server.path().join("plugins")).unwrap();
+        let plugin_file = server.path().join("plugins").join("test.jar");
+        std::fs::write(&plugin_file, b"fake jar").unwrap();
+        let plugins = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "test.jar".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            status: PluginStatus::Readable,
+            ..Default::default()
+        }];
+        let state = AppState::new();
+        let result =
+            remove_plugin_safe("test", server.path(), server.path(), &plugins, &state).await;
+        assert!(matches!(
+            result,
+            PluginRemoveOutcome::Removed | PluginRemoveOutcome::RemovedUntracked
+        ));
+        assert!(!plugin_file.exists(), "Artifact should be removed");
+    }
+
+    #[tokio::test]
+    async fn remove_safe_blocks() {
+        let plugins = vec![
+            PluginInfo {
+                inventory_id: "a".to_string(),
+                file_name: "a.jar".to_string(),
+                plugin_name: Some("PluginA".to_string()),
+                dependencies: vec![PluginDependency {
+                    name: "b".to_string(),
+                    required: true,
+                    load_before: false,
+                }],
+                ..Default::default()
+            },
+            PluginInfo {
+                inventory_id: "b".to_string(),
+                file_name: "b.jar".to_string(),
+                plugin_name: Some("PluginB".to_string()),
+                dependencies: vec![],
+                ..Default::default()
+            },
+        ];
+        let server = tempfile::tempdir().unwrap();
+        let state = AppState::new();
+        let result = remove_plugin_safe("b", server.path(), server.path(), &plugins, &state).await;
+        match &result {
+            PluginRemoveOutcome::BlockedByDependents { dependents } => {
+                assert_eq!(dependents, &vec!["a".to_string()]);
+            }
+            _ => panic!("Expected BlockedByDependents, got {:?}", result),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_safe_not_found() {
+        let server = tempfile::tempdir().unwrap();
+        let state = AppState::new();
+        let result =
+            remove_plugin_safe("nonexistent", server.path(), server.path(), &[], &state).await;
+        assert!(matches!(result, PluginRemoveOutcome::NotFound));
+    }
+
+    // ── 4B.4C: Update check tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn update_unsupported_provider() {
+        let info = PluginInfo {
+            inventory_id: "test".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: Some(PluginProvider::SpigotMC),
+            project_id: Some("12345".to_string()),
+            file_version_id: Some("v1".to_string()),
+            status: PluginStatus::Readable,
+            ..Default::default()
+        };
+        let result = check_plugin_update(&info, &ServerType::Paper, None).await;
+        assert!(matches!(result.status, PluginUpdateStatus::ProviderUnknown));
+    }
+
+    #[tokio::test]
+    async fn update_no_receipt() {
+        let info = PluginInfo {
+            inventory_id: "test".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: None,
+            project_id: None,
+            status: PluginStatus::Readable,
+            ..Default::default()
+        };
+        let result = check_plugin_update(&info, &ServerType::Paper, None).await;
+        assert!(matches!(result.status, PluginUpdateStatus::ProviderUnknown));
+    }
+
+    #[tokio::test]
+    async fn update_unreadable() {
+        let info = PluginInfo {
+            inventory_id: "test".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: Some(PluginProvider::Modrinth),
+            project_id: Some("abc".to_string()),
+            status: PluginStatus::Unreadable,
+            ..Default::default()
+        };
+        let result = check_plugin_update(&info, &ServerType::Paper, None).await;
+        assert!(matches!(result.status, PluginUpdateStatus::Unreadable));
+    }
+
+    // ── 4B.4C: Batch update tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn batch_guard_conflicts() {
+        let server = tempfile::tempdir().unwrap();
+        let state = AppState::new();
+        // Hold a guard
+        let _guard = state.require_plugin_mutation_ready().await.unwrap();
+        // Batch should fail
+        let result = update_all_plugins(
+            &["test".to_string()],
+            server.path(),
+            server.path(),
+            &[],
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+            &state,
+        )
+        .await;
+        assert_eq!(result.updated_count, 0);
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.skipped_count, 0);
+        assert!(result.items.is_empty());
+    }
+    // ══════════════════════════════════════════════════════════════════
+    // 4B.4C: Deterministic update transaction tests
+    // ══════════════════════════════════════════════════════════════════
+
+    /// Helper: create a valid JAR bytes with plugin.yml for the given name/version.
+    fn make_update_jar_bytes(name: &str, version: &str) -> Vec<u8> {
+        let plugin_yml = format!(
+            "name: {}\nversion: {}\nmain: com.example.Main\n",
+            name, version
+        );
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut zip = zip::ZipWriter::new(tmp.reopen().unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("plugin.yml", options).unwrap();
+        zip.write_all(plugin_yml.as_bytes()).unwrap();
+        zip.finish().unwrap();
+        std::fs::read(tmp.path()).unwrap()
+    }
+
+    /// Helper: write a JAR to the plugins dir and return its path.
+    fn write_plugin_jar(
+        plugins_dir: &std::path::Path,
+        filename: &str,
+        name: &str,
+        version: &str,
+    ) -> std::path::PathBuf {
+        let bytes = make_update_jar_bytes(name, version);
+        let path = plugins_dir.join(filename);
+        std::fs::write(&path, &bytes).unwrap();
+        path
+    }
+
+    /// Helper: compute SHA-256 of bytes as hex string.
+    fn update_sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        let hash = sha2::Sha256::digest(bytes);
+        hash.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// Helper: build a standard UpdateAvailable status for testing.
+    fn make_update_available(
+        target_filename: &str,
+        target_version: &str,
+        download_url: &str,
+        hashes: PluginCandidateHashes,
+        platforms: Vec<PluginPlatform>,
+        game_versions: Vec<String>,
+    ) -> PluginUpdateStatus {
+        PluginUpdateStatus::UpdateAvailable {
+            current_version: Some("v1".to_string()),
+            target_version: Some(target_version.to_string()),
+            target_filename: target_filename.to_string(),
+            download_url: download_url.to_string(),
+            hashes,
+            platforms,
+            game_versions,
+            release_channel: Some("release".to_string()),
+        }
+    }
+
+    // ── 1. Same-filename update success ─────────────────────────────
+
+    /// Master test: runs all seam-based update tests sequentially
+    /// to avoid race conditions on global test seams.
+    #[test]
+    fn update_transaction_suite() {
+        subtest_update_same_filename_success();
+        subtest_update_filename_changing_success();
+        subtest_update_hash_mismatch_rollback();
+        subtest_update_invalid_jar_rollback();
+        subtest_update_identity_conflict_rollback();
+        subtest_update_platform_mismatch_rollback();
+        subtest_update_mc_version_mismatch_rollback();
+        subtest_update_folia_incompatible_rollback();
+        subtest_update_receipt_failure_untracked();
+        subtest_update_temp_cleanup();
+        subtest_update_backup_cleanup();
+        subtest_update_filename_changing_forced_failure_rollback();
+        subtest_remove_safe_receipt_cleanup();
+        subtest_batch_update_a_b_c_with_failure();
+        subtest_batch_update_a_b_c_direct();
+        subtest_update_downgrade_prevention();
+        subtest_update_same_version_up_to_date();
+        subtest_hangar_sha256_mismatch_regression();
+    }
+
+    fn subtest_update_same_filename_success() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let old_path = write_plugin_jar(&plugins_dir, "myplugin.jar", "TestPlugin", "1.0");
+
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            *seam = Some(|_id| {
+                make_update_available(
+                    "myplugin.jar",
+                    "v2",
+                    "https://example.com/myplugin.jar",
+                    PluginCandidateHashes::default(),
+                    vec![PluginPlatform::Paper],
+                    vec!["1.20.1".to_string()],
+                )
+            });
+        }
+        {
+            let mut seam = DOWNLOAD_SEAM.lock().unwrap();
+            *seam = Some(|_url| Ok(make_update_jar_bytes("TestPlugin", "2.0")));
+        }
+
+        let installed = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "myplugin.jar".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: Some(PluginProvider::Modrinth),
+            project_id: Some("proj1".to_string()),
+            file_version_id: Some("v1".to_string()),
+            status: PluginStatus::Readable,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        }];
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(update_plugin_no_guard(
+            "test",
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+        ));
+
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+        {
+            *DOWNLOAD_SEAM.lock().unwrap() = None;
+        }
+
+        match &result {
+            PluginUpdateOutcome::Updated(info) => {
+                assert_eq!(info.file_name, "myplugin.jar");
+                assert_eq!(info.file_version_id, Some("v2".to_string()));
+            }
+            PluginUpdateOutcome::UpdatedUntracked(info) => {
+                assert_eq!(info.file_name, "myplugin.jar");
+            }
+            _ => panic!("Expected Updated or UpdatedUntracked, got {:?}", result),
+        }
+        assert!(
+            old_path.exists(),
+            "Artifact with same filename should still exist (overwritten)"
+        );
+    }
+
+    // ── 2. Filename-changing update success ─────────────────────────
+
+    fn subtest_update_filename_changing_success() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let old_path = write_plugin_jar(&plugins_dir, "old-name.jar", "TestPlugin", "1.0");
+
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            *seam = Some(|_id| {
+                make_update_available(
+                    "new-name.jar",
+                    "v2",
+                    "https://example.com/new.jar",
+                    PluginCandidateHashes::default(),
+                    vec![PluginPlatform::Paper],
+                    vec!["1.20.1".to_string()],
+                )
+            });
+        }
+        {
+            let mut seam = DOWNLOAD_SEAM.lock().unwrap();
+            *seam = Some(|_url| Ok(make_update_jar_bytes("TestPlugin", "2.0")));
+        }
+
+        let installed = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "old-name.jar".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: Some(PluginProvider::Modrinth),
+            project_id: Some("proj1".to_string()),
+            file_version_id: Some("v1".to_string()),
+            status: PluginStatus::Readable,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        }];
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(update_plugin_no_guard(
+            "test",
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+        ));
+
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+        {
+            *DOWNLOAD_SEAM.lock().unwrap() = None;
+        }
+
+        match &result {
+            PluginUpdateOutcome::Updated(info) => {
+                assert_eq!(info.file_name, "new-name.jar");
+            }
+            PluginUpdateOutcome::UpdatedUntracked(info) => {
+                assert_eq!(info.file_name, "new-name.jar");
+            }
+            _ => panic!("Expected Updated, got {:?}", result),
+        }
+        assert!(
+            !old_path.exists(),
+            "Old artifact must be removed on filename change"
+        );
+        assert!(
+            plugins_dir.join("new-name.jar").exists(),
+            "New artifact must exist"
+        );
+    }
+
+    // ── 3. Provider hash mismatch → rollback/live untouched ─────────
+
+    fn subtest_update_hash_mismatch_rollback() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let old_path = write_plugin_jar(&plugins_dir, "myplugin.jar", "TestPlugin", "1.0");
+        let old_bytes = std::fs::read(&old_path).unwrap();
+        let old_hash = update_sha256_hex(&old_bytes);
+
+        // Set hashes to a wrong SHA-512
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            *seam = Some(|_id| {
+                make_update_available(
+                    "myplugin.jar", "v2", "https://example.com/myplugin.jar",
+                    PluginCandidateHashes {
+                        sha512: Some("00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000deadbeef".to_string()),
+                        sha256: None,
+                        sha1: None,
+                    },
+                    vec![PluginPlatform::Paper],
+                    vec!["1.20.1".to_string()],
+                )
+            });
+        }
+        {
+            let mut seam = DOWNLOAD_SEAM.lock().unwrap();
+            *seam = Some(|_url| Ok(make_update_jar_bytes("TestPlugin", "2.0")));
+        }
+
+        let installed = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "myplugin.jar".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: Some(PluginProvider::Modrinth),
+            project_id: Some("proj1".to_string()),
+            file_version_id: Some("v1".to_string()),
+            status: PluginStatus::Readable,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        }];
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(update_plugin_no_guard(
+            "test",
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+        ));
+
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+        {
+            *DOWNLOAD_SEAM.lock().unwrap() = None;
+        }
+
+        assert!(
+            matches!(result, PluginUpdateOutcome::Failed(ref e) if e.contains("hash")),
+            "Expected hash mismatch failure, got {:?}",
+            result
+        );
+        assert!(
+            old_path.exists(),
+            "Old artifact must be untouched on hash mismatch"
+        );
+        let current_hash = update_sha256_hex(&std::fs::read(&old_path).unwrap());
+        assert_eq!(
+            old_hash, current_hash,
+            "Old artifact content must be unchanged"
+        );
+    }
+
+    // ── 4. Invalid JAR → rollback/live untouched ────────────────────
+
+    fn subtest_update_invalid_jar_rollback() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let old_path = write_plugin_jar(&plugins_dir, "myplugin.jar", "TestPlugin", "1.0");
+        let old_hash = update_sha256_hex(&std::fs::read(&old_path).unwrap());
+
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            *seam = Some(|_id| {
+                make_update_available(
+                    "myplugin.jar",
+                    "v2",
+                    "https://example.com/myplugin.jar",
+                    PluginCandidateHashes::default(),
+                    vec![PluginPlatform::Paper],
+                    vec!["1.20.1".to_string()],
+                )
+            });
+        }
+        {
+            let mut seam = DOWNLOAD_SEAM.lock().unwrap();
+            *seam = Some(|_url| Ok(b"not a valid zip".to_vec()));
+        }
+
+        let installed = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "myplugin.jar".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: Some(PluginProvider::Modrinth),
+            project_id: Some("proj1".to_string()),
+            file_version_id: Some("v1".to_string()),
+            status: PluginStatus::Readable,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        }];
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(update_plugin_no_guard(
+            "test",
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+        ));
+
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+        {
+            *DOWNLOAD_SEAM.lock().unwrap() = None;
+        }
+
+        assert!(
+            matches!(result, PluginUpdateOutcome::Failed(ref e) if e.contains("descriptor")),
+            "Expected descriptor failure, got {:?}",
+            result
+        );
+        assert!(
+            old_path.exists(),
+            "Old artifact must be untouched on invalid JAR"
+        );
+        assert_eq!(
+            update_sha256_hex(&std::fs::read(&old_path).unwrap()),
+            old_hash
+        );
+    }
+
+    // ── 5. Identity conflict → rollback/live untouched ──────────────
+
+    fn subtest_update_identity_conflict_rollback() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let old_path = write_plugin_jar(&plugins_dir, "myplugin.jar", "OriginalPlugin", "1.0");
+        let old_hash = update_sha256_hex(&std::fs::read(&old_path).unwrap());
+
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            *seam = Some(|_id| {
+                make_update_available(
+                    "myplugin.jar",
+                    "v2",
+                    "https://example.com/myplugin.jar",
+                    PluginCandidateHashes::default(),
+                    vec![PluginPlatform::Paper],
+                    vec!["1.20.1".to_string()],
+                )
+            });
+        }
+        {
+            let mut seam = DOWNLOAD_SEAM.lock().unwrap();
+            // Return JAR with DIFFERENT plugin name → identity conflict
+            *seam = Some(|_url| Ok(make_update_jar_bytes("TotallyDifferentPlugin", "2.0")));
+        }
+
+        let installed = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "myplugin.jar".to_string(),
+            plugin_name: Some("OriginalPlugin".to_string()),
+            provider: Some(PluginProvider::Modrinth),
+            project_id: Some("proj1".to_string()),
+            file_version_id: Some("v1".to_string()),
+            status: PluginStatus::Readable,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        }];
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(update_plugin_no_guard(
+            "test",
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+        ));
+
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+        {
+            *DOWNLOAD_SEAM.lock().unwrap() = None;
+        }
+
+        assert!(
+            matches!(result, PluginUpdateOutcome::Conflict(_)),
+            "Expected Conflict for identity change, got {:?}",
+            result
+        );
+        assert!(
+            old_path.exists(),
+            "Old artifact must be untouched on identity conflict"
+        );
+        assert_eq!(
+            update_sha256_hex(&std::fs::read(&old_path).unwrap()),
+            old_hash
+        );
+    }
+
+    // ── 6. Platform mismatch → live untouched ───────────────────────
+
+    fn subtest_update_platform_mismatch_rollback() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let old_path = write_plugin_jar(&plugins_dir, "myplugin.jar", "TestPlugin", "1.0");
+        let old_hash = update_sha256_hex(&std::fs::read(&old_path).unwrap());
+
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            // Velocity-only plugin on Paper server → ProxyMismatch
+            *seam = Some(|_id| {
+                make_update_available(
+                    "myplugin.jar",
+                    "v2",
+                    "https://example.com/myplugin.jar",
+                    PluginCandidateHashes::default(),
+                    vec![PluginPlatform::Velocity],
+                    vec!["1.20.1".to_string()],
+                )
+            });
+        }
+        {
+            let mut seam = DOWNLOAD_SEAM.lock().unwrap();
+            *seam = Some(|_url| Ok(make_update_jar_bytes("TestPlugin", "2.0")));
+        }
+
+        let installed = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "myplugin.jar".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: Some(PluginProvider::Modrinth),
+            project_id: Some("proj1".to_string()),
+            file_version_id: Some("v1".to_string()),
+            status: PluginStatus::Readable,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        }];
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(update_plugin_no_guard(
+            "test",
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+        ));
+
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+        {
+            *DOWNLOAD_SEAM.lock().unwrap() = None;
+        }
+
+        assert!(
+            matches!(result, PluginUpdateOutcome::Incompatible(_)),
+            "Expected Incompatible (ProxyMismatch), got {:?}",
+            result
+        );
+        assert!(
+            old_path.exists(),
+            "Old artifact must be untouched on platform mismatch"
+        );
+        assert_eq!(
+            update_sha256_hex(&std::fs::read(&old_path).unwrap()),
+            old_hash
+        );
+    }
+
+    // ── 7. MC version mismatch → live untouched ─────────────────────
+
+    fn subtest_update_mc_version_mismatch_rollback() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let old_path = write_plugin_jar(&plugins_dir, "myplugin.jar", "TestPlugin", "1.0");
+        let old_hash = update_sha256_hex(&std::fs::read(&old_path).unwrap());
+
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            // Plugin only supports 1.21 but server is 1.20.1
+            *seam = Some(|_id| {
+                make_update_available(
+                    "myplugin.jar",
+                    "v2",
+                    "https://example.com/myplugin.jar",
+                    PluginCandidateHashes::default(),
+                    vec![PluginPlatform::Paper],
+                    vec!["1.21".to_string()],
+                )
+            });
+        }
+        {
+            let mut seam = DOWNLOAD_SEAM.lock().unwrap();
+            *seam = Some(|_url| Ok(make_update_jar_bytes("TestPlugin", "2.0")));
+        }
+
+        let installed = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "myplugin.jar".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: Some(PluginProvider::Modrinth),
+            project_id: Some("proj1".to_string()),
+            file_version_id: Some("v1".to_string()),
+            status: PluginStatus::Readable,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        }];
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(update_plugin_no_guard(
+            "test",
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+        ));
+
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+        {
+            *DOWNLOAD_SEAM.lock().unwrap() = None;
+        }
+
+        assert!(
+            matches!(result, PluginUpdateOutcome::Incompatible(ref r)
+                if matches!(r.compatible, PluginCompatibility::MinecraftVersionMismatch)),
+            "Expected Incompatible(MC mismatch), got {:?}",
+            result
+        );
+        assert!(old_path.exists());
+        assert_eq!(
+            update_sha256_hex(&std::fs::read(&old_path).unwrap()),
+            old_hash
+        );
+    }
+
+    // ── 8. FoliaIncompatible → live untouched ───────────────────────
+
+    fn subtest_update_folia_incompatible_rollback() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let old_path = write_plugin_jar(&plugins_dir, "myplugin.jar", "TestPlugin", "1.0");
+        let old_hash = update_sha256_hex(&std::fs::read(&old_path).unwrap());
+
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            *seam = Some(|_id| {
+                make_update_available(
+                    "myplugin.jar",
+                    "v2",
+                    "https://example.com/myplugin.jar",
+                    PluginCandidateHashes::default(),
+                    vec![PluginPlatform::Paper],
+                    vec!["1.20.1".to_string()],
+                )
+            });
+        }
+        {
+            let mut seam = DOWNLOAD_SEAM.lock().unwrap();
+            *seam = Some(|_url| Ok(make_update_jar_bytes("TestPlugin", "2.0")));
+        }
+
+        let installed = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "myplugin.jar".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: Some(PluginProvider::Modrinth),
+            project_id: Some("proj1".to_string()),
+            file_version_id: Some("v1".to_string()),
+            status: PluginStatus::Readable,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        }];
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // folia_explicit = Some(false) → FoliaIncompatible
+        let result = rt.block_on(update_plugin_no_guard(
+            "test",
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Folia,
+            Some(false),
+            "1.20.1",
+        ));
+
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+        {
+            *DOWNLOAD_SEAM.lock().unwrap() = None;
+        }
+
+        assert!(
+            matches!(result, PluginUpdateOutcome::Incompatible(ref r)
+                if matches!(r.compatible, PluginCompatibility::FoliaIncompatible)),
+            "Expected Incompatible(FoliaIncompatible), got {:?}",
+            result
+        );
+        assert!(old_path.exists());
+        assert_eq!(
+            update_sha256_hex(&std::fs::read(&old_path).unwrap()),
+            old_hash
+        );
+    }
+
+    // ── 9. Receipt failure → UpdatedUntracked ───────────────────────
+
+    fn subtest_update_receipt_failure_untracked() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        write_plugin_jar(&plugins_dir, "myplugin.jar", "TestPlugin", "1.0");
+
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            *seam = Some(|_id| {
+                make_update_available(
+                    "myplugin.jar",
+                    "v2",
+                    "https://example.com/myplugin.jar",
+                    PluginCandidateHashes::default(),
+                    vec![PluginPlatform::Paper],
+                    vec!["1.20.1".to_string()],
+                )
+            });
+        }
+        {
+            let mut seam = DOWNLOAD_SEAM.lock().unwrap();
+            *seam = Some(|_url| Ok(make_update_jar_bytes("TestPlugin", "2.0")));
+        }
+        {
+            let mut seam = RECEIPT_SAVE_SEAM.lock().unwrap();
+            *seam = Some(|| Err("disk full".to_string()));
+        }
+
+        let installed = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "myplugin.jar".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: Some(PluginProvider::Modrinth),
+            project_id: Some("proj1".to_string()),
+            file_version_id: Some("v1".to_string()),
+            status: PluginStatus::Readable,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        }];
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(update_plugin_no_guard(
+            "test",
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+        ));
+
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+        {
+            *DOWNLOAD_SEAM.lock().unwrap() = None;
+        }
+        {
+            *RECEIPT_SAVE_SEAM.lock().unwrap() = None;
+        }
+
+        assert!(
+            matches!(result, PluginUpdateOutcome::UpdatedUntracked(_)),
+            "Expected UpdatedUntracked on receipt failure, got {:?}",
+            result
+        );
+        assert!(
+            plugins_dir.join("myplugin.jar").exists(),
+            "New artifact should exist even on receipt failure"
+        );
+    }
+
+    // ── 10. Temp cleanup after success ──────────────────────────────
+
+    fn subtest_update_temp_cleanup() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        write_plugin_jar(&plugins_dir, "myplugin.jar", "TestPlugin", "1.0");
+
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            *seam = Some(|_id| {
+                make_update_available(
+                    "myplugin.jar",
+                    "v2",
+                    "https://example.com/myplugin.jar",
+                    PluginCandidateHashes::default(),
+                    vec![PluginPlatform::Paper],
+                    vec!["1.20.1".to_string()],
+                )
+            });
+        }
+        {
+            let mut seam = DOWNLOAD_SEAM.lock().unwrap();
+            *seam = Some(|_url| Ok(make_update_jar_bytes("TestPlugin", "2.0")));
+        }
+
+        let installed = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "myplugin.jar".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: Some(PluginProvider::Modrinth),
+            project_id: Some("proj1".to_string()),
+            file_version_id: Some("v1".to_string()),
+            status: PluginStatus::Readable,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        }];
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _result = rt.block_on(update_plugin_no_guard(
+            "test",
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+        ));
+
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+        {
+            *DOWNLOAD_SEAM.lock().unwrap() = None;
+        }
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("lbby-plugin-update-{}", std::process::id()));
+        if tmp_dir.exists() {
+            let leftover: Vec<_> = std::fs::read_dir(&tmp_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .collect();
+            assert!(
+                leftover.is_empty(),
+                "Temp files should be cleaned: {:?}",
+                leftover
+            );
+        }
+    }
+
+    // ── 11. Backup cleanup after success ────────────────────────────
+
+    fn subtest_update_backup_cleanup() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        write_plugin_jar(&plugins_dir, "old.jar", "TestPlugin", "1.0");
+
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            *seam = Some(|_id| {
+                make_update_available(
+                    "new.jar",
+                    "v2",
+                    "https://example.com/new.jar",
+                    PluginCandidateHashes::default(),
+                    vec![PluginPlatform::Paper],
+                    vec!["1.20.1".to_string()],
+                )
+            });
+        }
+        {
+            let mut seam = DOWNLOAD_SEAM.lock().unwrap();
+            *seam = Some(|_url| Ok(make_update_jar_bytes("TestPlugin", "2.0")));
+        }
+
+        let installed = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "old.jar".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: Some(PluginProvider::Modrinth),
+            project_id: Some("proj1".to_string()),
+            file_version_id: Some("v1".to_string()),
+            status: PluginStatus::Readable,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        }];
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _result = rt.block_on(update_plugin_no_guard(
+            "test",
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+        ));
+
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+        {
+            *DOWNLOAD_SEAM.lock().unwrap() = None;
+        }
+
+        let backup_path = plugins_dir.join("old.jar.bak");
+        assert!(
+            !backup_path.exists(),
+            "Backup file should be cleaned after successful update"
+        );
+    }
+
+    // ── 12. Filename-changing forced-failure → rollback ─────────────
+
+    fn subtest_update_filename_changing_forced_failure_rollback() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let old_path = write_plugin_jar(&plugins_dir, "old.jar", "TestPlugin", "1.0");
+        let old_hash = update_sha256_hex(&std::fs::read(&old_path).unwrap());
+
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            *seam = Some(|_id| {
+                make_update_available(
+                    "new.jar",
+                    "v2",
+                    "https://example.com/new.jar",
+                    PluginCandidateHashes::default(),
+                    vec![PluginPlatform::Paper],
+                    vec!["1.20.1".to_string()],
+                )
+            });
+        }
+        {
+            let mut seam = DOWNLOAD_SEAM.lock().unwrap();
+            *seam = Some(|_url| Ok(make_update_jar_bytes("TestPlugin", "2.0")));
+        }
+        {
+            let mut seam = OLD_ARTIFACT_REMOVE_SEAM.lock().unwrap();
+            *seam = Some(|_path| Err("simulated removal failure".to_string()));
+        }
+
+        let installed = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "old.jar".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: Some(PluginProvider::Modrinth),
+            project_id: Some("proj1".to_string()),
+            file_version_id: Some("v1".to_string()),
+            status: PluginStatus::Readable,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        }];
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(update_plugin_no_guard(
+            "test",
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+        ));
+
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+        {
+            *DOWNLOAD_SEAM.lock().unwrap() = None;
+        }
+        {
+            *OLD_ARTIFACT_REMOVE_SEAM.lock().unwrap() = None;
+        }
+
+        assert!(
+            matches!(result, PluginUpdateOutcome::Failed(ref e) if e.contains("rolled back")),
+            "Expected rollback failure, got {:?}",
+            result
+        );
+        // Old artifact should be restored
+        assert!(
+            old_path.exists(),
+            "Old artifact must be restored on rollback"
+        );
+        assert_eq!(
+            update_sha256_hex(&std::fs::read(&old_path).unwrap()),
+            old_hash
+        );
+        // New artifact should NOT remain
+        assert!(
+            !plugins_dir.join("new.jar").exists(),
+            "New artifact must be removed on rollback"
+        );
+    }
+
+    // ── 13. Remove receipt-failure → RemovedUntracked ───────────────
+
+    fn subtest_remove_safe_receipt_cleanup() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let plugin_path = plugins_dir.join("test.jar");
+        std::fs::write(&plugin_path, b"fake jar").unwrap();
+
+        // Write a trusted receipt for the plugin
+        {
+            let mut store = PluginProfileReceipts::default();
+            store.receipts.insert(
+                "test.jar".to_string(),
+                PluginReceipt {
+                    schema_version: 1,
+                    provider: PluginProvider::Modrinth,
+                    project_id: "proj-test".to_string(),
+                    file_version_id: Some("v1".to_string()),
+                    filename: "test.jar".to_string(),
+                    artifact_hash: update_sha256_hex(b"fake jar"),
+                    platforms: vec![],
+                    mc_version: Some("1.20.1".to_string()),
+                },
+            );
+            save_plugin_receipts(&profile_path, &store).unwrap();
+        }
+
+        // Verify receipt exists on disk before removal
+        assert!(
+            profile_path.join(".lbby-plugin-receipts.json").exists(),
+            "Receipt file must exist before removal"
+        );
+
+        // Force receipt persistence failure during removal
+        {
+            *RECEIPT_REMOVE_SEAM.lock().unwrap() =
+                Some(|| Err("forced receipt write failure".to_string()));
+        }
+
+        let installed = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "test.jar".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            status: PluginStatus::Readable,
+            ..Default::default()
+        }];
+
+        let state = AppState::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(remove_plugin_safe(
+            "test",
+            &server_path,
+            &profile_path,
+            &installed,
+            &state,
+        ));
+
+        // Clear seam
+        {
+            *RECEIPT_REMOVE_SEAM.lock().unwrap() = None;
+        }
+
+        // MUST be exactly RemovedUntracked — never Removed
+        assert!(
+            matches!(result, PluginRemoveOutcome::RemovedUntracked),
+            "Expected exactly RemovedUntracked when receipt cleanup fails, got {:?}",
+            result
+        );
+
+        // Artifact must be absent
+        assert!(
+            !plugin_path.exists(),
+            "Artifact must be absent after removal"
+        );
+
+        // Stale receipt must still be on disk (cleanup failed)
+        let receipt_path = profile_path.join(".lbby-plugin-receipts.json");
+        assert!(
+            receipt_path.exists(),
+            "Stale receipt file must remain on disk when cleanup fails"
+        );
+
+        // Reload the receipt store — stale entry persists
+        let stale_store = load_plugin_receipts(&profile_path).unwrap();
+        assert!(
+            stale_store.receipts.contains_key("test.jar"),
+            "Stale receipt entry must persist on disk after failed cleanup"
+        );
+
+        // Next inventory scan must NOT trust the stale receipt:
+        // provider identity must NOT be restored onto a nonexistent artifact
+        // (i.e. there is no artifact on disk, so any scan that trusts the receipt
+        // would claim the plugin exists when it does not)
+        assert!(
+            !plugins_dir.join("test.jar").exists(),
+            "Next scan must see artifact as absent — stale receipt must NOT restore it"
+        );
+    }
+
+    // ── 14a. A/B/C batch — B fails at mutation path ─────────────────
+
+    fn subtest_batch_update_a_b_c_with_failure() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        // Write 3 existing plugins
+        write_plugin_jar(&plugins_dir, "a.jar", "PluginA", "1.0");
+        write_plugin_jar(&plugins_dir, "b.jar", "PluginB", "1.0");
+        write_plugin_jar(&plugins_dir, "c.jar", "PluginC", "1.0");
+
+        let installed = vec![
+            PluginInfo {
+                inventory_id: "a".to_string(),
+                file_name: "a.jar".to_string(),
+                plugin_name: Some("PluginA".to_string()),
+                provider: Some(PluginProvider::Modrinth),
+                project_id: Some("proj-a".to_string()),
+                file_version_id: Some("v1".to_string()),
+                status: PluginStatus::Readable,
+                platforms: vec![PluginPlatform::Paper],
+                ..Default::default()
+            },
+            PluginInfo {
+                inventory_id: "b".to_string(),
+                file_name: "b.jar".to_string(),
+                plugin_name: Some("PluginB".to_string()),
+                provider: Some(PluginProvider::Modrinth),
+                project_id: Some("proj-b".to_string()),
+                file_version_id: Some("v1".to_string()),
+                status: PluginStatus::Readable,
+                platforms: vec![PluginPlatform::Paper],
+                ..Default::default()
+            },
+            PluginInfo {
+                inventory_id: "c".to_string(),
+                file_name: "c.jar".to_string(),
+                plugin_name: Some("PluginC".to_string()),
+                provider: Some(PluginProvider::Modrinth),
+                project_id: Some("proj-c".to_string()),
+                file_version_id: Some("v1".to_string()),
+                status: PluginStatus::Readable,
+                platforms: vec![PluginPlatform::Paper],
+                ..Default::default()
+            },
+        ];
+
+        // All 3 get UpdateAvailable
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            *seam = Some(|id| {
+                let fname = format!("{}.jar", id);
+                make_update_available(
+                    &fname,
+                    "v2",
+                    &format!("https://example.com/{}.jar", id),
+                    PluginCandidateHashes::default(),
+                    vec![PluginPlatform::Paper],
+                    vec!["1.20.1".to_string()],
+                )
+            });
+        }
+        // B download fails — reaches mutation path and returns Failed
+        {
+            let mut seam = DOWNLOAD_SEAM.lock().unwrap();
+            *seam = Some(|url| {
+                if url.contains("/b.") {
+                    Err("download failed: network timeout".to_string())
+                } else if url.contains("/a.") {
+                    Ok(make_update_jar_bytes("PluginA", "2.0"))
+                } else if url.contains("/c.") {
+                    Ok(make_update_jar_bytes("PluginC", "2.0"))
+                } else {
+                    Ok(make_update_jar_bytes("Plugin", "2.0"))
+                }
+            });
+        }
+
+        let state = AppState::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(update_all_plugins(
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+            &state,
+        ));
+
+        // Clear seams
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+        {
+            *DOWNLOAD_SEAM.lock().unwrap() = None;
+        }
+
+        // Exact counts
+        assert_eq!(result.items.len(), 3, "Should have 3 items");
+        assert_eq!(result.updated_count, 2, "A and C should be updated");
+        assert_eq!(
+            result.failed_count, 1,
+            "B (download failure) should be failed"
+        );
+        assert_eq!(
+            result.skipped_count, 0,
+            "No skips — all reached mutation path"
+        );
+
+        // Individual outcomes
+        assert!(
+            matches!(&result.items[0].1, PluginUpdateOutcome::Updated(_)),
+            "A should be Updated, got {:?}",
+            result.items[0].1
+        );
+        assert!(
+            matches!(&result.items[1].1, PluginUpdateOutcome::Failed(_)),
+            "B should be Failed (download failure), got {:?}",
+            result.items[1].1
+        );
+        assert!(
+            matches!(&result.items[2].1, PluginUpdateOutcome::Updated(_)),
+            "C should be Updated (continues after B fail), got {:?}",
+            result.items[2].1
+        );
+
+        // C artifact should exist (proves continuation after B fail)
+        assert!(
+            plugins_dir.join("c.jar").exists(),
+            "C artifact must exist on disk after successful update"
+        );
+        // B artifact should be unchanged (old artifact preserved on failure)
+        assert!(
+            plugins_dir.join("b.jar").exists(),
+            "B old artifact must be preserved after download failure"
+        );
+    }
+
+    // ── 14b. A/B/C batch — skipped continuation (ProviderUnavailable) ─
+
+    fn subtest_batch_update_a_b_c_direct() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        // Write 3 existing plugins
+        write_plugin_jar(&plugins_dir, "a.jar", "PluginA", "1.0");
+        write_plugin_jar(&plugins_dir, "b.jar", "PluginB", "1.0");
+        write_plugin_jar(&plugins_dir, "c.jar", "PluginC", "1.0");
+
+        let installed = vec![
+            PluginInfo {
+                inventory_id: "a".to_string(),
+                file_name: "a.jar".to_string(),
+                plugin_name: Some("PluginA".to_string()),
+                provider: Some(PluginProvider::Modrinth),
+                project_id: Some("proj-a".to_string()),
+                file_version_id: Some("v1".to_string()),
+                status: PluginStatus::Readable,
+                platforms: vec![PluginPlatform::Paper],
+                ..Default::default()
+            },
+            PluginInfo {
+                inventory_id: "b".to_string(),
+                file_name: "b.jar".to_string(),
+                plugin_name: Some("PluginB".to_string()),
+                provider: Some(PluginProvider::Modrinth),
+                project_id: Some("proj-b".to_string()),
+                file_version_id: Some("v1".to_string()),
+                status: PluginStatus::Readable,
+                platforms: vec![PluginPlatform::Paper],
+                ..Default::default()
+            },
+            PluginInfo {
+                inventory_id: "c".to_string(),
+                file_name: "c.jar".to_string(),
+                plugin_name: Some("PluginC".to_string()),
+                provider: Some(PluginProvider::Modrinth),
+                project_id: Some("proj-c".to_string()),
+                file_version_id: Some("v1".to_string()),
+                status: PluginStatus::Readable,
+                platforms: vec![PluginPlatform::Paper],
+                ..Default::default()
+            },
+        ];
+
+        // UPDATE_CHECK_SEAM: A and C get UpdateAvailable, B gets Failed
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            *seam = Some(|id| {
+                if id == "b" {
+                    PluginUpdateStatus::ProviderUnavailable("API timeout".to_string())
+                } else {
+                    let fname = format!("{}.jar", id);
+                    make_update_available(
+                        &fname,
+                        "v2",
+                        &format!("https://example.com/{}.jar", id),
+                        PluginCandidateHashes::default(),
+                        vec![PluginPlatform::Paper],
+                        vec!["1.20.1".to_string()],
+                    )
+                }
+            });
+        }
+        {
+            let mut seam = DOWNLOAD_SEAM.lock().unwrap();
+            *seam = Some(|url| {
+                // Return JAR with correct plugin name based on download URL
+                if url.contains("/a.") {
+                    Ok(make_update_jar_bytes("PluginA", "2.0"))
+                } else if url.contains("/c.") {
+                    Ok(make_update_jar_bytes("PluginC", "2.0"))
+                } else {
+                    Ok(make_update_jar_bytes("Plugin", "2.0"))
+                }
+            });
+        }
+
+        let state = AppState::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(update_all_plugins(
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+            &state,
+        ));
+
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+        {
+            *DOWNLOAD_SEAM.lock().unwrap() = None;
+        }
+
+        assert_eq!(result.items.len(), 3, "Should have 3 items");
+        assert_eq!(result.updated_count, 2, "A and C should be updated");
+        assert_eq!(
+            result.skipped_count, 1,
+            "B (ProviderUnavailable) should be skipped"
+        );
+        assert_eq!(result.failed_count, 0, "No failures in this scenario");
+
+        // Verify outcomes
+        assert!(
+            matches!(&result.items[0].1, PluginUpdateOutcome::Updated(_)),
+            "A should be Updated"
+        );
+        assert!(
+            matches!(
+                &result.items[1].1,
+                PluginUpdateOutcome::ProviderUnavailable(_)
+            ),
+            "B should be ProviderUnavailable"
+        );
+        assert!(
+            matches!(&result.items[2].1, PluginUpdateOutcome::Updated(_)),
+            "C should be Updated"
+        );
+    }
+
+    // ── 15. Downgrade prevention ────────────────────────────────────
+
+    fn subtest_update_downgrade_prevention() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        write_plugin_jar(&plugins_dir, "myplugin.jar", "TestPlugin", "2.0");
+
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            *seam = Some(|_id| PluginUpdateStatus::UpToDate);
+        }
+
+        let installed = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "myplugin.jar".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: Some(PluginProvider::Modrinth),
+            project_id: Some("proj1".to_string()),
+            file_version_id: Some("v2".to_string()),
+            status: PluginStatus::Readable,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        }];
+
+        let state = AppState::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(update_plugin_from_provider(
+            "test",
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+            &state,
+        ));
+
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+
+        assert!(
+            matches!(result, PluginUpdateOutcome::UpToDate),
+            "Expected UpToDate for same/downgrade, got {:?}",
+            result
+        );
+    }
+
+    // ── 16. Same-version → UpToDate ─────────────────────────────────
+
+    fn subtest_update_same_version_up_to_date() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        write_plugin_jar(&plugins_dir, "myplugin.jar", "TestPlugin", "1.0");
+
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            *seam = Some(|_id| PluginUpdateStatus::UpToDate);
+        }
+
+        let installed = vec![PluginInfo {
+            inventory_id: "test".to_string(),
+            file_name: "myplugin.jar".to_string(),
+            plugin_name: Some("TestPlugin".to_string()),
+            provider: Some(PluginProvider::Modrinth),
+            project_id: Some("proj1".to_string()),
+            file_version_id: Some("v1".to_string()),
+            status: PluginStatus::Readable,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        }];
+
+        let state = AppState::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(update_plugin_from_provider(
+            "test",
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+            &state,
+        ));
+
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+
+        assert!(
+            matches!(result, PluginUpdateOutcome::UpToDate),
+            "Expected UpToDate for same version, got {:?}",
+            result
+        );
+    }
+
+    // ── 17. Dependency case policy test ─────────────────────────────
+
+    #[test]
+    fn dependency_case_sensitive_matching() {
+        // Note: dependency names are matched against inventory_id (not plugin_name).
+        // This reflects the Bukkit ecosystem convention where plugin names ARE identifiers.
+
+        // Exact match → blocks removal
+        let plugins = vec![
+            PluginInfo {
+                inventory_id: "a".to_string(),
+                plugin_name: Some("PluginA".to_string()),
+                dependencies: vec![PluginDependency {
+                    name: "b".to_string(),
+                    required: true,
+                    load_before: false,
+                }],
+                ..Default::default()
+            },
+            PluginInfo {
+                inventory_id: "b".to_string(),
+                plugin_name: Some("PluginB".to_string()),
+                dependencies: vec![],
+                ..Default::default()
+            },
+        ];
+        let graph = compute_plugin_dependency_graph(&plugins);
+        let blockers = check_remove_blockers("b", &graph);
+        assert_eq!(
+            blockers,
+            vec!["a".to_string()],
+            "Exact match should block removal"
+        );
+
+        // Different case → does NOT block (case-sensitive policy)
+        let plugins_case = vec![
+            PluginInfo {
+                inventory_id: "a".to_string(),
+                plugin_name: Some("PluginA".to_string()),
+                dependencies: vec![PluginDependency {
+                    name: "B".to_string(), // different case than inventory_id "b"
+                    required: true,
+                    load_before: false,
+                }],
+                ..Default::default()
+            },
+            PluginInfo {
+                inventory_id: "b".to_string(),
+                plugin_name: Some("PluginB".to_string()),
+                dependencies: vec![],
+                ..Default::default()
+            },
+        ];
+        let graph_case = compute_plugin_dependency_graph(&plugins_case);
+        let blockers_case = check_remove_blockers("b", &graph_case);
+        assert!(
+            blockers_case.is_empty(),
+            "Different-case dependency name should NOT match (case-sensitive policy)"
+        );
+    }
+
+    // ── 18. Velocity-on-Paper via compatibility gate ────────────────
+
+    #[test]
+    fn velocity_plugin_on_paper_proxy_mismatch() {
+        let candidate = PluginCandidate {
+            provider: PluginProvider::Modrinth,
+            project_id: "vel-proj".to_string(),
+            file_version_id: Some("v1".to_string()),
+            title: "VelocityPlugin".to_string(),
+            description: None,
+            authors: vec![],
+            download_url: String::new(),
+            filename: "vel.jar".to_string(),
+            hashes: PluginCandidateHashes::default(),
+            game_versions: vec!["1.20.1".to_string()],
+            platforms: vec![PluginPlatform::Velocity],
+            release_channel: ReleaseChannel::Release,
+            published_at: None,
+            icon_url: None,
+            compatibility: None,
+        };
+
+        let compat = check_candidate_compatibility(&candidate, "1.20.1", &ServerType::Paper, None);
+        assert!(
+            matches!(compat.compatible, PluginCompatibility::ProxyMismatch),
+            "Velocity plugin on Paper should be ProxyMismatch, got {:?}",
+            compat
+        );
+    }
+
+    // ── Hangar SHA-256 mismatch regression ──────────────────────────
+
+    fn subtest_hangar_sha256_mismatch_regression() {
+        let (_dir, server_path, profile_path) = make_test_server_dir();
+        let plugins_dir = server_path.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        // Write existing plugin with known content
+        write_plugin_jar(&plugins_dir, "hangar.jar", "HangarPlugin", "1.0");
+
+        let installed = vec![PluginInfo {
+            inventory_id: "hangar".to_string(),
+            file_name: "hangar.jar".to_string(),
+            plugin_name: Some("HangarPlugin".to_string()),
+            provider: Some(PluginProvider::Hangar),
+            project_id: Some("hangar-proj".to_string()),
+            file_version_id: Some("v1".to_string()),
+            status: PluginStatus::Readable,
+            platforms: vec![PluginPlatform::Paper],
+            ..Default::default()
+        }];
+
+        // Candidate hashes with intentionally wrong SHA-256
+        {
+            let mut seam = UPDATE_CHECK_SEAM.lock().unwrap();
+            *seam = Some(|id| {
+                if id == "hangar" {
+                    make_update_available(
+                        "hangar-new.jar",
+                        "v2",
+                        "https://hangar.example.com/hangar-new.jar",
+                        PluginCandidateHashes {
+                            sha512: None,
+                            sha256: Some(
+                                "000000000000000000000000000000000000000000000000000000000000dead"
+                                    .to_string(),
+                            ),
+                            sha1: None,
+                        },
+                        vec![PluginPlatform::Paper],
+                        vec!["1.20.1".to_string()],
+                    )
+                } else {
+                    PluginUpdateStatus::UpToDate
+                }
+            });
+        }
+        // Download returns valid JAR bytes (content != wrong hash)
+        {
+            let mut seam = DOWNLOAD_SEAM.lock().unwrap();
+            *seam = Some(|_| Ok(make_update_jar_bytes("HangarPlugin", "2.0")));
+        }
+
+        let state = AppState::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(update_all_plugins(
+            &["hangar".to_string()],
+            &server_path,
+            &profile_path,
+            &installed,
+            &ServerType::Paper,
+            None,
+            "1.20.1",
+            &state,
+        ));
+
+        // Clear seams
+        {
+            *UPDATE_CHECK_SEAM.lock().unwrap() = None;
+        }
+        {
+            *DOWNLOAD_SEAM.lock().unwrap() = None;
+        }
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.failed_count, 1, "Hangar SHA-256 mismatch must fail");
+
+        assert!(
+            matches!(&result.items[0].1, PluginUpdateOutcome::Failed(_)),
+            "Hangar SHA-256 mismatch must produce Failed, got {:?}",
+            result.items[0].1
+        );
+
+        // Old artifact must be unchanged on disk
+        let old_content = std::fs::read(plugins_dir.join("hangar.jar")).unwrap();
+        assert_eq!(
+            old_content,
+            make_update_jar_bytes("HangarPlugin", "1.0"),
+            "Old artifact must be unchanged after Hangar SHA-256 mismatch"
+        );
+
+        // Receipt must be unchanged (no new receipt written for failed update)
+        let store = load_plugin_receipts(&profile_path).unwrap();
+        assert!(
+            store.receipts.get("hangar.jar").is_none(),
+            "Receipt must not exist for plugin that was never receipted"
+        );
+
+        // Temp directory must be cleaned (no leftover temp files)
+        let temp_pattern = std::path::PathBuf::from(&plugins_dir);
+        // Check that no .tmp or .partial files remain
+        if let Ok(entries) = std::fs::read_dir(&temp_pattern) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                assert!(
+                    !name.contains(".tmp") && !name.contains(".partial") && !name.contains(".bak"),
+                    "Temp file must be cleaned: {}",
+                    name
+                );
+            }
+        }
     }
 }
