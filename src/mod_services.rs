@@ -3045,41 +3045,16 @@ pub async fn install_curseforge_modpack(
         let mut cfg2 = prepare_modpack_server(&app, cfg).await?;
         let root = server_dir(&cfg2)?;
         let total = zip.len() as u32;
-        for i in 0..zip.len() {
-            let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
-            // Use safe path extraction — validate against path traversal
-            let entry_name = entry.mangled_name();
-            let relative = match std::path::Path::new(&entry_name).strip_prefix("/") {
-                Ok(r) => r.to_path_buf(),
-                Err(_) => std::path::PathBuf::from(&entry_name),
-            };
-            // Block path traversal
-            if relative
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                continue;
-            }
-            let outpath = root.join(&relative);
-            if entry.is_dir() {
-                std::fs::create_dir_all(&outpath).ok();
-            } else {
-                if let Some(parent) = outpath.parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-                let mut outfile = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
-                std::io::copy(&mut entry, &mut outfile).map_err(|e| e.to_string())?;
-            }
-            if i % 50 == 0 || i + 1 == total as usize {
-                emit_mod_progress(
-                    &app,
-                    "Extracting server pack",
-                    &format!("{}/{} files", i + 1, total),
-                    (i + 1) as u32,
-                    total,
-                );
-            }
-        }
+        emit_mod_progress(
+            &app,
+            "Extracting server pack",
+            &format!("0/{} files", total),
+            0,
+            total,
+        );
+        // Use safe extraction: enclosed_name() + canonical containment check
+        // Reuses the established safe_extract_zip pattern from helpers.rs
+        crate::helpers::safe_extract_zip(&mut zip, &root, "")?;
         eprintln!(
             "[lbby] Server pack extracted {} files to {}",
             total,

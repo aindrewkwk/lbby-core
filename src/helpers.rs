@@ -627,6 +627,43 @@ pub fn read_zip_text<R: Read + std::io::Seek>(
     Some(text)
 }
 
+/// Reject path components that indicate absolute paths, traversal, or
+/// platform-specific rooted paths. Returns `true` for unsafe names.
+fn has_absolute_or_traversal_components(name: &str) -> bool {
+    // Reject Unix absolute paths
+    if name.starts_with('/') {
+        return true;
+    }
+    // Reject Windows drive absolute paths (C:/, C:\)
+    let bytes = name.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        // Check for drive letter followed by separator or just "C:" at start
+        if bytes.len() == 2 || bytes[2] == b'/' || bytes[2] == b'\\' {
+            return true;
+        }
+    }
+    // Reject UNC paths (\\server\share)
+    if name.starts_with("\\\\") || name.starts_with("//") {
+        return true;
+    }
+    // Reject backslash separators (Windows-style in zip entries)
+    // Only reject if backslashes look like path separators (not just in filenames)
+    if name.contains('\\') {
+        let parts: Vec<&str> = name.split('\\').collect();
+        // If splitting by backslash produces path-like components, reject
+        if parts.len() > 1 && parts.iter().all(|p| !p.is_empty() || p.contains("..")) {
+            return true;
+        }
+    }
+    // Reject `..` components in any position (using both / and \ separators)
+    for component in name.split(&['/', '\\'][..]) {
+        if component == ".." {
+            return true;
+        }
+    }
+    false
+}
+
 /// Safely extract a ZIP archive into `dest_root`.
 ///
 /// For each entry:
@@ -636,6 +673,9 @@ pub fn read_zip_text<R: Read + std::io::Seek>(
 ///
 /// `strip_prefix` is optional — when non-empty the leading prefix is
 /// removed from every entry name before joining with `dest_root`.
+///
+/// Rejects absolute paths (Unix, Windows drive letters, UNC), traversal
+/// components (`..`), and backslash-based Windows paths.
 pub fn safe_extract_zip<R: Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     dest_root: &Path,
@@ -657,10 +697,22 @@ pub fn safe_extract_zip<R: Read + std::io::Seek>(
         // 1) enclosed_name filters absolute paths and `..` components
         let enclosed: PathBuf = match entry.enclosed_name() {
             Some(p) => p.to_path_buf(),
-            None => continue, // skip unsafe paths silently
+            None => {
+                return Err(format!(
+                    "Zip entry rejected by enclosed_name(): {}",
+                    entry.name()
+                ))
+            }
         };
 
-        // 2) Strip optional prefix (e.g. "world/")
+        // 2) Additional validation: reject platform-specific absolute paths
+        //    that enclosed_name() may miss (Windows drive letters, UNC paths)
+        let name_str = entry.name();
+        if has_absolute_or_traversal_components(name_str) {
+            return Err(format!("Zip entry rejected as unsafe path: {}", name_str));
+        }
+
+        // 3) Strip optional prefix (e.g. "world/")
         let relative = if !strip_prefix.is_empty() {
             enclosed
                 .strip_prefix(strip_prefix)
@@ -672,7 +724,7 @@ pub fn safe_extract_zip<R: Read + std::io::Seek>(
 
         let outpath = dest_root.join(&relative);
 
-        // 3) Canonicalize parent (or the dir itself) and verify containment
+        // 4) Canonicalize parent (or the dir itself) and verify containment
         if let Some(parent) = outpath.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -1002,4 +1054,155 @@ pub fn extract_mod_version(filename: &str) -> Option<String> {
         return Some(version.to_string());
     }
     None
+}
+
+#[cfg(test)]
+mod zip_traversal_tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    /// Helper: build an in-memory zip with the given entry names (dirs end with `/`).
+    fn make_zip(entries: &[&str]) -> std::io::Cursor<Vec<u8>> {
+        let buf = Vec::new();
+        let mut w = ZipWriter::new(std::io::Cursor::new(buf));
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for name in entries {
+            if name.ends_with('/') {
+                w.add_directory(*name, opts).unwrap();
+            } else {
+                w.start_file(*name, opts).unwrap();
+                w.write_all(b"payload").unwrap();
+            }
+        }
+        let cursor = w.finish().unwrap();
+        // Reset cursor to start so ZipArchive can read it
+        let mut c = std::io::Cursor::new(cursor.into_inner());
+        c.set_position(0);
+        c
+    }
+
+    #[test]
+    fn rejects_dot_dot_traversal() {
+        let cursor = make_zip(&["../evil.jar"]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut za = zip::ZipArchive::new(cursor).unwrap();
+        let result = safe_extract_zip(&mut za, dir.path(), "");
+        assert!(result.is_err(), "Must reject ../ traversal");
+    }
+
+    #[test]
+    fn rejects_deep_dot_dot_traversal() {
+        let cursor = make_zip(&["../../evil.jar"]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut za = zip::ZipArchive::new(cursor).unwrap();
+        let result = safe_extract_zip(&mut za, dir.path(), "");
+        assert!(result.is_err(), "Must reject ../../ traversal");
+    }
+
+    #[test]
+    fn rejects_unix_absolute_path() {
+        let cursor = make_zip(&["/evil.jar"]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut za = zip::ZipArchive::new(cursor).unwrap();
+        let result = safe_extract_zip(&mut za, dir.path(), "");
+        assert!(result.is_err(), "Must reject /evil.jar absolute path");
+    }
+
+    #[test]
+    fn rejects_windows_drive_path() {
+        let cursor = make_zip(&["C:/evil.jar"]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut za = zip::ZipArchive::new(cursor).unwrap();
+        let result = safe_extract_zip(&mut za, dir.path(), "");
+        assert!(result.is_err(), "Must reject C:/evil.jar drive path");
+    }
+
+    #[test]
+    fn rejects_windows_backslash_drive_path() {
+        let cursor = make_zip(&["C:\\evil.jar"]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut za = zip::ZipArchive::new(cursor).unwrap();
+        let result = safe_extract_zip(&mut za, dir.path(), "");
+        assert!(
+            result.is_err(),
+            "Must reject C:\\evil.jar backslash drive path"
+        );
+    }
+
+    #[test]
+    fn rejects_unc_path() {
+        let cursor = make_zip(&["\\\\server\\share\\evil.jar"]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut za = zip::ZipArchive::new(cursor).unwrap();
+        let result = safe_extract_zip(&mut za, dir.path(), "");
+        assert!(
+            result.is_err(),
+            "Must reject \\\\server\\share\\evil.jar UNC path"
+        );
+    }
+
+    #[test]
+    fn rejects_embedded_dot_dot() {
+        // The entry "safe/../../evil.jar" escapes the root after entering "safe/"
+        let cursor = make_zip(&["safe/../../evil.jar"]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut za = zip::ZipArchive::new(cursor).unwrap();
+        let result = safe_extract_zip(&mut za, dir.path(), "");
+        assert!(result.is_err(), "Must reject embedded ../../ traversal");
+    }
+
+    #[test]
+    fn safe_relative_entry_extracts_normally() {
+        let cursor = make_zip(&["mods/example.jar", "config/settings.toml"]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut za = zip::ZipArchive::new(cursor).unwrap();
+        safe_extract_zip(&mut za, dir.path(), "").unwrap();
+        assert!(dir.path().join("mods/example.jar").exists());
+        assert!(dir.path().join("config/settings.toml").exists());
+    }
+
+    #[test]
+    fn safe_nested_entry_extracts_normally() {
+        let cursor = make_zip(&["nested/valid/deep/file.txt"]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut za = zip::ZipArchive::new(cursor).unwrap();
+        safe_extract_zip(&mut za, dir.path(), "").unwrap();
+        assert!(dir.path().join("nested/valid/deep/file.txt").exists());
+    }
+
+    #[test]
+    fn prefix_stripping_works_for_safe_entries() {
+        // Entry "overrides/mods/example.jar" with strip_prefix "overrides"
+        let cursor = make_zip(&["overrides/mods/example.jar"]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut za = zip::ZipArchive::new(cursor).unwrap();
+        safe_extract_zip(&mut za, dir.path(), "overrides").unwrap();
+        // After stripping "overrides/", the file should be at mods/example.jar
+        assert!(dir.path().join("mods/example.jar").exists());
+    }
+
+    #[test]
+    fn prefix_stripping_still_rejects_traversal() {
+        // Even with prefix stripping, traversal must be caught
+        let cursor = make_zip(&["overrides/../../evil.jar"]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut za = zip::ZipArchive::new(cursor).unwrap();
+        let result = safe_extract_zip(&mut za, dir.path(), "overrides");
+        assert!(
+            result.is_err(),
+            "Must reject traversal even with prefix stripping"
+        );
+    }
+
+    #[test]
+    fn directory_entries_extracts_safely() {
+        let cursor = make_zip(&["mods/", "mods/example.jar"]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut za = zip::ZipArchive::new(cursor).unwrap();
+        safe_extract_zip(&mut za, dir.path(), "").unwrap();
+        assert!(dir.path().join("mods/").is_dir());
+        assert!(dir.path().join("mods/example.jar").exists());
+    }
 }
