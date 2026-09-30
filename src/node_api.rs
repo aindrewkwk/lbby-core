@@ -155,7 +155,9 @@ pub async fn prepare_minecraft(
     let required_major = crate::java::required_java_for_mc_with_loader(
         &spec.minecraft_version,
         Some(&spec.distribution),
-    );
+    )
+    .ok_or_else(|| format!("Cannot determine Java requirement for '{}'", spec.minecraft_version))
+    .map_err(NodeApiError::MissingField)?;
     let app = noop_event_sender();
 
     let java_bin = match crate::java::find_java_with_version(required_major) {

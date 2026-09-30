@@ -180,7 +180,7 @@ pub fn build_server_launch_command(
 ///
 /// This is the shared version-resolution logic used by both production
 /// (which may download) and validation (which just fails).
-pub fn required_java_major(cfg: &ServerConfig) -> u8 {
+pub fn required_java_major(cfg: &ServerConfig) -> Option<u8> {
     let server_type_str = format!("{:?}", cfg.server_type);
     crate::java::required_java_for_mc_with_loader(&cfg.minecraft_version, Some(&server_type_str))
 }
@@ -355,13 +355,13 @@ mod tests {
     #[test]
     fn required_java_major_mc121() {
         let cfg = test_cfg(ServerType::Vanilla, "1.21.1", None);
-        assert_eq!(required_java_major(&cfg), 21);
+        assert_eq!(required_java_major(&cfg), Some(21));
     }
 
     #[test]
     fn required_java_major_mc120() {
         let cfg = test_cfg(ServerType::Vanilla, "1.20.1", None);
-        assert_eq!(required_java_major(&cfg), 17);
+        assert_eq!(required_java_major(&cfg), Some(17));
     }
 
     #[test]

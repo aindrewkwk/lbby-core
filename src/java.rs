@@ -7,49 +7,61 @@ use serde::Deserialize;
 
 /// Map a Minecraft version like "1.20.1" to the Java major version that should run it.
 /// Conservative — picks the highest Java the version is well-tested with.
-pub fn required_java_for_mc(mc_version: &str) -> u8 {
+pub fn required_java_for_mc(mc_version: &str) -> Option<u8> {
     required_java_for_mc_with_loader(mc_version, None)
 }
 
 /// Returns the required Java major version for a given Minecraft version and server type.
 /// NeoForge requires Java 21 regardless of MC version.
-pub fn required_java_for_mc_with_loader(mc_version: &str, server_type: Option<&str>) -> u8 {
+pub fn required_java_for_mc_with_loader(mc_version: &str, server_type: Option<&str>) -> Option<u8> {
+    required_java_for_mc_with_loader_opt(mc_version, server_type)
+}
+
+/// Returns Some(java_major) if the Minecraft version is recognized, None if unknown.
+/// This is the safe API — use this instead of required_java_for_mc_with_loader
+/// when you need to distinguish "unknown version" from "Java 17 required".
+pub fn required_java_for_mc_with_loader_opt(mc_version: &str, server_type: Option<&str>) -> Option<u8> {
+    let trimmed = mc_version.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+
     // NeoForge requires Java 21+ for all versions
     if let Some(st) = server_type {
         if st.eq_ignore_ascii_case("neoforge") {
-            return 21;
+            return Some(21);
         }
     }
 
     // Parse MC version — supports both old "1.X.Y" and new "X.Y" (26.x+) formats
-    let (minor, patch) = parse_mc_version(mc_version);
+    let (minor, patch) = parse_mc_version(trimmed)?;
 
-    match minor {
+    Some(match minor {
         0..=16 => 8,
         17 => 16,
         18 | 19 => 17,
         20 if patch <= 4 => 17,
-        20..=25 => 21, // 1.20.5+ through 1.25.x
-        _ => 25,       // 26.x+ (new MC versioning, compiled with Java 25)
-    }
+        20..=25 => 21,
+        _ => 25,
+    })
 }
 
 /// Parse a Minecraft version string into (minor, patch).
 /// Handles both "1.X.Y" (classic) and "X.Y" (new format, 26.x+) styles.
-fn parse_mc_version(mc_version: &str) -> (u32, u32) {
+fn parse_mc_version(mc_version: &str) -> Option<(u32, u32)> {
     // Try "1.X.Y" format first
     if let Some(rest) = mc_version.strip_prefix("1.") {
         let mut parts = rest.split('.');
-        let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(20);
+        let minor = parts.next().and_then(|s| s.parse().ok())?;
         let patch = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        return (minor, patch);
+        return Some((minor, patch));
     }
 
     // New format "X.Y" (e.g., "26.2") — MC dropped the "1." prefix
     let mut parts = mc_version.split('.');
-    let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let minor = parts.next().and_then(|s| s.parse().ok())?;
     let patch = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    (minor, patch)
+    Some((minor, patch))
 }
 
 fn push_unique(candidates: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
@@ -532,23 +544,31 @@ mod java_resolver_tests {
 
     #[test]
     fn test_required_java_baseline() {
-        assert_eq!(required_java_for_mc("1.12.2"), 8);
-        assert_eq!(required_java_for_mc("1.16.5"), 8);
-        assert_eq!(required_java_for_mc("1.17.0"), 16);
-        assert_eq!(required_java_for_mc("1.17.1"), 16);
-        assert_eq!(required_java_for_mc("1.18.2"), 17);
-        assert_eq!(required_java_for_mc("1.19.4"), 17);
-        assert_eq!(required_java_for_mc("1.20.1"), 17);
-        assert_eq!(required_java_for_mc("1.20.4"), 17);
-        assert_eq!(required_java_for_mc("1.20.6"), 21);
-        assert_eq!(required_java_for_mc("1.21.1"), 21);
-        assert_eq!(required_java_for_mc("26.2"), 25);
+        assert_eq!(required_java_for_mc("1.12.2"), Some(8));
+        assert_eq!(required_java_for_mc("1.16.5"), Some(8));
+        assert_eq!(required_java_for_mc("1.17.0"), Some(16));
+        assert_eq!(required_java_for_mc("1.17.1"), Some(16));
+        assert_eq!(required_java_for_mc("1.18.2"), Some(17));
+        assert_eq!(required_java_for_mc("1.19.4"), Some(17));
+        assert_eq!(required_java_for_mc("1.20.1"), Some(17));
+        assert_eq!(required_java_for_mc("1.20.4"), Some(17));
+        assert_eq!(required_java_for_mc("1.20.6"), Some(21));
+        assert_eq!(required_java_for_mc("1.21.1"), Some(21));
+        assert_eq!(required_java_for_mc("26.2"), Some(25));
+    }
+
+    #[test]
+    fn test_unknown_versions() {
+        assert_eq!(required_java_for_mc_with_loader_opt("", None), None);
+        assert_eq!(required_java_for_mc_with_loader_opt("unknown", None), None);
+        assert_eq!(required_java_for_mc_with_loader_opt("UNKNOWN", None), None);
+        assert_eq!(required_java_for_mc_with_loader_opt("garbage", None), None);
     }
 
     #[test]
     fn test_parse_mc_version_structural() {
-        assert_eq!(parse_mc_version("1.12.2"), (12, 2));
-        assert_eq!(parse_mc_version("1.20.1"), (20, 1));
-        assert_eq!(parse_mc_version("26.2"), (26, 2));
+        assert_eq!(parse_mc_version("1.12.2"), Some((12, 2)));
+        assert_eq!(parse_mc_version("1.20.1"), Some((20, 1)));
+        assert_eq!(parse_mc_version("26.2"), Some((26, 2)));
     }
 }

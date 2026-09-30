@@ -545,7 +545,8 @@ pub fn build_launch_spec(cfg: &ServerConfig, server_dir: &Path) -> Result<Launch
     let required_major = crate::java::required_java_for_mc_with_loader(
         &cfg.minecraft_version,
         Some(&server_type_str),
-    );
+    )
+    .ok_or_else(|| format!("Cannot determine Java requirement for Minecraft version '{}'", cfg.minecraft_version))?;
     let java_bin = crate::java::find_java_with_version(required_major)
         .ok_or_else(|| format!("Java {} not found", required_major))?;
 
