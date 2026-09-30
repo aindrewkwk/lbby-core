@@ -26,7 +26,7 @@ pub fn required_java_for_mc_with_loader(mc_version: &str, server_type: Option<&s
 
     match minor {
         0..=16 => 8,
-        17 => 17,
+        17 => 16,
         18 | 19 => 17,
         20 if patch <= 4 => 17,
         20..=25 => 21, // 1.20.5+ through 1.25.x
@@ -524,4 +524,31 @@ pub async fn ensure_java(
 
     // 2. Download from Adoptium
     download_jre(major, app).await
+}
+
+#[cfg(test)]
+mod java_resolver_tests {
+    use super::*;
+
+    #[test]
+    fn test_required_java_baseline() {
+        assert_eq!(required_java_for_mc("1.12.2"), 8);
+        assert_eq!(required_java_for_mc("1.16.5"), 8);
+        assert_eq!(required_java_for_mc("1.17.0"), 16);
+        assert_eq!(required_java_for_mc("1.17.1"), 16);
+        assert_eq!(required_java_for_mc("1.18.2"), 17);
+        assert_eq!(required_java_for_mc("1.19.4"), 17);
+        assert_eq!(required_java_for_mc("1.20.1"), 17);
+        assert_eq!(required_java_for_mc("1.20.4"), 17);
+        assert_eq!(required_java_for_mc("1.20.6"), 21);
+        assert_eq!(required_java_for_mc("1.21.1"), 21);
+        assert_eq!(required_java_for_mc("26.2"), 25);
+    }
+
+    #[test]
+    fn test_parse_mc_version_structural() {
+        assert_eq!(parse_mc_version("1.12.2"), (12, 2));
+        assert_eq!(parse_mc_version("1.20.1"), (20, 1));
+        assert_eq!(parse_mc_version("26.2"), (26, 2));
+    }
 }
