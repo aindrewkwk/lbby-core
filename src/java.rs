@@ -6,13 +6,13 @@ use std::{
 use serde::Deserialize;
 
 /// Map a Minecraft version like "1.20.1" to the Java major version that should run it.
-/// Conservative — picks the highest Java the version is well-tested with.
+/// Only recognized release families resolve without runtime bytecode evidence.
 pub fn required_java_for_mc(mc_version: &str) -> Option<u8> {
     required_java_for_mc_with_loader(mc_version, None)
 }
 
 /// Returns the required Java major version for a given Minecraft version and server type.
-/// NeoForge requires Java 21 regardless of MC version.
+/// NeoForge has a Java 21 floor, without lowering the Minecraft requirement.
 pub fn required_java_for_mc_with_loader(mc_version: &str, server_type: Option<&str>) -> Option<u8> {
     required_java_for_mc_with_loader_opt(mc_version, server_type)
 }
@@ -20,48 +20,82 @@ pub fn required_java_for_mc_with_loader(mc_version: &str, server_type: Option<&s
 /// Returns Some(java_major) if the Minecraft version is recognized, None if unknown.
 /// This is the safe API — use this instead of required_java_for_mc_with_loader
 /// when you need to distinguish "unknown version" from "Java 17 required".
-pub fn required_java_for_mc_with_loader_opt(mc_version: &str, server_type: Option<&str>) -> Option<u8> {
-    let trimmed = mc_version.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown") {
-        return None;
-    }
-
-    // NeoForge requires Java 21+ for all versions
-    if let Some(st) = server_type {
-        if st.eq_ignore_ascii_case("neoforge") {
-            return Some(21);
-        }
-    }
-
-    // Parse MC version — supports both old "1.X.Y" and new "X.Y" (26.x+) formats
-    let (minor, patch) = parse_mc_version(trimmed)?;
-
-    Some(match minor {
-        0..=16 => 8,
-        17 => 16,
-        18 | 19 => 17,
-        20 if patch <= 4 => 17,
-        20..=25 => 21,
-        _ => 25,
-    })
+pub fn required_java_for_mc_with_loader_opt(
+    mc_version: &str,
+    server_type: Option<&str>,
+) -> Option<u8> {
+    resolve_java_requirement(mc_version, server_type, None)
 }
 
-/// Parse a Minecraft version string into (minor, patch).
-/// Handles both "1.X.Y" (classic) and "X.Y" (new format, 26.x+) styles.
-fn parse_mc_version(mc_version: &str) -> Option<(u32, u32)> {
-    // Try "1.X.Y" format first
-    if let Some(rest) = mc_version.strip_prefix("1.") {
-        let mut parts = rest.split('.');
-        let minor = parts.next().and_then(|s| s.parse().ok())?;
-        let patch = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        return Some((minor, patch));
-    }
+/// Runtime bytecode evidence may resolve an otherwise unknown release.
+/// Loader floors can only raise a resolved Minecraft requirement.
+pub fn resolve_java_requirement(
+    mc_version: &str,
+    server_type: Option<&str>,
+    bytecode_major: Option<u8>,
+) -> Option<u8> {
+    let version = mc_version.trim();
+    let known = parse_mc_version(version).and_then(|(minor, patch)| {
+        if version.starts_with("1.") {
+            match minor {
+                0..=16 => Some(8),
+                17 => Some(16),
+                18 | 19 => Some(17),
+                20 if patch <= 4 => Some(17),
+                20 | 21 => Some(21),
+                _ => None,
+            }
+        } else if minor == 26 && (1..=2).contains(&patch) {
+            Some(25)
+        } else {
+            None
+        }
+    });
+    let evidence = bytecode_major.filter(|m| *m > 0);
+    let major = match (known, evidence) {
+        (Some(a), Some(b)) => a.max(b),
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => return None,
+    };
+    Some(
+        if server_type.is_some_and(|st| st.eq_ignore_ascii_case("neoforge")) {
+            major.max(21)
+        } else {
+            major
+        },
+    )
+}
 
-    // New format "X.Y" (e.g., "26.2") — MC dropped the "1." prefix
-    let mut parts = mc_version.split('.');
-    let minor = parts.next().and_then(|s| s.parse().ok())?;
-    let patch = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    Some((minor, patch))
+fn parse_mc_version(mc_version: &str) -> Option<(u32, u32)> {
+    let parts: Vec<&str> = mc_version.split('.').collect();
+    if !(2..=3).contains(&parts.len())
+        || parts
+            .iter()
+            .any(|p| p.is_empty() || !p.bytes().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    let numbers: Vec<u32> = parts
+        .iter()
+        .map(|p| p.parse())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if numbers[0] == 1 {
+        Some((numbers[1], *numbers.get(2).unwrap_or(&0)))
+    } else {
+        Some((numbers[0], numbers[1]))
+    }
+}
+
+/// Reject both mismatched majors and failed detection before running Java.
+pub fn verify_java_major(required: u8, actual: Option<u8>) -> Result<u8, String> {
+    match actual {
+        Some(major) if major == required => Ok(major),
+        _ => Err(format!(
+            "Java {} is required; detected {:?}. Install the exact Java major before continuing.",
+            required, actual
+        )),
+    }
 }
 
 fn push_unique(candidates: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
@@ -535,12 +569,36 @@ pub async fn ensure_java(
     }
 
     // 2. Download from Adoptium
-    download_jre(major, app).await
+    let path = download_jre(major, app).await?;
+    verify_java_major(major, detect_java_major(&path))?;
+    Ok(path)
 }
 
 #[cfg(test)]
 mod java_resolver_tests {
     use super::*;
+
+    #[test]
+    fn safety_regressions() {
+        assert_eq!(
+            required_java_for_mc_with_loader("26.2", Some("NeoForge")),
+            Some(25)
+        );
+        for version in ["27.1", "1.22.1", "26.3", "27.foo", "unknown"] {
+            assert_eq!(
+                required_java_for_mc_with_loader(version, Some("NeoForge")),
+                None
+            );
+        }
+        assert_eq!(
+            resolve_java_requirement("27.1", Some("NeoForge"), Some(26)),
+            Some(26)
+        );
+        assert_eq!(verify_java_major(25, Some(25)), Ok(25));
+        for actual in [None, Some(21), Some(26)] {
+            assert!(verify_java_major(25, actual).is_err());
+        }
+    }
 
     #[test]
     fn test_required_java_baseline() {
@@ -552,6 +610,7 @@ mod java_resolver_tests {
         assert_eq!(required_java_for_mc("1.19.4"), Some(17));
         assert_eq!(required_java_for_mc("1.20.1"), Some(17));
         assert_eq!(required_java_for_mc("1.20.4"), Some(17));
+        assert_eq!(required_java_for_mc("1.20.5"), Some(21));
         assert_eq!(required_java_for_mc("1.20.6"), Some(21));
         assert_eq!(required_java_for_mc("1.21.1"), Some(21));
         assert_eq!(required_java_for_mc("26.2"), Some(25));

@@ -4171,14 +4171,13 @@ pub async fn install_curseforge_modpack(
 
 fn ensure_server_properties(root: &Path, server_name: &str) -> Result<(), String> {
     let path = root.join("server.properties");
-    let mut props = std::fs::read_to_string(&path).unwrap_or_default();
-    if !props.lines().any(|l| l.starts_with("motd=")) {
-        props.push_str(&format!("\nmotd={}\n", server_name));
-    }
-    if !props.lines().any(|l| l.starts_with("online-mode=")) {
-        props.push_str("online-mode=true\n");
-    }
-    std::fs::write(&path, props).map_err(|e| e.to_string())
+    // Keep an existing pack file authoritative. Preserve the legacy minimal
+    // modpack template only when the file is genuinely absent.
+    let template = format!(
+        "motd={}\nonline-mode=true\n",
+        server_name.replace(['\r', '\n'], " ")
+    );
+    crate::minecraft_properties::ensure_properties_file(&path, &template)
 }
 
 fn backup_modpack_targets(root: &Path) -> Result<(), String> {
@@ -4514,25 +4513,11 @@ fn update_resource_pack_requirement(
     require: bool,
 ) -> Result<(), String> {
     let path = std::path::PathBuf::from(&cfg.server_path).join("server.properties");
-    if !path.exists() {
-        return Ok(());
-    }
-    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-    let key = "require-resource-pack=";
-    let value = if require { "true" } else { "false" };
-    let mut found = false;
-    for line in lines.iter_mut() {
-        if line.starts_with(key) {
-            *line = format!("{}{}", key, value);
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        lines.push(format!("{}{}", key, value));
-    }
-    std::fs::write(&path, lines.join("\n") + "\n").map_err(|e| e.to_string())
+    let props = std::collections::HashMap::from([(
+        "require-resource-pack".to_string(),
+        require.to_string(),
+    )]);
+    crate::minecraft_properties::patch_existing_properties(&path, &props).map(|_| ())
 }
 
 /// Internal helper to list resource packs without going through the public API.
@@ -7347,5 +7332,29 @@ type = "optional"
         assert!(ids.contains(&"alpha".to_string()));
         assert!(ids.contains(&"beta".to_string()));
         assert!(ids.contains(&"gamma".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod properties_safety_tests {
+    use super::ensure_server_properties;
+
+    #[test]
+    fn modpack_preserves_existing_properties_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.properties");
+        let original = "# imported pack\r\ncustom-key=abc\r\n";
+        std::fs::write(&path, original).unwrap();
+        ensure_server_properties(dir.path(), "New server").unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn modpack_read_failure_does_not_create_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.properties");
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(ensure_server_properties(dir.path(), "New server").is_err());
+        assert_eq!(std::fs::read(path).unwrap(), [0xff, 0xfe]);
     }
 }

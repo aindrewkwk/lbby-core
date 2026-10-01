@@ -151,9 +151,10 @@ pub fn analyze_runtime_issue(log_tail: &str, cfg: &ServerConfig) -> RuntimeIssue
     if crate::boot_failure_analyzer::is_wrong_java_log(log_tail) {
         let class_major = extract_class_file_major_version(log_tail);
         let server_type_str = format!("{:?}", cfg.server_type);
-        let required_major = match crate::java::required_java_for_mc_with_loader(
+        let required_major = match crate::java::resolve_java_requirement(
             &cfg.minecraft_version,
             Some(&server_type_str),
+            class_major,
         ) {
             Some(m) => m,
             None => return RuntimeIssue::Unsupported,
@@ -706,6 +707,25 @@ mod tests {
             ram_mb: 4096,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn unknown_future_uses_runtime_bytecode_evidence() {
+        let mut cfg = default_test_cfg();
+        cfg.minecraft_version = "27.1".into();
+        cfg.server_type = crate::config::ServerType::NeoForge;
+        let issue = analyze_runtime_issue(
+            "UnsupportedClassVersionError: class file version 70.0",
+            &cfg,
+        );
+        match issue {
+            RuntimeIssue::WrongJavaVersion(issue) => assert_eq!(issue.required_major, 26),
+            _ => panic!("Expected bytecode-derived Java requirement"),
+        }
+        assert!(matches!(
+            analyze_runtime_issue("UnsupportedClassVersionError", &cfg),
+            RuntimeIssue::Unsupported
+        ));
     }
 
     // ── Class file version parsing ──────────────────────────────────────

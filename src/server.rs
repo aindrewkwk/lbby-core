@@ -297,7 +297,12 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
         &cfg.minecraft_version,
         Some(&server_type_str),
     )
-    .ok_or_else(|| format!("Cannot determine Java requirement for Minecraft version '{}'", cfg.minecraft_version))?;
+    .ok_or_else(|| {
+        format!(
+            "Cannot determine Java requirement for Minecraft version '{}'",
+            cfg.minecraft_version
+        )
+    })?;
     let resolved_java = crate::java::find_java_with_version(required_major);
     let (java_bin, actual_major) = match resolved_java {
         Some(p) => (p, Some(required_major)),
@@ -327,49 +332,7 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
         }
     };
 
-    // Java version check
-    let install_hint: &str = if cfg!(target_os = "macos") {
-        "  \u{2022} Install via: brew install openjdk@17 (or download from https://adoptium.net)"
-    } else if cfg!(target_os = "windows") {
-        "  \u{2022} Download Eclipse Temurin from https://adoptium.net (pick the matching version)"
-    } else {
-        "  \u{2022} Install OpenJDK 17 from your distro's package manager or https://adoptium.net"
-    };
-    match actual_major {
-        Some(m) if m < required_major => {
-            return Err(format!(
-                "Java too old. Minecraft {} (Forge/{}) needs Java {}, but {} has Java {}.\n{}",
-                cfg.minecraft_version,
-                cfg.loader_version.as_deref().unwrap_or("loader"),
-                required_major,
-                java_bin.display(),
-                m,
-                install_hint
-            ));
-        }
-        Some(m) if m > required_major => {
-            if matches!(cfg.server_type, ServerType::Forge | ServerType::NeoForge) {
-                return Err(format!(
-                    "Java {} is too new for Minecraft {} ({}). This server type needs Java {} — \
-                     newer JVMs cause the server to hang silently.\n{}",
-                    m,
-                    cfg.minecraft_version,
-                    cfg.loader_version.as_deref().unwrap_or("loader"),
-                    required_major,
-                    install_hint
-                ));
-            }
-            let s = app.state();
-            let warn = format!(
-                "[lbby] \u{26a0} Using Java {} (newer than the recommended Java {} for MC {}). \
-                 Most newer JVMs work, but if the server hangs at startup, install Java {}.",
-                m, required_major, cfg.minecraft_version, required_major
-            );
-            s.push_console_line(warn.clone());
-            app.emit("mc-line", &warn).ok();
-        }
-        _ => {}
-    }
+    crate::java::verify_java_major(required_major, crate::java::detect_java_major(&java_bin))?;
 
     let _java_home = crate::java::java_home_from_bin(&java_bin); // used by shared builder
     let banner = format!(
@@ -1478,18 +1441,7 @@ pub fn get_server_properties() -> Result<HashMap<String, String>, String> {
     let cfg = crate::config::load_config();
     let path = PathBuf::from(&cfg.server_path).join("server.properties");
     PROPS_CACHE.get_or_load(&path, || {
-        let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        let mut map = HashMap::new();
-        for line in content.lines() {
-            let line = line.trim();
-            if line.starts_with('#') || line.is_empty() {
-                continue;
-            }
-            if let Some((k, v)) = line.split_once('=') {
-                map.insert(k.trim().to_string(), v.trim().to_string());
-            }
-        }
-        Ok(map)
+        crate::minecraft_properties::read_properties_map(&path)
     })
 }
 
@@ -1497,13 +1449,7 @@ pub fn get_server_properties() -> Result<HashMap<String, String>, String> {
 pub fn save_server_properties(props: HashMap<String, String>) -> Result<(), String> {
     let cfg = crate::config::load_config();
     let path = PathBuf::from(&cfg.server_path).join("server.properties");
-    let mut lines = vec!["# Minecraft server properties".to_string()];
-    let mut sorted: Vec<_> = props.iter().collect();
-    sorted.sort_by_key(|(k, _)| k.as_str());
-    for (k, v) in sorted {
-        lines.push(format!("{}={}", k, v));
-    }
-    let result = std::fs::write(&path, lines.join("\n") + "\n").map_err(|e| e.to_string());
+    let result = crate::minecraft_properties::merge_properties_file(&path, &props);
     PROPS_CACHE.invalidate();
     result
 }
@@ -1728,7 +1674,7 @@ pub async fn do_install_server(
         .map_err(|e| e.to_string())?;
 
     // Terraria servers don't need Java — skip Java detection/download
-    if cfg.server_type.needs_java() && cfg.java_path.is_empty() {
+    if cfg.server_type.needs_java() {
         // Try to auto-download the right Java version for this MC version.
         // If download fails, fall back to system Java but verify its version
         // is sufficient — never silently use a too-old JVM (especially for
@@ -1740,7 +1686,10 @@ pub async fn do_install_server(
         ) {
             Some(m) => m,
             None => {
-                return Err(format!("Cannot determine Java requirement for '{}'", cfg.minecraft_version));
+                return Err(format!(
+                    "Cannot determine Java requirement for '{}'",
+                    cfg.minecraft_version
+                ));
             }
         };
         eprintln!("[forge-diag] required Java major: {}", required_major);
@@ -1756,16 +1705,16 @@ pub async fn do_install_server(
                 eprintln!("[forge-diag] fallback java: {}", fallback);
                 let bin = std::path::PathBuf::from(&fallback);
                 match crate::java::detect_java_major(&bin) {
-                    Some(m) if m >= required_major => {
+                    Some(m) if m == required_major => {
                         eprintln!(
-                            "[forge-diag] fallback java major {} >= {}, using it",
+                            "[forge-diag] fallback java major {} matches {}, using it",
                             m, required_major
                         );
                         fallback
                     }
                     Some(m) => {
                         eprintln!(
-                            "[forge-diag] fallback java major {} < {}, REJECTED",
+                            "[forge-diag] fallback java major {} differs from {}, REJECTED",
                             m, required_major
                         );
                         return Err(format!(
@@ -1857,9 +1806,8 @@ pub async fn do_install_server(
             _ => (8, 6),
         };
         let properties_path = server_dir.join("server.properties");
-        let existing = tokio::fs::read_to_string(&properties_path).await.ok();
         let mut props = merge_server_properties(
-            existing.as_deref(),
+            None,
             cfg.max_players,
             &cfg.server_name,
             cfg.default_port(),
@@ -1872,9 +1820,11 @@ pub async fn do_install_server(
         {
             props.push_str(&format!("level-seed={}\n", cfg.minecraft_seed.trim()));
         }
-        tokio::fs::write(properties_path, props)
-            .await
-            .map_err(|e| e.to_string())?;
+        tokio::task::spawn_blocking(move || {
+            crate::minecraft_properties::ensure_properties_file(&properties_path, &props)
+        })
+        .await
+        .map_err(|e| format!("Properties install task failed: {}", e))??;
     } else if cfg.is_terraria() {
         // Terraria: serverconfig.txt + Worlds directory
         let worlds_dir = server_dir.join("Worlds");

@@ -150,23 +150,10 @@ fn find_free_port() -> u16 {
 /// Returns the port that was set.
 fn override_server_port(server_path: &PathBuf, port: u16) -> Result<u16, String> {
     let props_path = server_path.join("server.properties");
-    if !props_path.exists() {
+    let props = std::collections::HashMap::from([("server-port".to_string(), port.to_string())]);
+    if !lbby_core::minecraft_properties::patch_existing_properties(&props_path, &props)? {
         return Err("server.properties not found".to_string());
     }
-    let content = std::fs::read_to_string(&props_path).map_err(|e| e.to_string())?;
-    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-    let mut found = false;
-    for line in &mut lines {
-        if line.starts_with("server-port=") {
-            *line = format!("server-port={}", port);
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        lines.push(format!("server-port={}", port));
-    }
-    std::fs::write(&props_path, lines.join("\n") + "\n").map_err(|e| e.to_string())?;
     Ok(port)
 }
 

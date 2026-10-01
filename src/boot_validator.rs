@@ -546,7 +546,12 @@ pub fn build_launch_spec(cfg: &ServerConfig, server_dir: &Path) -> Result<Launch
         &cfg.minecraft_version,
         Some(&server_type_str),
     )
-    .ok_or_else(|| format!("Cannot determine Java requirement for Minecraft version '{}'", cfg.minecraft_version))?;
+    .ok_or_else(|| {
+        format!(
+            "Cannot determine Java requirement for Minecraft version '{}'",
+            cfg.minecraft_version
+        )
+    })?;
     let java_bin = crate::java::find_java_with_version(required_major)
         .ok_or_else(|| format!("Java {} not found", required_major))?;
 
@@ -583,75 +588,14 @@ fn write_validation_properties(
     validation_world: &str,
 ) -> Result<(), String> {
     let props_path = staging_path.join("server.properties");
-    let existing = std::fs::read_to_string(&props_path).unwrap_or_default();
-
-    let mut output = String::new();
-    let mut set_keys = std::collections::HashSet::new();
-
-    // Preserve existing properties, override validation-specific ones
-    for line in existing.lines() {
-        if line.starts_with('#') || line.trim().is_empty() {
-            output.push_str(line);
-            output.push('\n');
-            continue;
-        }
-        if let Some((key, _)) = line.split_once('=') {
-            let key = key.trim();
-            set_keys.insert(key.to_string());
-            match key {
-                "server-ip" => {
-                    output.push_str(&format!("server-ip=127.0.0.1\n"));
-                }
-                "server-port" => {
-                    output.push_str(&format!("server-port={}\n", port));
-                }
-                "level-name" => {
-                    output.push_str(&format!("level-name={}\n", validation_world));
-                }
-                "enable-rcon" => {
-                    output.push_str("enable-rcon=false\n");
-                }
-                "enable-query" => {
-                    output.push_str("enable-query=false\n");
-                }
-                "online-mode" => {
-                    // Keep existing value — don't override
-                    output.push_str(line);
-                    output.push('\n');
-                }
-                _ => {
-                    output.push_str(line);
-                    output.push('\n');
-                }
-            }
-        }
-    }
-
-    // Add missing required keys
-    if !set_keys.contains("server-ip") {
-        output.push_str("server-ip=127.0.0.1\n");
-    }
-    if !set_keys.contains("server-port") {
-        output.push_str(&format!("server-port={}\n", port));
-    }
-    if !set_keys.contains("level-name") {
-        output.push_str(&format!("level-name={}\n", validation_world));
-    }
-    if !set_keys.contains("enable-rcon") {
-        output.push_str("enable-rcon=false\n");
-    }
-    if !set_keys.contains("enable-query") {
-        output.push_str("enable-query=false\n");
-    }
-    // Preserve motd if present; add default if missing
-    if !set_keys.contains("motd") {
-        if let Some(motd) = extract_prop(&existing, "motd") {
-            output.push_str(&format!("motd={}\n", motd));
-        }
-    }
-
-    std::fs::write(&props_path, output)
-        .map_err(|e| format!("Failed to write server.properties: {}", e))
+    let props = std::collections::HashMap::from([
+        ("server-ip".to_string(), "127.0.0.1".to_string()),
+        ("server-port".to_string(), port.to_string()),
+        ("level-name".to_string(), validation_world.to_string()),
+        ("enable-rcon".to_string(), "false".to_string()),
+        ("enable-query".to_string(), "false".to_string()),
+    ]);
+    crate::minecraft_properties::merge_properties_file(&props_path, &props)
 }
 
 /// Restore original server.properties contents.
@@ -659,19 +603,17 @@ fn restore_server_properties(staging_path: &Path) -> Result<(), String> {
     let props_path = staging_path.join("server.properties");
     let original_path = staging_path.join(".lbby-original-server.properties");
 
-    if original_path.exists() {
-        let original = std::fs::read_to_string(&original_path)
-            .map_err(|e| format!("Failed to read original properties: {}", e))?;
-        std::fs::write(&props_path, original)
-            .map_err(|e| format!("Failed to restore server.properties: {}", e))?;
-        let _ = std::fs::remove_file(&original_path);
-    } else if props_path.exists() {
-        // No original existed — remove the one we created
-        // But check if the normal install pipeline intentionally created one.
-        // If the staging path had no server.properties before our overlay, remove it.
-        // We track this via the .lbby-original-server.properties marker.
-        // If the marker doesn't exist, it means the file didn't exist before.
-        let _ = std::fs::remove_file(&props_path);
+    if let Some(original) = crate::minecraft_properties::read_properties_text(&original_path)? {
+        crate::minecraft_properties::atomic_properties_text(&props_path, &original, false)?;
+        std::fs::remove_file(&original_path)
+            .map_err(|e| format!("Cannot remove original properties marker: {}", e))?;
+    } else {
+        // No original existed before the staging-only validation overlay.
+        match std::fs::remove_file(&props_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Cannot remove validation properties: {}", e)),
+        }
     }
 
     Ok(())
@@ -686,12 +628,9 @@ fn write_validation_properties_with_backup(
 ) -> Result<(), String> {
     // Backup original
     let props_path = staging_path.join("server.properties");
-    if props_path.exists() {
-        let original = std::fs::read_to_string(&props_path)
-            .map_err(|e| format!("Failed to read server.properties: {}", e))?;
+    if let Some(original) = crate::minecraft_properties::read_properties_text(&props_path)? {
         let backup_path = staging_path.join(".lbby-original-server.properties");
-        std::fs::write(&backup_path, original)
-            .map_err(|e| format!("Failed to backup server.properties: {}", e))?;
+        crate::minecraft_properties::atomic_properties_text(&backup_path, &original, false)?;
     }
 
     write_validation_properties(staging_path, cfg, port, validation_world)

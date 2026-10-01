@@ -156,7 +156,12 @@ pub async fn prepare_minecraft(
         &spec.minecraft_version,
         Some(&spec.distribution),
     )
-    .ok_or_else(|| format!("Cannot determine Java requirement for '{}'", spec.minecraft_version))
+    .ok_or_else(|| {
+        format!(
+            "Cannot determine Java requirement for '{}'",
+            spec.minecraft_version
+        )
+    })
     .map_err(NodeApiError::MissingField)?;
     let app = noop_event_sender();
 
@@ -167,7 +172,9 @@ pub async fn prepare_minecraft(
             .map_err(|e| NodeApiError::JavaNotFound(required_major, e))?,
     };
 
-    let java_major = crate::java::detect_java_major(&java_bin).unwrap_or(required_major);
+    let java_major =
+        crate::java::verify_java_major(required_major, crate::java::detect_java_major(&java_bin))
+            .map_err(|e| NodeApiError::JavaNotFound(required_major, e))?;
 
     // Prepare the distribution runtime. Modern Forge/NeoForge installations are
     // script-based and intentionally do not create a root server.jar.
@@ -201,9 +208,8 @@ pub async fn prepare_minecraft(
 
     // Preserve user-managed values and default new servers to authenticated mode.
     let properties_path = instance_dir.join("server.properties");
-    let existing = tokio::fs::read_to_string(&properties_path).await.ok();
     let props = crate::minecraft_properties::merge_server_properties(
-        existing.as_deref(),
+        None,
         spec.max_players,
         &spec.server_name,
         spec.game_port,
@@ -211,7 +217,12 @@ pub async fn prepare_minecraft(
         6,
         None,
     );
-    tokio::fs::write(properties_path, props).await?;
+    tokio::task::spawn_blocking(move || {
+        crate::minecraft_properties::ensure_properties_file(&properties_path, &props)
+    })
+    .await
+    .map_err(|e| NodeApiError::ProcessError(format!("Properties install task failed: {}", e)))?
+    .map_err(NodeApiError::ProcessError)?;
 
     // Create plugins or mods directory based on distribution
     let extras_dir = match spec.distribution.as_str() {
