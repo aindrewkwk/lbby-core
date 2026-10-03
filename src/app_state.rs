@@ -743,27 +743,30 @@ impl AppState {
     }
     /// Acquire a plugin-mutation guard. Same server-status and overlap checks as mod mutation.
     /// ModMutation and PluginMutation conflict (both change server-owned content).
+    /// Plugin mutation guard — allows operations while server is running.
+    /// Only blocks when a truly unsafe lifecycle phase is active
+    /// (profile deletion, import/restore replacing the profile).
+    /// Plugin file writes are safe while server runs: the plugin takes
+    /// effect after next restart.
     pub async fn require_plugin_mutation_ready(&self) -> Result<OperationGuard<'_>, String> {
         {
-            let srv = self.server.lock().await;
-            if !matches!(srv.status, ServerStatus::Stopped | ServerStatus::Error) {
-                return Err(format!(
-                    "Cannot modify plugins while server is {:?}. Stop the server first.",
-                    srv.status
-                ));
+            if let Ok(op) = self.current_operation.try_lock() {
+                if matches!(
+                    *op,
+                    OperationKind::DeletingProfile
+                        | OperationKind::Importing
+                        | OperationKind::Restoring
+                        | OperationKind::Resetting
+                ) {
+                    return Err(format!(
+                        "Cannot modify plugins while {:?} is in progress.",
+                        *op
+                    ));
+                }
             }
         }
         let guard =
             OperationGuard::acquire(&self.current_operation, OperationKind::PluginMutation).await?;
-        {
-            let srv = self.server.lock().await;
-            if !matches!(srv.status, ServerStatus::Stopped | ServerStatus::Error) {
-                return Err(format!(
-                    "Server state changed during plugin operation setup: {:?}",
-                    srv.status
-                ));
-            }
-        }
         Ok(guard)
     }
 }
@@ -1029,22 +1032,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugin_mutation_rejected_while_running() {
+    async fn plugin_mutation_allowed_while_running() {
         let state = AppState::new();
         {
             let mut srv = state.server.lock().await;
             srv.set_status(ServerStatus::Running, None);
         }
         let result = state.require_plugin_mutation_ready().await;
-        match result {
-            Ok(_) => panic!("require_plugin_mutation_ready must reject while server is Running"),
-            Err(e) => {
-                let msg = e.to_lowercase();
-                assert!(
-                    msg.contains("running"),
-                    "Error must mention the Running state, got: {msg}"
-                );
-            }
-        }
+        assert!(
+            result.is_ok(),
+            "Plugin mutation must be allowed while server is Running (restart-required semantics)"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_mutation_allowed_when_none_operation() {
+        let state = AppState::new();
+        let result = state.require_plugin_mutation_ready().await;
+        assert!(result.is_ok(), "Should allow plugin mutation when no operation in progress");
+    }
+
+    #[tokio::test]
+    async fn plugin_mutation_blocked_during_profile_deletion() {
+        let state = AppState::new();
+        *state.current_operation.lock().await = OperationKind::DeletingProfile;
+        let result = state.require_plugin_mutation_ready().await;
+        assert!(result.is_err(), "Should block during profile deletion");
+    }
+
+    #[tokio::test]
+    async fn plugin_mutation_blocked_during_import() {
+        let state = AppState::new();
+        *state.current_operation.lock().await = OperationKind::Importing;
+        let result = state.require_plugin_mutation_ready().await;
+        assert!(result.is_err(), "Should block during import");
+    }
+
+    #[tokio::test]
+    async fn plugin_mutation_blocked_by_concurrent_mutation() {
+        let state = AppState::new();
+        let _guard = state.require_plugin_mutation_ready().await.unwrap();
+        let result = state.require_plugin_mutation_ready().await;
+        assert!(result.is_err(), "Should block concurrent plugin mutation");
     }
 }

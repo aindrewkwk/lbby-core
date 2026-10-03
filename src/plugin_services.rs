@@ -1687,30 +1687,54 @@ pub async fn install_plugin_from_provider(
 
     let plugin_dir = plugins_dir(server_path)?;
 
+    // Resolve download_url if empty (search results don't include it)
+    let resolved_candidate: PluginCandidate;
+    let candidate_ref: &PluginCandidate = if candidate.download_url.is_empty() {
+        match candidate.provider {
+            PluginProvider::Modrinth => {
+                resolved_candidate = resolve_modrinth_plugin_version(
+                    &candidate.project_id,
+                    mc_version,
+                    server_type,
+                )
+                .await?;
+                &resolved_candidate
+            }
+            _ => {
+                return Err(format!(
+                    "Cannot resolve download URL for provider {:?}",
+                    candidate.provider
+                ));
+            }
+        }
+    } else {
+        candidate
+    };
+
     // 1. Download to temp (with test seam)
     let temp_dir = std::env::temp_dir().join("lbby-plugin-install");
     std::fs::create_dir_all(&temp_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
-    let temp_path = temp_dir.join(&candidate.filename);
+    let temp_path = temp_dir.join(&candidate_ref.filename);
 
     let jar_bytes: Vec<u8>;
     #[cfg(test)]
     {
         let seam = DOWNLOAD_SEAM.lock().unwrap();
         if let Some(f) = *seam {
-            jar_bytes = f(&candidate.download_url)?;
+            jar_bytes = f(&candidate_ref.download_url)?;
         } else {
-            jar_bytes = download_from_url(&candidate.download_url).await?;
+            jar_bytes = download_from_url(&candidate_ref.download_url).await?;
         }
     }
     #[cfg(not(test))]
     {
-        jar_bytes = download_from_url(&candidate.download_url).await?;
+        jar_bytes = download_from_url(&candidate_ref.download_url).await?;
     }
     std::fs::write(&temp_path, &jar_bytes)
         .map_err(|e| format!("Failed to write temp file: {}", e))?;
 
     // 2. Verify provider hash — algorithm-aware, hard failure on mismatch
-    if let Err(e) = verify_provider_hash(&temp_path, &candidate.hashes) {
+    if let Err(e) = verify_provider_hash(&temp_path, &candidate_ref.hashes) {
         let _ = std::fs::remove_file(&temp_path);
         return Err(e);
     }
@@ -2170,19 +2194,28 @@ fn verify_provider_hash(
 /// Download bytes from a URL.
 async fn download_from_url(url: &str) -> Result<Vec<u8>, String> {
     let client = crate::mod_services::client()?;
+    eprintln!("[plugin_services] Downloading from URL: {}", url);
     let response = client
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("Download failed: {}", e))?;
+        .map_err(|e| {
+            eprintln!("[plugin_services] Download request failed: {} (url: {})", e, url);
+            format!("Download failed: {}", e)
+        })?;
     if !response.status().is_success() {
+        eprintln!("[plugin_services] Download HTTP error: {} (url: {})", response.status(), url);
         return Err(format!("Download failed: HTTP {}", response.status()));
     }
-    response
+    let bytes = response
         .bytes()
         .await
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("Download failed: {}", e))
+        .map_err(|e| {
+            eprintln!("[plugin_services] Download body read failed: {} (url: {})", e, url);
+            format!("Download failed: {}", e)
+        })?;
+    eprintln!("[plugin_services] Downloaded {} bytes from {}", bytes.len(), url);
+    Ok(bytes.to_vec())
 }
 
 // ── Test seam: install from pre-downloaded bytes ─────────────────────
