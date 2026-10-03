@@ -1741,7 +1741,7 @@ pub async fn install_plugin_from_provider(
 
     // 3. Parse plugin descriptors
     let descriptors = jar_metadata::read_jar_plugin_descriptors(&temp_path);
-    let temp_file_name = candidate.filename.clone();
+    let temp_file_name = candidate_ref.filename.clone();
 
     // 3a. Reject invalid/empty-descriptor JARs before any live commit
     if descriptors.is_empty() {
@@ -1777,12 +1777,12 @@ pub async fn install_plugin_from_provider(
     }
 
     // 7. Check destination conflict
-    let dest = plugin_dir.join(&candidate.filename);
+    let dest = plugin_dir.join(&candidate_ref.filename);
     if dest.exists() {
         let _ = std::fs::remove_file(&temp_path);
         return Err(format!(
             "Destination file already exists: {}",
-            candidate.filename
+            candidate_ref.filename
         ));
     }
 
@@ -5728,12 +5728,15 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let (_dir, server_path, profile_path) = make_test_server_dir();
 
-        let candidate = make_test_candidate(
+        let mut candidate = make_test_candidate(
             PluginProvider::Modrinth,
             "proj_dl_fail",
             "download_fail.jar",
             PluginCandidateHashes::default(),
         );
+        // This test targets download failure, not provider version resolution.
+        // A resolved URL keeps the fake project from reaching the real API.
+        candidate.download_url = "https://example.invalid/download_fail.jar".to_string();
 
         // Set download seam to return error
         {
