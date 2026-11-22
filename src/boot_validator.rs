@@ -1426,6 +1426,7 @@ mod tests {
         validator.validate_with_launch(&cfg, staging, spec).await
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn simulated_successful_boot() {
         // Script prints the ready signal then waits for "stop"
@@ -1446,6 +1447,7 @@ done
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn simulated_process_exits_before_ready() {
         let script = r#"#!/bin/bash
@@ -1459,6 +1461,7 @@ exit 1
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn simulated_timeout() {
         // Script sleeps forever without printing ready
@@ -1478,6 +1481,7 @@ done
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn simulated_ready_then_force_kill() {
         // Script prints ready but ignores "stop" entirely
@@ -1498,6 +1502,7 @@ sleep 60
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn simulated_output_cap_no_oom() {
         // Script spams output then prints ready
@@ -1520,6 +1525,7 @@ done
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn simulated_overlay_cleaned_by_guard_after_success() {
         // Tests that ValidationOverlayGuard (used by do_validate) cleans up
@@ -1584,6 +1590,7 @@ done
         assert!(restored.contains("level-name=myworld"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn simulated_oom_detection() {
         let script = r#"#!/bin/bash
@@ -1652,6 +1659,7 @@ sleep 60
         assert!(staging.join("myworld").exists());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_and_reaps_child() {
         // Script sleeps forever — timeout should kill it
@@ -1985,6 +1993,7 @@ done
 
     // ── Phase 3E.1: Validation log cleanup on success ──────────────
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn success_removes_validation_latest_log() {
         let script = r#"#!/bin/bash

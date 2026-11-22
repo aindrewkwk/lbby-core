@@ -594,14 +594,14 @@ async fn remote_command_response(
 
     let state = app.state();
     let mut srv = state.server.lock().await;
-    let Some(stdin) = srv.stdin.as_mut() else {
+    if srv.stdin.is_none() {
         return json_response(
             409,
             &serde_json::json!({ "error": "Server is not running" }),
         );
-    };
+    }
 
-    match stdin.write_all(format!("{}\n", cmd).as_bytes()).await {
+    match crate::server::write_server_input(&mut srv.stdin, format!("{}\n", cmd).as_bytes()).await {
         Ok(_) => json_response(200, &serde_json::json!({ "ok": true })),
         Err(e) => json_response(500, &serde_json::json!({ "error": e.to_string() })),
     }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
 
 use crate::app_state::AppEventSender;
@@ -18,6 +18,65 @@ use crate::stats::ServerStats;
 
 const RESTART_WINDOW_SECS: u64 = 300;
 const MAX_RESTARTS_IN_WINDOW: usize = 3;
+
+async fn read_console_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    if reader.take(64 * 1024).read_until(b'\n', &mut bytes).await? == 0 { return Ok(None); }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') { bytes.pop(); }
+    }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+pub(crate) async fn write_server_input(input: &mut Option<ChildStdin>, bytes: &[u8]) -> std::io::Result<()> {
+    let result = match input.as_mut() {
+        Some(stdin) => match tokio::time::timeout(std::time::Duration::from_secs(3), stdin.write_all(bytes)).await {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Server did not accept the command in time")),
+        },
+        None => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Server stdin is not available")),
+    };
+    if result.is_err() { *input = None; }
+    result
+}
+
+#[cfg(test)]
+mod console_io_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reader_survives_invalid_utf8_and_bounds_long_lines() {
+        let mut input = vec![b'x'; 150_000];
+        input.extend_from_slice(b"\ninvalid \xff\nnext\n");
+        let mut reader = BufReader::new(&input[..]);
+        let mut chars = 0;
+        while chars < 150_000 {
+            let line = read_console_line(&mut reader).await.unwrap().unwrap();
+            assert!(line.len() <= 64 * 1024);
+            chars += line.len();
+        }
+        assert_eq!(read_console_line(&mut reader).await.unwrap().as_deref(), Some("invalid �"));
+        assert_eq!(read_console_line(&mut reader).await.unwrap().as_deref(), Some("next"));
+        assert_eq!(read_console_line(&mut reader).await.unwrap(), None);
+    }
+
+    #[test]
+    #[ignore]
+    fn child_that_does_not_read() { std::thread::sleep(std::time::Duration::from_secs(8)); }
+
+    #[tokio::test]
+    async fn unresponsive_child_input_times_out_and_closes_pipe() {
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "server::console_io_tests::child_that_does_not_read", "--ignored"])
+            .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let mut input = child.stdin.take();
+        let error = write_server_input(&mut input, &vec![b'x'; 4 * 1024 * 1024]).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(input.is_none());
+        child.kill().await.unwrap();
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -375,7 +434,6 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
     let stdout = child.stdout.take().ok_or("No stdout")?;
     let stderr = child.stderr.take().ok_or("No stderr")?;
     let pid = child.id();
-    drop(child); // Release the child handle — streams are taken, process runs independently
 
     {
         let state = app.state();
@@ -401,9 +459,18 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
     // and feeds the console buffer.
     let app3 = app.clone();
     tokio::spawn(async move {
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let line = match read_console_line(&mut reader).await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(error) => {
+                    let msg = format!("[lbby] Error reading server stdout: {}", error);
+                    app3.state().push_console_line(msg.clone());
+                    app3.emit("mc-line", &msg).ok();
+                    break;
+                }
+            };
             if line.contains("Done") && line.contains("For help") {
                 let s = app3.state();
                 let mut srv = s.server.lock().await;
@@ -440,12 +507,12 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
             if let Some((login_name, ip)) = parse_player_login_ip(&line) {
                 #[cfg(feature = "sqlite")]
                 {
-                    let _ = crate::player_stats::record_player_ip(
-                        app3.clone(),
-                        login_name.clone(),
-                        ip.clone(),
-                    )
-                    .await;
+                    let app_ip = app3.clone();
+                    let player = login_name.clone();
+                    let player_ip = ip.clone();
+                    tokio::spawn(async move {
+                        let _ = crate::player_stats::record_player_ip(app_ip, player, player_ip).await;
+                    });
                 }
                 app3.emit(
                     "player-ip-update",
@@ -490,23 +557,39 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
             }
             app3.emit("mc-line", &line).ok();
         }
-        // Stream ended — server process exited
+        // EOF does not mean the child has exited; its wait task owns lifecycle.
+        let s = app3.state();
+        let current = { let srv = s.server.lock().await; pid.is_some() && srv.pid == pid && srv.status == ServerStatus::Running };
+        if current {
+            let msg = "[lbby] Server stdout closed; live console output is unavailable. The process is still being monitored.".to_string();
+            s.push_console_line(msg.clone());
+            app3.emit("mc-line", &msg).ok();
+        }
+    });
+
+    let app3 = app.clone();
+    tokio::spawn(async move {
+        if let Err(error) = child.wait().await {
+            let msg = format!("[lbby] Failed to monitor server process: {}", error);
+            app3.state().push_console_line(msg.clone());
+            app3.emit("mc-line", &msg).ok();
+            return;
+        }
         let s = app3.state();
         let (was_unexpected, captured_profile_id, captured_server_dir, captured_generation) = {
-            let srv = s.server.lock().await;
-            (
+            let mut srv = s.server.lock().await;
+            if srv.pid != pid { return; }
+            let previous = (
                 !srv.stop_requested,
                 srv.profile_id.clone(),
                 srv.server_dir.clone(),
                 srv.restart_generation,
-            )
-        };
-        {
-            let mut srv = s.server.lock().await;
+            );
             srv.status = ServerStatus::Stopped;
             srv.stdin = None;
             srv.pid = None;
-        }
+            previous
+        };
         app3.emit("server-status", ServerStatus::Stopped).ok();
         s.push_console_line("[lbby] Server stopped".to_string());
         // Use captured server_dir for PID cleanup (not active profile)
@@ -581,9 +664,18 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
     // Spawn stderr reader task
     let app2 = app.clone();
     tokio::spawn(async move {
-        let reader = BufReader::new(stderr);
-        let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        let mut reader = BufReader::new(stderr);
+        loop {
+            let line = match read_console_line(&mut reader).await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(error) => {
+                    let msg = format!("[lbby] Error reading server stderr: {}", error);
+                    app2.state().push_console_line(msg.clone());
+                    app2.emit("mc-line", &msg).ok();
+                    break;
+                }
+            };
             let formatted = format!("[stderr] {}", line);
             let s = app2.state();
             s.push_console_line(formatted.clone());
@@ -677,10 +769,8 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
                         break;
                     }
                     if srv.status == ServerStatus::Running {
-                        if let Some(stdin) = &mut srv.stdin {
-                            let _ =
-                                tokio::io::AsyncWriteExt::write_all(stdin, cmd_bytes.as_bytes())
-                                    .await;
+                        if srv.stdin.is_some() {
+                            let _ = write_server_input(&mut srv.stdin, cmd_bytes.as_bytes()).await;
                         }
                     }
                 }
@@ -739,17 +829,8 @@ pub async fn send_command(
 ) -> Result<(), String> {
     let state = app.state();
     let mut srv = state.server.lock().await;
-    if let Some(stdin) = &mut srv.stdin {
-        stdin
-            .write_all(format!("{}\n", cmd).as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    } else if srv.status == ServerStatus::Running {
-        Err("Server stdin is not available".to_string())
-    } else {
-        Err("Server is not running".to_string())
-    }
+    if srv.status != ServerStatus::Running { return Err("Server is not running".to_string()); }
+    write_server_input(&mut srv.stdin, format!("{}\n", cmd).as_bytes()).await.map_err(|e| e.to_string())
 }
 
 // ── Internal: graceful-or-force stop ───────────────────────────────────────
@@ -770,12 +851,11 @@ async fn graceful_or_force_stop_server(
         match srv.status {
             ServerStatus::Running | ServerStatus::Starting => {
                 srv.stop_requested = true;
-                if let Some(stdin) = &mut srv.stdin {
+                if srv.stdin.is_some() {
                     if cfg.is_terraria() {
-                        stdin.write_all(b"save\n").await.ok();
-                        stdin.write_all(b"exit\n").await.ok();
+                        let _ = write_server_input(&mut srv.stdin, b"save\nexit\n").await;
                     } else {
-                        stdin.write_all(b"stop\n").await.ok();
+                        let _ = write_server_input(&mut srv.stdin, b"stop\n").await;
                     }
                 }
                 srv.status = ServerStatus::Stopping;
@@ -3059,9 +3139,8 @@ pub async fn do_pregenerate_chunks(
         {
             let mut srv = s.server.lock().await;
             if srv.status == ServerStatus::Running {
-                if let Some(stdin) = &mut srv.stdin {
-                    let _ =
-                        tokio::io::AsyncWriteExt::write_all(stdin, b"forceload remove all\n").await;
+                if srv.stdin.is_some() {
+                    let _ = write_server_input(&mut srv.stdin, b"forceload remove all\n").await;
                 }
             }
         }
@@ -3124,11 +3203,7 @@ async fn run_pregen(
             let cmd = format!("forceload add {} {} {} {}\n", x, z, x_end, z_end);
             {
                 let mut srv = s.server.lock().await;
-                if let Some(stdin) = &mut srv.stdin {
-                    tokio::io::AsyncWriteExt::write_all(stdin, cmd.as_bytes())
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
+                write_server_input(&mut srv.stdin, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
             }
 
             let batch_chunks = ((x_end - x + 1) as u32) * ((z_end - z + 1) as u32);
@@ -3146,9 +3221,8 @@ async fn run_pregen(
 
             if completed.is_multiple_of(1024) {
                 let mut srv = s.server.lock().await;
-                if let Some(stdin) = &mut srv.stdin {
-                    let _ =
-                        tokio::io::AsyncWriteExt::write_all(stdin, b"forceload remove all\n").await;
+                if srv.stdin.is_some() {
+                    let _ = write_server_input(&mut srv.stdin, b"forceload remove all\n").await;
                 }
             }
 
