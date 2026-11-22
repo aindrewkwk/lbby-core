@@ -203,6 +203,10 @@ pub fn start_server(
     app: Arc<AppEventSender>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
     Box::pin(async move {
+        let state = app.state();
+        let _operation = crate::app_state::OperationGuard::acquire(
+            &state.current_operation, crate::app_state::OperationKind::Starting,
+        ).await?;
         // Guard: only start from Stopped or Error states
         {
             let state = app.state();

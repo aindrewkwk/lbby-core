@@ -463,9 +463,10 @@ pub async fn do_pregenerate_chunks(
 }
 
 /// Stub: kill server and playit for remote control.
-pub async fn remote_kill_server_and_playit(app: &Arc<AppEventSender>) {
-    let _ = crate::server::stop_server(app.clone()).await;
-    let _ = crate::playit::stop(app.clone()).await;
+pub async fn remote_kill_server_and_playit(app: &Arc<AppEventSender>) -> Result<(), String> {
+    crate::server::stop_server(app.clone()).await?;
+    crate::playit::stop(app.clone()).await?;
+    Ok(())
 }
 
 /// Install a game server — delegates to the full implementation in server.rs.

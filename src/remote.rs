@@ -644,8 +644,10 @@ async fn remote_stop_server(app: std::sync::Arc<crate::app_state::AppEventSender
     // playit.gg tunnel. The LAN remote service we're answering this request
     // on stays up; Cloudflare quick-tunnel (also part of the remote-control
     // path) is intentionally left running.
-    crate::remote_kill_server_and_playit(&app).await;
-    json_response(200, &serde_json::json!({ "ok": true }))
+    match crate::remote_kill_server_and_playit(&app).await {
+        Ok(()) => json_response(200, &serde_json::json!({ "ok": true })),
+        Err(error) => json_response(409, &serde_json::json!({ "error": error })),
+    }
 }
 
 async fn remote_restart_server(app: std::sync::Arc<crate::app_state::AppEventSender>) -> String {
@@ -710,6 +712,16 @@ async fn remote_backup_create(
     app: std::sync::Arc<crate::app_state::AppEventSender>,
     body: Vec<u8>,
 ) -> String {
+    let state = app.state();
+    let _guard = match crate::app_state::OperationGuard::acquire(
+        &state.current_operation, crate::app_state::OperationKind::BackingUp,
+    ).await {
+        Ok(guard) => guard,
+        Err(error) => return json_response(409, &serde_json::json!({ "error": error })),
+    };
+    if state.server.lock().await.status != ServerStatus::Stopped {
+        return json_response(409, &serde_json::json!({ "error": "Server must be stopped before creating a backup" }));
+    }
     // Optional body: { "include_logs": bool }. Default false (matches UI default).
     let include_logs = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
@@ -1564,4 +1576,30 @@ fn json_response(status: u16, value: &serde_json::Value) -> String {
         body.len(),
         body
     )
+}
+
+#[cfg(test)]
+mod backup_safety_tests {
+    use super::*;
+    use crate::app_state::{AppEventSender, AppState, OperationGuard, OperationKind};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn remote_backup_rejects_running_server() {
+        let state = Arc::new(AppState::new());
+        state.server.lock().await.status = ServerStatus::Running;
+        let app = Arc::new(AppEventSender::new(state));
+        let response = remote_backup_create(app, Vec::new()).await;
+        assert!(response.starts_with("HTTP/1.1 409"));
+        assert!(response.contains("Server must be stopped"));
+    }
+
+    #[tokio::test]
+    async fn remote_backup_and_server_start_obey_operation_guard() {
+        let state = Arc::new(AppState::new());
+        let app = Arc::new(AppEventSender::new(state.clone()));
+        let _guard = OperationGuard::acquire(&state.current_operation, OperationKind::BackingUp).await.unwrap();
+        assert!(remote_backup_create(app.clone(), Vec::new()).await.starts_with("HTTP/1.1 409"));
+        assert!(crate::server::start_server(app).await.is_err());
+    }
 }

@@ -63,6 +63,20 @@ mod backup_creation_tests {
         assert_eq!(contents, "world data");
     }
     #[test]
+    fn backup_can_be_restored_to_a_separate_server_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = dir.path().join("server");
+        std::fs::create_dir_all(server.join("world/region")).unwrap();
+        std::fs::write(server.join("server.properties"), b"motd=test").unwrap();
+        std::fs::write(server.join("world/region/r.0.0.mca"), b"saved-world").unwrap();
+        let archive = dir.path().join("backup.zip");
+        create_server_backup(&sender(), &server, &archive, false).unwrap();
+        let restored = dir.path().join("restored");
+        assert_eq!(restore_server_backup(&sender(), &archive, &restored).unwrap(), 2);
+        assert_eq!(std::fs::read(restored.join("server.properties")).unwrap(), b"motd=test");
+        assert_eq!(std::fs::read(restored.join("world/region/r.0.0.mca")).unwrap(), b"saved-world");
+    }
+    #[test]
     fn publish_failure_removes_temporary_archive() {
         let dir = tempfile::tempdir().unwrap();
         let server = dir.path().join("server");
