@@ -281,13 +281,21 @@ pub async fn sync(
     let app_handle = app.clone();
     let token = cfg.remote_control_token.clone();
     let handle = tokio::spawn(async move {
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
         loop {
             let Ok((stream, _peer)) = listener.accept().await else {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                continue;
+            };
+            let Ok(permit) = permits.clone().try_acquire_owned() else {
+                // Refuse excess connections rather than accumulating tasks.
+                drop(stream);
                 continue;
             };
             let app_request = app_handle.clone();
             let token_request = token.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(10),
                     handle_connection(stream, app_request, token_request),

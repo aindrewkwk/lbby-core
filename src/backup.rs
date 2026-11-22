@@ -34,6 +34,48 @@ pub fn default_backup_filename() -> String {
 const SKIP_NAMES_ANYWHERE: &[&str] = &[".DS_Store", "session.lock", "Thumbs.db"];
 const SKIP_TOPLEVEL_DIRS: &[&str] = &[".git", "node_modules", "target"];
 
+#[cfg(test)]
+mod backup_creation_tests {
+    use super::*;
+    fn sender() -> std::sync::Arc<crate::app_state::AppEventSender> {
+        std::sync::Arc::new(crate::app_state::AppEventSender::new(std::sync::Arc::new(crate::app_state::AppState::new())))
+    }
+    #[test]
+    fn refuses_backup_inside_server_without_creating_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("backup.zip");
+        let err = create_server_backup(&sender(), dir.path(), &dest, false).unwrap_err();
+        assert!(err.contains("outside the server directory"));
+        assert!(!dest.exists());
+    }
+    #[test]
+    fn creates_a_readable_zip_outside_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = dir.path().join("server");
+        std::fs::create_dir(&server).unwrap();
+        std::fs::write(server.join("level.dat"), b"world data").unwrap();
+        let dest = dir.path().join("backup.zip");
+        let (count, _) = create_server_backup(&sender(), &server, &dest, false).unwrap();
+        assert_eq!(count, 1);
+        let mut zip = zip::ZipArchive::new(File::open(dest).unwrap()).unwrap();
+        let mut contents = String::new();
+        zip.by_name("level.dat").unwrap().read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "world data");
+    }
+    #[test]
+    fn publish_failure_removes_temporary_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = dir.path().join("server");
+        std::fs::create_dir(&server).unwrap();
+        std::fs::write(server.join("level.dat"), b"world data").unwrap();
+        let dest = dir.path().join("backup.zip");
+        std::fs::create_dir(&dest).unwrap();
+        assert!(create_server_backup(&sender(), &server, &dest, false).is_err());
+        assert!(dest.is_dir());
+        assert!(!std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with(".lbby-backup-")));
+    }
+}
+
 pub fn create_server_backup(
     app: &std::sync::Arc<crate::app_state::AppEventSender>,
     server_path: &Path,
@@ -53,10 +95,21 @@ pub fn create_server_backup(
         ));
     }
 
-    if let Some(parent) = dest_zip.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create dest dir: {}", e))?;
+    let parent = dest_zip.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create dest dir: {}", e))?;
+    let server_root = server_path.canonicalize().map_err(|e| format!("Cannot resolve server path: {}", e))?;
+    let dest_parent = parent.canonicalize().map_err(|e| format!("Cannot resolve backup directory: {}", e))?;
+    if dest_parent.starts_with(&server_root) {
+        return Err("Backup destination must be outside the server directory".to_string());
     }
-    let file = File::create(dest_zip).map_err(|e| format!("Cannot create zip: {}", e))?;
+    // Write next to the destination and publish only a completed archive.
+    // This preserves any prior backup if creating the new one fails.
+    let temp_path = dest_parent.join(format!(".lbby-backup-{}.tmp", uuid::Uuid::new_v4()));
+    struct TempBackup(PathBuf);
+    impl Drop for TempBackup { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
+    let temp = TempBackup(temp_path);
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp.0)
+        .map_err(|e| format!("Cannot create temporary zip: {}", e))?;
     let mut zip = ZipWriter::new(file);
 
     let opts = SimpleFileOptions::default()
@@ -80,8 +133,10 @@ pub fn create_server_backup(
         app,
     )?;
 
-    zip.finish()
-        .map_err(|e| format!("Failed to finalize zip: {}", e))?;
+    let file = zip.finish().map_err(|e| format!("Failed to finalize zip: {}", e))?;
+    file.sync_all().map_err(|e| format!("Failed to flush zip: {}", e))?;
+    drop(file);
+    std::fs::rename(&temp.0, dest_zip).map_err(|e| format!("Cannot publish backup: {}", e))?;
 
     // Final progress emit
     app.emit(
@@ -156,7 +211,8 @@ fn walk_and_zip<W: Write + std::io::Seek>(
                 .map_err(|e| format!("add_directory {}: {}", zip_path, e))?;
             walk_and_zip(base, &entry_rel, zip, opts, include_logs, false, state, app)?;
         } else if ft.is_file() {
-            zip.start_file(&zip_path, opts)
+            let file_len = entry.metadata().map_err(|e| format!("metadata {}: {}", entry.path().display(), e))?.len();
+            zip.start_file(&zip_path, opts.large_file(file_len >= u32::MAX as u64))
                 .map_err(|e| format!("start_file {}: {}", zip_path, e))?;
             let mut f = File::open(entry.path())
                 .map_err(|e| format!("open {}: {}", entry.path().display(), e))?;

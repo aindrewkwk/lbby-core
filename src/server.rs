@@ -700,7 +700,7 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
             let s = app_stats.state();
             let server_pid = {
                 let srv = s.server.lock().await;
-                if srv.status == ServerStatus::Stopped {
+                if pid.is_none() || srv.pid != pid || srv.status == ServerStatus::Stopped {
                     break;
                 }
                 match srv.pid {
@@ -711,6 +711,18 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
             if let Some((cpu, ram_mb, disk_r, disk_w, disk_used, disk_total)) =
                 poller.sample(server_pid, &server_dir_for_stats)
             {
+                let sizes = if tick.is_multiple_of(5) {
+                    let root = server_dir_for_stats.clone();
+                    let folder = mods_folder.clone();
+                    let terraria = cfg.is_terraria();
+                    tokio::task::spawn_blocking(move || {
+                        let mods = crate::stats::count_mods(&root.join(folder));
+                        let world = if terraria { root.join("Worlds") } else { root.join(crate::config::resolve_world_name(&root)) };
+                        (mods, crate::stats::dir_size_mb(&world))
+                    }).await.ok()
+                } else { None };
+                let srv = s.server.lock().await;
+                if srv.pid != pid || srv.status == ServerStatus::Stopped { break; }
                 let mut st = s.stats.lock().await;
                 st.cpu_percent = cpu;
                 st.ram_used_mb = ram_mb;
@@ -720,18 +732,9 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
                 st.disk_total_mb = disk_total;
                 st.uptime_seconds = started_at.elapsed().as_secs();
                 st.loader_label = loader_label.clone();
-                if tick.is_multiple_of(5) {
-                    st.mods_count =
-                        crate::stats::count_mods(&server_dir_for_stats.join(&mods_folder));
-                    let world_dir = if cfg.is_terraria() {
-                        server_dir_for_stats.join("Worlds")
-                    } else {
-                        let world_name = crate::config::resolve_world_name(&server_dir_for_stats);
-                        server_dir_for_stats.join(&world_name)
-                    };
-                    st.world_size_mb = crate::stats::dir_size_mb(&world_dir);
-                }
+                if let Some((mods, size)) = sizes { st.mods_count = mods; st.world_size_mb = size; }
                 tick = tick.wrapping_add(1);
+                drop(srv);
                 app_stats.emit("server-stats", st.clone()).ok();
             }
         }
@@ -765,12 +768,17 @@ pub async fn do_start_server(app: Arc<AppEventSender>) -> Result<(), String> {
                 let s = app_tps.state();
                 {
                     let mut srv = s.server.lock().await;
-                    if srv.status == ServerStatus::Stopped {
+                    if pid.is_none() || srv.pid != pid || srv.status == ServerStatus::Stopped {
                         break;
                     }
                     if srv.status == ServerStatus::Running {
                         if srv.stdin.is_some() {
-                            let _ = write_server_input(&mut srv.stdin, cmd_bytes.as_bytes()).await;
+                            if let Err(error) = write_server_input(&mut srv.stdin, cmd_bytes.as_bytes()).await {
+                                let msg = format!("[lbby] Server console input is unavailable: {}. Commands cannot be sent; check the server before stopping it.", error);
+                                s.push_console_line(msg.clone());
+                                app_tps.emit("mc-line", &msg).ok();
+                                break;
+                            }
                         }
                     }
                 }
@@ -794,14 +802,12 @@ pub async fn stop_server(app: Arc<crate::app_state::AppEventSender>) -> Result<(
             return Err("Server is not running".to_string());
         }
     }
-    graceful_or_force_stop_server(&app, 10).await;
-    Ok(())
+    graceful_or_force_stop_server(&app, 10).await
 }
 
 /// Hard-kill variant — only waits 3 seconds before force-killing.
 pub async fn force_stop_server(app: Arc<crate::app_state::AppEventSender>) -> Result<(), String> {
-    graceful_or_force_stop_server(&app, 3).await;
-    Ok(())
+    graceful_or_force_stop_server(&app, 3).await
 }
 
 /// Restart the server: stop, wait a moment, then start again.
@@ -841,7 +847,7 @@ pub async fn send_command(
 async fn graceful_or_force_stop_server(
     app: &Arc<crate::app_state::AppEventSender>,
     grace_secs: u64,
-) {
+) -> Result<(), String> {
     let state = app.state();
 
     // Phase 1: request graceful stop (if running)
@@ -875,7 +881,7 @@ async fn graceful_or_force_stop_server(
     };
 
     if pid_to_watch.is_none() {
-        return;
+        return if state.server.lock().await.status == ServerStatus::Stopped { Ok(()) } else { Err("No tracked server process is available to stop".to_string()) };
     }
 
     state.push_console_line("[lbby] Server stopping...".to_string());
@@ -889,14 +895,15 @@ async fn graceful_or_force_stop_server(
             srv.status == ServerStatus::Stopped || srv.pid.is_none()
         };
         if stopped {
-            return;
+            return Ok(());
         }
     }
 
     // Phase 3: force-kill the stuck process tree
     let stuck_pid = match state.server.lock().await.pid {
-        Some(p) => p,
-        None => return,
+        Some(p) if Some(p) == pid_to_watch => p,
+        Some(_) => return Err("Server process changed while stopping; refusing to kill it".to_string()),
+        None => return Ok(()),
     };
     eprintln!(
         "[lbby] graceful stop timed out after {}s — force-killing PID {} and descendants",
@@ -912,28 +919,15 @@ async fn graceful_or_force_stop_server(
         let mut cmd = tokio::process::Command::new("taskkill");
         cmd.args(["/PID", &stuck_pid.to_string(), "/T", "/F"]);
         crate::helpers::hide_child_window(&mut cmd);
-        cmd.output().await.ok();
+        if let Err(e) = cmd.output().await { return Err(format!("Failed to launch taskkill: {}", e)); }
     }
-
-    // Phase 4: clear stale session lock so next start can boot
-    let cfg = crate::config::load_config();
-    if cfg.is_minecraft() {
-        let server_dir = std::path::PathBuf::from(&cfg.server_path);
-        let world_name = crate::config::resolve_world_name(&server_dir);
-        let lock = server_dir.join(&world_name).join("session.lock");
-        if lock.exists() {
-            std::fs::remove_file(&lock).ok();
-        }
+    for _ in 0..20 {
+        let srv = state.server.lock().await;
+        if srv.pid != Some(stuck_pid) || srv.status == ServerStatus::Stopped { return Ok(()); }
+        drop(srv);
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
     }
-
-    // Phase 5: reset state
-    let mut srv = state.server.lock().await;
-    srv.status = ServerStatus::Stopped;
-    srv.stdin = None;
-    srv.pid = None;
-    drop(srv);
-    state.push_console_line("[lbby] Server stopped".to_string());
-    app.emit("server-status", ServerStatus::Stopped).ok();
+    Err(format!("Could not confirm that server process {} stopped; its world remains locked", stuck_pid))
 }
 
 // ── Extracted generic server functions ────────────────────────────────────────

@@ -75,14 +75,14 @@ impl StatsPoller {
         // `bash run.sh nogui` (Forge / NeoForge) or `java -jar server.jar`
         // (Vanilla / Paper / Fabric). If the PID got recycled by the OS for an
         // unrelated process (e.g. a cloudflared zombie) the command line
-        // won't match any of those, and we should report no stats — better
+        // won't match any of those, and we should report no stats â€” better
         // than rendering the dashboard with someone else's CPU usage.
         let root = Pid::from_u32(root_pid);
         // PID-reuse guard. Goal: reject obvious mismatches (PID recycled into
         // an unrelated process) without false-rejecting legitimate
-        // `bash run.sh` — sysinfo's `cmd()` returns empty for those on macOS.
+        // `bash run.sh` â€” sysinfo's `cmd()` returns empty for those on macOS.
         // Strategy: only reject when we have *positive evidence* the process
-        // is something else. Empty/unknown signals → trust the PID, since the
+        // is something else. Empty/unknown signals â†’ trust the PID, since the
         // wait task would flip status to Stopped if it had actually exited.
         let still_ours = match self.sys.process(root) {
             Some(p) => {
@@ -242,39 +242,32 @@ pub fn count_mods(dir: &Path) -> u32 {
 
 /// Recursively sum the size of all files in a directory (in MB).
 pub fn dir_size_mb(dir: &Path) -> u64 {
-    if !dir.exists() {
-        return 0;
-    }
-    let mut total: u64 = 0;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Ok(meta) = path.metadata() {
-                if meta.is_file() {
-                    total += meta.len();
-                } else if meta.is_dir() {
-                    total += dir_size_mb_bytes(&path);
-                }
-            }
-        }
-    }
+    // Never traverse symlinks or junctions: they can point outside the world
+    // or back into it, and make a recurring stats poll extremely expensive.
+    let total = walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| entry.metadata().ok())
+        .fold(0u64, |sum, meta| sum.saturating_add(meta.len()));
     total / 1024 / 1024
 }
 
-/// Internal helper that returns bytes instead of MB (avoids double division).
-fn dir_size_mb_bytes(dir: &Path) -> u64 {
-    let mut total: u64 = 0;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Ok(meta) = path.metadata() {
-                if meta.is_file() {
-                    total += meta.len();
-                } else if meta.is_dir() {
-                    total += dir_size_mb_bytes(&path);
-                }
-            }
-        }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn world_size_counts_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("region"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+        assert_eq!(super::dir_size_mb(dir.path()), 2);
     }
-    total
+
+    #[cfg(unix)]
+    #[test]
+    fn world_size_does_not_follow_symlink_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+        assert_eq!(super::dir_size_mb(dir.path()), 0);
+    }
 }
