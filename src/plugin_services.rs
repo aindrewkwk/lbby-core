@@ -1711,11 +1711,7 @@ pub async fn install_plugin_from_provider(
         candidate
     };
 
-    // 1. Download to temp (with test seam)
-    let temp_dir = std::env::temp_dir().join("lbby-plugin-install");
-    std::fs::create_dir_all(&temp_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
-    let temp_path = temp_dir.join(&candidate_ref.filename);
-
+    // 1. Download to an installation-owned temporary file.
     let jar_bytes: Vec<u8>;
     #[cfg(test)]
     {
@@ -1730,8 +1726,8 @@ pub async fn install_plugin_from_provider(
     {
         jar_bytes = download_from_url(&candidate_ref.download_url).await?;
     }
-    std::fs::write(&temp_path, &jar_bytes)
-        .map_err(|e| format!("Failed to write temp file: {}", e))?;
+    let temp_file = create_plugin_temp_file(&jar_bytes)?;
+    let temp_path = &temp_file.0;
 
     // 2. Verify provider hash — algorithm-aware, hard failure on mismatch
     if let Err(e) = verify_provider_hash(&temp_path, &candidate_ref.hashes) {
@@ -2218,13 +2214,25 @@ async fn download_from_url(url: &str) -> Result<Vec<u8>, String> {
     Ok(bytes.to_vec())
 }
 
-// ── Test seam: install from pre-downloaded bytes ─────────────────────
+// Each installation owns its staging file, including on early return or error.
+struct PluginTempFile(std::path::PathBuf);
+impl Drop for PluginTempFile {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+}
 
-/// Synchronous install pipeline from pre-downloaded bytes.
-/// This is the test seam — no HTTP calls, fully deterministic.
-///
-/// Pipeline: verify hash → parse JAR → reconcile identity → check duplicate →
-/// check identity conflict → write to plugins dir → save receipt.
+fn create_plugin_temp_file(bytes: &[u8]) -> Result<PluginTempFile, String> {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("lbby-plugin-install");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
+    let path = dir.join(format!("{}.jar", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
+        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+    let temp = PluginTempFile(path);
+    file.write_all(bytes).map_err(|e| format!("Failed to write temp file: {}", e))?;
+    Ok(temp)
+}
+
+// Test seam: install from pre-downloaded bytes without HTTP calls.
 fn install_plugin_from_bytes(
     candidate: &PluginCandidate,
     bytes: &[u8],
@@ -2250,11 +2258,9 @@ fn install_plugin_from_bytes(
 
     let plugin_dir = plugins_dir(server_path)?;
 
-    // 1. Write bytes to temp
-    let temp_dir = std::env::temp_dir().join("lbby-plugin-install");
-    std::fs::create_dir_all(&temp_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
-    let temp_path = temp_dir.join(&candidate.filename);
-    std::fs::write(&temp_path, bytes).map_err(|e| format!("Failed to write temp file: {}", e))?;
+    // 1. Write to an installation-owned temporary file.
+    let temp_file = create_plugin_temp_file(bytes)?;
+    let temp_path = &temp_file.0;
 
     // 2. Verify provider hash — algorithm-aware, hard failure on mismatch
     if let Err(e) = verify_provider_hash(&temp_path, &candidate.hashes) {
@@ -3207,6 +3213,19 @@ mod tests {
         }
         zip.finish().expect("finish zip");
         tmp
+    }
+
+    #[test]
+    fn plugin_staging_files_are_isolated_and_cleaned_up() {
+        let first = create_plugin_temp_file(b"first").unwrap();
+        let second = create_plugin_temp_file(b"second").unwrap();
+        assert_ne!(first.0, second.0);
+        assert_eq!(std::fs::read(&first.0).unwrap(), b"first");
+        assert_eq!(std::fs::read(&second.0).unwrap(), b"second");
+        let path = first.0.clone();
+        drop(first);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&second.0).unwrap(), b"second");
     }
 
     // 1. Basic plugin.yml parsing
@@ -4761,7 +4780,7 @@ mod tests {
             &crate::config::ServerType::Paper,
             None,
         );
-        assert!(matches!(result, Ok(PluginInstallResult::Installed(_))));
+        assert!(matches!(result, Ok(PluginInstallResult::Installed(_))), "unexpected result: {result:?}");
     }
 
     #[test]
