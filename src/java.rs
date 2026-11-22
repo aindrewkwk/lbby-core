@@ -45,7 +45,7 @@ pub fn resolve_java_requirement(
                 20 | 21 => Some(21),
                 _ => None,
             }
-        } else if minor == 26 && (1..=2).contains(&patch) {
+        } else if minor == 26 && (1..=3).contains(&patch) {
             Some(25)
         } else {
             None
@@ -584,7 +584,7 @@ mod java_resolver_tests {
             required_java_for_mc_with_loader("26.2", Some("NeoForge")),
             Some(25)
         );
-        for version in ["27.1", "1.22.1", "26.3", "27.foo", "unknown"] {
+        for version in ["27.1", "1.22.1", "26.4", "27.foo", "unknown"] {
             assert_eq!(
                 required_java_for_mc_with_loader(version, Some("NeoForge")),
                 None
@@ -614,6 +614,10 @@ mod java_resolver_tests {
         assert_eq!(required_java_for_mc("1.20.6"), Some(21));
         assert_eq!(required_java_for_mc("1.21.1"), Some(21));
         assert_eq!(required_java_for_mc("26.2"), Some(25));
+        // Mojang's 26.3 release metadata specifies javaVersion.majorVersion = 25.
+        assert_eq!(required_java_for_mc("26.3"), Some(25));
+        assert_eq!(required_java_for_mc_with_loader("26.3", Some("Paper")), Some(25));
+        assert_eq!(required_java_for_mc_with_loader("26.3", Some("NeoForge")), Some(25));
     }
 
     #[test]

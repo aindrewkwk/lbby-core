@@ -45,6 +45,11 @@ struct PaperProjectV3 {
 #[derive(Debug, Serialize, Deserialize)]
 struct PaperBuildV3 {
     id: u32,
+    channel: String,
+}
+
+fn latest_stable_build(builds: &[PaperBuildV3]) -> Option<u32> {
+    builds.iter().filter(|build| build.channel == "STABLE").map(|build| build.id).max()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -152,11 +157,10 @@ pub async fn fetch_paper_builds(mc_version: String) -> Result<Vec<LoaderVersion>
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    let latest = builds.last().map(|b| b.id).unwrap_or(0);
-    Ok(vec![LoaderVersion {
+    Ok(latest_stable_build(&builds).map(|latest| LoaderVersion {
         version: latest.to_string(),
         label: format!("{} (latest)", latest),
-    }])
+    }).into_iter().collect())
 }
 
 pub async fn fetch_forge_versions(mc_version: String) -> Result<Vec<LoaderVersion>, String> {
@@ -288,11 +292,10 @@ pub async fn fetch_folia_builds(mc_version: String) -> Result<Vec<LoaderVersion>
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    let latest = builds.last().map(|b| b.id).unwrap_or(0);
-    Ok(vec![LoaderVersion {
+    Ok(latest_stable_build(&builds).map(|latest| LoaderVersion {
         version: latest.to_string(),
         label: format!("{} (latest)", latest),
-    }])
+    }).into_iter().collect())
 }
 
 // ── Purpur versions ──────────────────────────────────────────────────────────
@@ -397,4 +400,15 @@ pub async fn fetch_sponge_forge_versions(mc_version: String) -> Result<Vec<Loade
         .collect();
     out.reverse();
     Ok(out)
+}
+
+#[cfg(test)]
+mod paper_build_selection_tests {
+    use super::*;
+    #[test]
+    fn selects_newest_stable_independent_of_api_order() {
+        let builds: Vec<PaperBuildV3> = serde_json::from_str(r#"[{"id":258,"channel":"STABLE"},{"id":259,"channel":"EXPERIMENTAL"},{"id":1,"channel":"STABLE"}]"#).unwrap();
+        assert_eq!(latest_stable_build(&builds), Some(258));
+        assert_eq!(latest_stable_build(&[]), None);
+    }
 }
