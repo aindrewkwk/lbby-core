@@ -77,6 +77,28 @@ mod backup_creation_tests {
         assert_eq!(std::fs::read(restored.join("world/region/r.0.0.mca")).unwrap(), b"saved-world");
     }
     #[test]
+    fn symbolic_link_does_not_produce_a_successful_incomplete_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = dir.path().join("server");
+        std::fs::create_dir(&server).unwrap();
+        let world = dir.path().join("world-data");
+        std::fs::create_dir(&world).unwrap();
+        let link = server.join("world");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&world, &link).unwrap();
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_dir(&world, &link) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(1314) {
+                eprintln!("Skipping symlink test: Windows does not grant symlink creation privileges");
+                return;
+            }
+            panic!("Could not create test symlink: {error}");
+        }
+        let dest = dir.path().join("backup.zip");
+        assert!(create_server_backup(&sender(), &server, &dest, false).unwrap_err().contains("symbolic link"));
+        assert!(!dest.exists());
+    }
+    #[test]
     fn publish_failure_removes_temporary_archive() {
         let dir = tempfile::tempdir().unwrap();
         let server = dir.path().join("server");
@@ -214,10 +236,11 @@ fn walk_and_zip<W: Write + std::io::Seek>(
             .file_type()
             .map_err(|e| format!("file_type {}: {}", entry.path().display(), e))?;
 
-        // Skip symlinks to prevent traversing into directories outside the
-        // server path (e.g., a symlinked world folder pointing to /).
+        // Silently skipping a linked world or plugin directory would publish
+        // an incomplete backup as successful. Refuse it rather than traverse
+        // outside the server or omit data without warning.
         if ft.is_symlink() {
-            continue;
+            return Err(format!("Cannot back up symbolic link: {}", entry.path().display()));
         }
 
         if ft.is_dir() {
@@ -258,7 +281,6 @@ fn walk_and_zip<W: Write + std::io::Seek>(
                 state.last_emit = std::time::Instant::now();
             }
         }
-        // Symlinks: ignored (avoid cycles, don't follow)
     }
     Ok(())
 }
