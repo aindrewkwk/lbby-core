@@ -1174,17 +1174,7 @@ fn extract_jar_path(line: &str) -> Option<PathBuf> {
         return None; // Reject path traversal
     }
 
-    // Reject Windows absolute paths that look system-related
-    if path_display.len() >= 2 {
-        let bytes = path_display.as_bytes();
-        if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-            // Windows absolute path like C:\...
-            // Only accept if it looks like a mod path (contains "mods")
-            if !path_display.to_lowercase().contains("mods") {
-                return None;
-            }
-        }
-    }
+    // Paths are only matched against the indexed staging JARs; never opened here.
 
     Some(p)
 }

@@ -2302,6 +2302,14 @@ mod tests {
         let symlink = mods.join("evil.jar");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside_jar, &symlink).unwrap();
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_file(&outside_jar, &symlink) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(1314) {
+                eprintln!("Skipping symlink test: Windows does not grant symlink creation privileges");
+                return;
+            }
+            panic!("Could not create test symlink: {error}");
+        }
 
         let result = validate_jar_containment(&symlink, &mods);
         assert!(result.is_err());
