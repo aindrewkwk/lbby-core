@@ -208,7 +208,17 @@ pub fn merge_properties_file(path: &Path, props: &HashMap<String, String>) -> Re
     let _guard = PROPERTIES_WRITE_LOCK
         .lock()
         .map_err(|_| "Properties write lock poisoned")?;
-    merge_locked(path, props, false).map(|_| ())
+    merge_locked(path, props, false)?;
+    // Confirm the on-disk file reflects the submitted patch before the UI
+    // reports success. Keep the writer lock until verification completes.
+    let written = read_properties_map(path)?;
+    for (key, value) in props {
+        let actual = written.get(key);
+        if actual != Some(value) && actual != Some(&escape_newlines(value)) {
+            return Err(format!("Cannot verify saved server.properties value for '{}'", key));
+        }
+    }
+    Ok(())
 }
 pub fn patch_existing_properties(
     path: &Path,
@@ -340,6 +350,18 @@ mod tests {
         assert_eq!(props["motd"], "B");
         assert_eq!(props["server-port"], "25565");
         assert_eq!(props["custom-key"], "foo");
+    }
+    #[test]
+    fn edited_patch_persists_without_overwriting_an_external_change() {
+        let (_dir, path) = fixture("# Server\nwhite-list=false\nsync-chunk-writes=true\nmotd=Initial\n");
+        let loaded = read_properties_map(&path).unwrap();
+        std::fs::write(&path, "# Server\nwhite-list=false\nsync-chunk-writes=true\nmotd=Changed elsewhere\n").unwrap();
+        assert_eq!(loaded["sync-chunk-writes"], "true");
+        merge_properties_file(&path, &HashMap::from([("sync-chunk-writes".into(), "false".into())])).unwrap();
+        let reloaded = read_properties_map(&path).unwrap();
+        assert_eq!(reloaded["sync-chunk-writes"], "false");
+        assert_eq!(reloaded["motd"], "Changed elsewhere");
+        assert_eq!(reloaded["white-list"], "false");
     }
     #[test]
     fn unknown_key_survives_known_property_save() {
