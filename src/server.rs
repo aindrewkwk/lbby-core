@@ -1150,6 +1150,7 @@ fn is_valid_player_name(s: &str) -> bool {
 pub fn parse_player_event(line: &str) -> Option<(String, bool)> {
     // Returns (name, is_join)
     let body = line.rsplit("]:").next()?.trim();
+    let body = body.strip_prefix("System chat: ").unwrap_or(body);
     if let Some(name) = body.strip_suffix(" joined the game") {
         let n = name.trim();
         if is_valid_player_name(n) {
@@ -3295,5 +3296,16 @@ mod install_tests {
         assert!(!profile_a.join("world-b.marker").exists());
         assert!(!profile_b.join("world-a.marker").exists());
         std::fs::remove_dir_all(root).ok();
+    }
+}
+
+#[cfg(test)]
+mod system_chat_player_tests {
+    use super::parse_player_event;
+    #[test]
+    fn minecraft_26_3_system_join_and_leave() {
+        assert_eq!(parse_player_event("[18:12:09 INFO]: System chat: BoShuViDai joined the game"), Some(("BoShuViDai".into(), true)));
+        assert_eq!(parse_player_event("[18:13:09 INFO]: System chat: BoShuViDai left the game"), Some(("BoShuViDai".into(), false)));
+        assert_eq!(parse_player_event("[18:13:09 INFO]: <Other> BoShuViDai joined the game"), None);
     }
 }

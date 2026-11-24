@@ -19,6 +19,7 @@ struct UsercacheEntry {
 
 struct UsercacheState {
     entries: Vec<UsercacheEntry>,
+    path: PathBuf,
     mtime: SystemTime,
 }
 
@@ -28,7 +29,7 @@ struct PlayerDatCache {
 }
 
 static USERCACHE: Mutex<Option<UsercacheState>> = Mutex::new(None);
-static PLAYER_CACHE: Mutex<Option<HashMap<String, PlayerDatCache>>> = Mutex::new(None);
+static PLAYER_CACHE: Mutex<Option<HashMap<PathBuf, PlayerDatCache>>> = Mutex::new(None);
 
 // ── Types returned to the frontend ──────────────────────────────────────────
 
@@ -151,7 +152,7 @@ fn resolve_uuid(name: &str, server_path: &Path) -> Result<String, String> {
     {
         let guard = USERCACHE.lock().unwrap();
         if let Some(ref state) = *guard {
-            if state.mtime == mtime {
+            if state.path == cache_path && state.mtime == mtime {
                 if let Some(entry) = state
                     .entries
                     .iter()
@@ -189,27 +190,14 @@ fn resolve_uuid(name: &str, server_path: &Path) -> Result<String, String> {
         }
     }
 
-    // Store in cache
+    let resolved = parsed.iter().find(|entry| entry.name.eq_ignore_ascii_case(name))
+        .map(|entry| entry.uuid.clone());
+    // Return the value from this file even if another profile is read in parallel.
     {
         let mut guard = USERCACHE.lock().unwrap();
-        *guard = Some(UsercacheState {
-            entries: parsed,
-            mtime,
-        });
+        *guard = Some(UsercacheState { entries: parsed, path: cache_path, mtime });
     }
-
-    // Lookup from cache
-    let guard = USERCACHE.lock().unwrap();
-    if let Some(ref state) = *guard {
-        if let Some(entry) = state
-            .entries
-            .iter()
-            .find(|e| e.name.eq_ignore_ascii_case(name))
-        {
-            return Ok(entry.uuid.clone());
-        }
-    }
-    Err(format!(
+    resolved.ok_or_else(|| format!(
         "Player '{}' not found in usercache.json. They must have joined the server at least once.",
         name
     ))
@@ -257,7 +245,9 @@ fn parse_inventory(items: &[fastnbt::Value]) -> Vec<InventorySlot> {
                 _ => return None,
             };
             let id = nbt_str(c, "id").unwrap_or_else(|| "unknown".into());
-            let count = nbt_i32(c, "count").unwrap_or(1);
+            // Older Minecraft versions store Count as an NBT byte; 1.20.5+
+            // uses the lowercase count integer.
+            let count = nbt_i32(c, "count").or_else(|| nbt_i32(c, "Count")).unwrap_or(1);
             let slot = nbt_i32(c, "Slot").unwrap_or(0);
 
             // Try to get display name from tag.display.Name (JSON text component)
@@ -284,6 +274,23 @@ fn parse_inventory(items: &[fastnbt::Value]) -> Vec<InventorySlot> {
             })
         })
         .collect()
+}
+
+/// Include the 1.21.5+ equipment compound alongside legacy Inventory slots.
+fn parse_saved_inventory(root: &HashMap<String, fastnbt::Value>) -> Vec<InventorySlot> {
+    let mut inventory = nbt_list(root, "Inventory").map(|items| parse_inventory(items)).unwrap_or_default();
+    if let Some(equipment) = nbt_compound(root, "equipment") {
+        for (key, slot) in [("feet", 100), ("legs", 101), ("chest", 102), ("head", 103), ("offhand", -106)] {
+            if let Some(item) = nbt_compound(equipment, key) {
+                if nbt_str(item, "id").is_none() { continue; }
+                let mut item = item.clone();
+                item.insert("Slot".to_string(), fastnbt::Value::Int(slot));
+                inventory.retain(|existing| existing.slot != slot);
+                inventory.extend(parse_inventory(&[fastnbt::Value::Compound(item)]));
+            }
+        }
+    }
+    inventory
 }
 
 /// Parse active effects from NBT.
@@ -346,7 +353,7 @@ pub fn get_player_full_data(name: String) -> Result<PlayerData, String> {
     {
         let guard = PLAYER_CACHE.lock().unwrap();
         if let Some(ref cache) = *guard {
-            if let Some(entry) = cache.get(&uuid) {
+            if let Some(entry) = cache.get(&dat_path) {
                 if entry.mtime == dat_mtime {
                     return Ok(entry.data.clone());
                 }
@@ -390,9 +397,7 @@ pub fn get_player_full_data(name: String) -> Result<PlayerData, String> {
         })
         .unwrap_or([0.0, 0.0, 0.0]);
 
-    let inventory = nbt_list(&root, "Inventory")
-        .map(|l| parse_inventory(l))
-        .unwrap_or_default();
+    let inventory = parse_saved_inventory(&root);
 
     let ender_chest = nbt_list(&root, "EnderItems")
         .map(|l| parse_inventory(l))
@@ -441,7 +446,7 @@ pub fn get_player_full_data(name: String) -> Result<PlayerData, String> {
         let mut guard = PLAYER_CACHE.lock().unwrap();
         let cache = guard.get_or_insert_with(HashMap::new);
         cache.insert(
-            uuid,
+            dat_path,
             PlayerDatCache {
                 data: player_data.clone(),
                 mtime: dat_mtime,
@@ -461,7 +466,9 @@ pub fn invalidate_player_cache(player_name: Option<&str>) {
             // Invalidate specific player — need to resolve UUID first
             if let Ok(server_path) = get_server_path() {
                 if let Ok(uuid) = resolve_uuid(name, &server_path) {
-                    cache.remove(&uuid);
+                    let world_name = config::resolve_world_name(&server_path);
+                    let path = server_path.join(world_name).join("playerdata").join(format!("{}.dat", uuid));
+                    cache.remove(&path);
                 }
             }
         } else {
@@ -489,7 +496,7 @@ pub fn get_player_inventory_only(name: String) -> Result<Vec<InventorySlot>, Str
     {
         let guard = PLAYER_CACHE.lock().unwrap();
         if let Some(ref cache) = *guard {
-            if let Some(entry) = cache.get(&uuid) {
+            if let Some(entry) = cache.get(&dat_path) {
                 if entry.mtime == dat_mtime {
                     return Ok(entry.data.inventory.clone());
                 }
@@ -498,9 +505,7 @@ pub fn get_player_inventory_only(name: String) -> Result<Vec<InventorySlot>, Str
     }
 
     let root = read_player_dat(&server_path, &uuid)?;
-    Ok(nbt_list(&root, "Inventory")
-        .map(|l| parse_inventory(l))
-        .unwrap_or_default())
+    Ok(parse_saved_inventory(&root))
 }
 
 pub fn get_player_uuid(name: String) -> Result<String, String> {
@@ -509,3 +514,45 @@ pub fn get_player_uuid(name: String) -> Result<String, String> {
 }
 
 // clear_player_item is handled on the frontend via send_command("clear <name> <item> [count]")
+
+#[cfg(test)]
+mod profile_cache_tests {
+    use super::*;
+    #[test]
+    fn reads_modern_and_legacy_stack_counts() {
+        let items = vec![
+            fastnbt::Value::Compound(HashMap::from([("id".into(), fastnbt::Value::String("minecraft:stone".into())), ("Slot".into(), fastnbt::Value::Byte(0)), ("Count".into(), fastnbt::Value::Byte(32))])),
+            fastnbt::Value::Compound(HashMap::from([("id".into(), fastnbt::Value::String("minecraft:dirt".into())), ("Slot".into(), fastnbt::Value::Byte(1)), ("count".into(), fastnbt::Value::Int(17))])),
+        ];
+        let parsed = parse_inventory(&items);
+        assert_eq!(parsed.iter().map(|item| item.count).collect::<Vec<_>>(), vec![32, 17]);
+    }
+    #[test]
+    fn reads_modern_player_equipment_without_duplicating_legacy_slots() {
+        let legacy = fastnbt::Value::Compound(HashMap::from([("id".into(), fastnbt::Value::String("minecraft:old_helmet".into())), ("Slot".into(), fastnbt::Value::Byte(103))]));
+        let head = fastnbt::Value::Compound(HashMap::from([("id".into(), fastnbt::Value::String("minecraft:diamond_helmet".into())), ("count".into(), fastnbt::Value::Int(1))]));
+        let offhand = fastnbt::Value::Compound(HashMap::from([("id".into(), fastnbt::Value::String("minecraft:shield".into()))]));
+        let root = HashMap::from([("Inventory".into(), fastnbt::Value::List(vec![legacy])), ("equipment".into(), fastnbt::Value::Compound(HashMap::from([("head".into(), head), ("offhand".into(), offhand)])))]);
+        let items = parse_saved_inventory(&root);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|item| item.slot == 103 && item.id == "minecraft:diamond_helmet"));
+        assert!(items.iter().any(|item| item.slot == -106 && item.id == "minecraft:shield"));
+    }
+    #[test]
+    fn same_timestamp_different_servers_resolve_their_own_uuid() {
+        let one = tempfile::tempdir().unwrap();
+        let two = tempfile::tempdir().unwrap();
+        let p1 = one.path().join("usercache.json");
+        let p2 = two.path().join("usercache.json");
+        std::fs::write(&p1, r#"[{"name":"Alex","uuid":"server-one"}]"#).unwrap();
+        std::fs::write(&p2, r#"[{"name":"Alex","uuid":"server-two"}]"#).unwrap();
+        let stamp = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for path in [&p1, &p2] {
+            std::fs::OpenOptions::new().write(true).open(path).unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(stamp)).unwrap();
+        }
+        assert_eq!(resolve_uuid("Alex", one.path()).unwrap(), "server-one");
+        assert_eq!(resolve_uuid("Alex", two.path()).unwrap(), "server-two");
+        assert_eq!(resolve_uuid("Alex", one.path()).unwrap(), "server-one");
+    }
+}
