@@ -264,6 +264,15 @@ fn walk_and_zip<W: Write + std::io::Seek>(
                 zip.write_all(&buf[..n])
                     .map_err(|e| format!("zip write: {}", e))?;
                 state.bytes += n as u64;
+                // Large region files and server jars may take minutes to compress.
+                // Report bytes while copying, not only after the file finishes.
+                if state.last_emit.elapsed().as_millis() >= 250 {
+                    app.emit(
+                        "backup-progress",
+                        BackupProgress { files: state.files, bytes: state.bytes, current: zip_path.clone() },
+                    ).ok();
+                    state.last_emit = std::time::Instant::now();
+                }
             }
             state.files += 1;
 
