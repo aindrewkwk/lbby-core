@@ -21,6 +21,7 @@ struct BackupProgress {
     files: u64,
     bytes: u64,
     current: String,
+    total_bytes: u64,
 }
 
 pub fn timestamp_ddmmyyyy_hhmmss() -> String {
@@ -47,6 +48,16 @@ mod backup_creation_tests {
         let err = create_server_backup(&sender(), dir.path(), &dest, false).unwrap_err();
         assert!(err.contains("outside the server directory"));
         assert!(!dest.exists());
+    }
+    #[test]
+    fn progress_total_counts_only_included_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("world.dat"), b"12345").unwrap();
+        std::fs::write(dir.path().join("session.lock"), b"ignored").unwrap();
+        std::fs::create_dir(dir.path().join("logs")).unwrap();
+        std::fs::write(dir.path().join("logs/latest.log"), b"123").unwrap();
+        assert_eq!(count_backup_bytes(dir.path(), false, true).unwrap(), 5);
+        assert_eq!(count_backup_bytes(dir.path(), true, true).unwrap(), 8);
     }
     #[test]
     fn creates_a_readable_zip_outside_server() {
@@ -112,6 +123,22 @@ mod backup_creation_tests {
     }
 }
 
+fn count_backup_bytes(base: &Path, include_logs: bool, top: bool) -> Result<u64, String> {
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(base).map_err(|e| format!("read_dir {}: {}", base.display(), e))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if SKIP_NAMES_ANYWHERE.iter().any(|x| *x == name.as_ref()) ||
+            (top && (SKIP_TOPLEVEL_DIRS.iter().any(|x| *x == name.as_ref()) || (!include_logs && name == "logs") || name == "forge-installer.jar.log")) { continue; }
+        let kind = entry.file_type().map_err(|e| format!("file_type {}: {}", entry.path().display(), e))?;
+        if kind.is_symlink() { return Err(format!("Cannot back up symbolic link: {}", entry.path().display())); }
+        if kind.is_dir() { total = total.saturating_add(count_backup_bytes(&entry.path(), include_logs, false)?); }
+        else if kind.is_file() { total = total.saturating_add(entry.metadata().map_err(|e| format!("metadata {}: {}", entry.path().display(), e))?.len()); }
+    }
+    Ok(total)
+}
+
 pub fn create_server_backup(
     app: &std::sync::Arc<crate::app_state::AppEventSender>,
     server_path: &Path,
@@ -140,6 +167,7 @@ pub fn create_server_backup(
     }
     // Write next to the destination and publish only a completed archive.
     // This preserves any prior backup if creating the new one fails.
+    let total_bytes = count_backup_bytes(server_path, include_logs, true)?;
     let temp_path = dest_parent.join(format!(".lbby-backup-{}.tmp", uuid::Uuid::new_v4()));
     struct TempBackup(PathBuf);
     impl Drop for TempBackup { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
@@ -155,6 +183,7 @@ pub fn create_server_backup(
     let mut state = WalkState {
         files: 0,
         bytes: 0,
+        total_bytes,
         last_emit: std::time::Instant::now(),
     };
 
@@ -181,6 +210,7 @@ pub fn create_server_backup(
             files: state.files,
             bytes: state.bytes,
             current: "done".to_string(),
+            total_bytes,
         },
     )
     .ok();
@@ -191,6 +221,7 @@ pub fn create_server_backup(
 struct WalkState {
     files: u64,
     bytes: u64,
+    total_bytes: u64,
     last_emit: std::time::Instant,
 }
 
@@ -269,7 +300,7 @@ fn walk_and_zip<W: Write + std::io::Seek>(
                 if state.last_emit.elapsed().as_millis() >= 250 {
                     app.emit(
                         "backup-progress",
-                        BackupProgress { files: state.files, bytes: state.bytes, current: zip_path.clone() },
+                        BackupProgress { files: state.files, bytes: state.bytes, current: zip_path.clone(), total_bytes: state.total_bytes },
                     ).ok();
                     state.last_emit = std::time::Instant::now();
                 }
@@ -284,6 +315,7 @@ fn walk_and_zip<W: Write + std::io::Seek>(
                         files: state.files,
                         bytes: state.bytes,
                         current: zip_path.clone(),
+                        total_bytes: state.total_bytes,
                     },
                 )
                 .ok();
@@ -438,6 +470,7 @@ fn extract_zip_to_dir(
                         files: count,
                         bytes,
                         current: safe_path.to_string_lossy().to_string(),
+                        total_bytes: 0,
                     },
                 )
                 .ok();
@@ -452,6 +485,7 @@ fn extract_zip_to_dir(
             files: count,
             bytes,
             current: "done".to_string(),
+            total_bytes: 0,
         },
     )
     .ok();
